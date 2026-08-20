@@ -19,7 +19,10 @@ jobs:
           - { runner: ubuntu-latest,    goos: linux,   goarch: amd64, ext: so }
           - { runner: ubuntu-24.04-arm, goos: linux,   goarch: arm64, ext: so }
           - { runner: macos-latest,     goos: darwin,  goarch: arm64, ext: dylib }
-          - { runner: macos-13,         goos: darwin,  goarch: amd64, ext: dylib }
+          # GitHub is retiring the Intel macOS runners, so the x86_64 build is
+          # cross-compiled on Apple Silicon: the macOS SDK ships both slices and
+          # clang -arch keeps cgo working.
+          - { runner: macos-latest,     goos: darwin,  goarch: amd64, ext: dylib, cc: "clang -arch x86_64" }
           - { runner: windows-latest,   goos: windows, goarch: amd64, ext: dll }
     steps:
       - uses: actions/checkout@v4
@@ -28,15 +31,21 @@ jobs:
         with:
           go-version: "1.26"
 
-      # cgo cannot cross-compile without a target toolchain, so every platform
-      # is built on its own native runner.
+      # cgo needs a toolchain that can target the platform, so every build runs
+      # on a runner of that OS.
       - name: Build
         shell: bash
+        env:
+          CC: ${{ matrix.cc }}
         run: |
           VERSION="${GITHUB_REF_NAME#v}"
-          CGO_ENABLED=1 go build -buildmode=c-shared -trimpath \
+          export CGO_ENABLED=1 GOOS=${{ matrix.goos }} GOARCH=${{ matrix.goarch }}
+          go build -buildmode=c-shared -trimpath \
             -ldflags "-s -w -X main.pluginVersion=${VERSION} -X main.repository=github.com/${{ github.repository }}" \
             -o "codex-weekly-usd.${{ matrix.ext }}" .
+          # Prove the artifact really is for the target architecture rather than
+          # silently the runner's own.
+          file "codex-weekly-usd.${{ matrix.ext }}" || ls -l "codex-weekly-usd.${{ matrix.ext }}"
 
       # The CLIProxyAPI plugin store requires the library at the zip root, named
       # exactly <plugin-id><ext>, and the asset named

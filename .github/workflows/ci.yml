@@ -38,25 +38,33 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - { runner: ubuntu-latest,  goos: linux,   goarch: amd64 }
-          - { runner: ubuntu-24.04-arm, goos: linux, goarch: arm64 }
-          - { runner: macos-latest,   goos: darwin,  goarch: arm64 }
-          - { runner: macos-13,       goos: darwin,  goarch: amd64 }
-          - { runner: windows-latest, goos: windows, goarch: amd64 }
+          - { runner: ubuntu-latest,    goos: linux,   goarch: amd64 }
+          - { runner: ubuntu-24.04-arm, goos: linux,   goarch: arm64 }
+          - { runner: macos-latest,     goos: darwin,  goarch: arm64 }
+          # GitHub is retiring the Intel macOS runners, so the x86_64 build is
+          # cross-compiled on Apple Silicon: the macOS SDK ships both slices and
+          # clang -arch keeps cgo working.
+          - { runner: macos-latest,     goos: darwin,  goarch: amd64, cc: "clang -arch x86_64" }
+          - { runner: windows-latest,   goos: windows, goarch: amd64 }
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-go@v5
         with:
           go-version: "1.26"
-      # cgo cannot cross-compile without a target toolchain, so each platform
-      # builds on its own native runner.
+      # cgo needs a toolchain that can target the platform, so every build runs
+      # on a runner of that OS.
       - name: Build
         shell: bash
+        env:
+          CC: ${{ matrix.cc }}
         run: |
           ext=so
           [ "${{ matrix.goos }}" = "darwin" ] && ext=dylib
           [ "${{ matrix.goos }}" = "windows" ] && ext=dll
-          CGO_ENABLED=1 go build -buildmode=c-shared -trimpath \
+          export CGO_ENABLED=1 GOOS=${{ matrix.goos }} GOARCH=${{ matrix.goarch }}
+          go build -buildmode=c-shared -trimpath \
             -ldflags "-s -w -X main.repository=github.com/${{ github.repository }}" \
             -o "codex-weekly-usd.$ext" .
-          ls -l "codex-weekly-usd.$ext"
+          # Prove the artifact really is for the target architecture rather than
+          # silently the runner's own.
+          file "codex-weekly-usd.$ext" || ls -l "codex-weekly-usd.$ext"
