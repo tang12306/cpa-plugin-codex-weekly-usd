@@ -1,0 +1,62 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.26"
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: Vet
+        run: make vet
+
+      - name: Build
+        run: make build
+
+      # The accounting suite drives the real C ABI through harness.c; the chart
+      # suite lifts the SVG builders out of the panel the plugin actually
+      # serves. Neither needs a running CLIProxyAPI.
+      - name: Test
+        run: make test
+
+  build-matrix:
+    name: build ${{ matrix.goos }}/${{ matrix.goarch }}
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { runner: ubuntu-latest,  goos: linux,   goarch: amd64 }
+          - { runner: ubuntu-24.04-arm, goos: linux, goarch: arm64 }
+          - { runner: macos-latest,   goos: darwin,  goarch: arm64 }
+          - { runner: macos-13,       goos: darwin,  goarch: amd64 }
+          - { runner: windows-latest, goos: windows, goarch: amd64 }
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.26"
+      # cgo cannot cross-compile without a target toolchain, so each platform
+      # builds on its own native runner.
+      - name: Build
+        shell: bash
+        run: |
+          ext=so
+          [ "${{ matrix.goos }}" = "darwin" ] && ext=dylib
+          [ "${{ matrix.goos }}" = "windows" ] && ext=dll
+          CGO_ENABLED=1 go build -buildmode=c-shared -trimpath \
+            -ldflags "-s -w -X main.repository=github.com/${{ github.repository }}" \
+            -o "codex-weekly-usd.$ext" .
+          ls -l "codex-weekly-usd.$ext"

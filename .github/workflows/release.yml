@@ -1,0 +1,91 @@
+name: Release
+
+# Tag a version to publish it, e.g.  git tag v1.2.0 && git push origin v1.2.0
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: build ${{ matrix.goos }}/${{ matrix.goarch }}
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { runner: ubuntu-latest,    goos: linux,   goarch: amd64, ext: so }
+          - { runner: ubuntu-24.04-arm, goos: linux,   goarch: arm64, ext: so }
+          - { runner: macos-latest,     goos: darwin,  goarch: arm64, ext: dylib }
+          - { runner: macos-13,         goos: darwin,  goarch: amd64, ext: dylib }
+          - { runner: windows-latest,   goos: windows, goarch: amd64, ext: dll }
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.26"
+
+      # cgo cannot cross-compile without a target toolchain, so every platform
+      # is built on its own native runner.
+      - name: Build
+        shell: bash
+        run: |
+          VERSION="${GITHUB_REF_NAME#v}"
+          CGO_ENABLED=1 go build -buildmode=c-shared -trimpath \
+            -ldflags "-s -w -X main.pluginVersion=${VERSION} -X main.repository=github.com/${{ github.repository }}" \
+            -o "codex-weekly-usd.${{ matrix.ext }}" .
+
+      # The CLIProxyAPI plugin store requires the library at the zip root, named
+      # exactly <plugin-id><ext>, and the asset named
+      # <id>_<version>_<goos>_<goarch>.zip
+      - name: Package
+        shell: bash
+        run: |
+          VERSION="${GITHUB_REF_NAME#v}"
+          NAME="codex-weekly-usd_${VERSION}_${{ matrix.goos }}_${{ matrix.goarch }}.zip"
+          python3 -c "
+          import zipfile, sys
+          lib, out = sys.argv[1], sys.argv[2]
+          with zipfile.ZipFile(out, 'w', zipfile.ZIP_DEFLATED) as z:
+              z.write(lib, arcname=lib)
+              z.write('LICENSE', arcname='LICENSE')
+              z.write('README.md', arcname='README.md')
+          " "codex-weekly-usd.${{ matrix.ext }}" "$NAME"
+          echo "ASSET=$NAME" >> "$GITHUB_ENV"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.goos }}-${{ matrix.goarch }}
+          path: ${{ env.ASSET }}
+          if-no-files-found: error
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      # checksums.txt is mandatory: the store refuses to install a release that
+      # does not carry one, and the format is plain sha256sum output.
+      - name: Checksums
+        run: |
+          cd dist
+          sha256sum *.zip > checksums.txt
+          cat checksums.txt
+
+      - name: Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" \
+            --title "$GITHUB_REF_NAME" \
+            --generate-notes \
+            dist/*.zip dist/checksums.txt

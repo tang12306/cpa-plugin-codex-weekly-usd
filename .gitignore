@@ -1,0 +1,16 @@
+# Build output
+/build/
+*.so
+*.dylib
+*.dll
+*.h
+
+# Plugin runtime data (never commit: contains per-credential usage)
+/data/
+state.json
+prices.json
+events/
+
+__pycache__/
+*.pyc
+.DS_Store

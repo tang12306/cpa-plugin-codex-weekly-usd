@@ -1,0 +1,3 @@
+# The build and test runners are Linux and macOS: CRLF would break the Makefile
+# and the shell steps in the workflows.
+* text=auto eol=lf
