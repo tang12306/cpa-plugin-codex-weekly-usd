@@ -259,7 +259,12 @@ rep = run([
 w = win(rep, WEEK)
 check("unexplained percent recorded", round(w["unexplained_percent"], 2), 6.00)
 check("failed requests counted", w["failed"], 2)
-check("warning raised", any("其它客户端" in x for x in rep["warnings"]), True)
+# Warnings are structured, not prose, so the panel can render them in either
+# language rather than whichever one the plugin was compiled with.
+ext = [x for x in rep["warnings"] if x.get("code") == "external_usage"]
+check("warning is structured", len(ext), 1)
+check("warning carries the percent", round(ext[0]["percent"], 2), 6.00)
+check("warning carries the window", ext[0]["window"], "7d")
 
 print()
 print("=" * 74)
@@ -311,6 +316,11 @@ check("ships cumulative line chart", "polyline" in html, True)
 check("ships quota curve", "drawQuotaCurve" in html, True)
 check("ships constant-rate reference", "stroke-dasharray" in html, True)
 check("charts are inline svg only", "<script src" not in html and "http://" not in html, True)
+check("ships a language switcher", 'id="lang"' in html, True)
+check("carries both dictionaries", ("zh: {" in html) and ("en: {" in html), True)
+check("both titles present", ("Codex 额度美元估算" in html) and ("Codex Quota USD" in html), True)
+# Dictionary parity is asserted in test_charts.js, which can evaluate the real
+# object instead of guessing at it with a regex.
 with open(os.path.join(BUILD, "panel.html"), "w", encoding="utf-8") as fh:
     fh.write(html)
 

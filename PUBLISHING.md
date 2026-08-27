@@ -20,8 +20,8 @@ grep -rn tang12306 --include='*.go' --include='*.json' --include='*.md' --includ
 版本号只写在 git tag 里，CI 用 `-ldflags -X main.pluginVersion=` 注入，源码里的默认值只是兜底。
 
 ```sh
-git tag v2.0.0
-git push origin v2.0.0
+git tag v2.1.0
+git push origin v2.1.0
 ```
 
 `.github/workflows/release.yml` 会：
@@ -56,16 +56,16 @@ https://github.com/router-for-me/CLIProxyAPI-Plugins-Store
 
 ```sh
 # 资产名是否符合规格
-gh release view v2.0.0 --json assets -q '.assets[].name'
+gh release view v2.1.0 --json assets -q '.assets[].name'
 
 # 抽一个包，确认库在 zip 根目录
-unzip -l codex-weekly-usd_2.0.0_linux_amd64.zip
+unzip -l codex-weekly-usd_2.1.0_linux_amd64.zip
 
 # 校验和可用
 sha256sum -c checksums.txt
 ```
 
-然后在一台真实的 CLIProxyAPI 上从商店装一次，确认面板菜单「额度美元」出现，且：
+然后在一台真实的 CLIProxyAPI 上从商店装一次，确认面板菜单「Quota USD」出现，且：
 
 ```sh
 curl -s -o /dev/null -w '%{http_code}\n' http://127.0.0.1:<端口>/v0/resource/plugins/codex-weekly-usd/panel   # 200

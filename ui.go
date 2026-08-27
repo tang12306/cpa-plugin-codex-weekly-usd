@@ -70,7 +70,7 @@ const panelHTML = `<!doctype html>
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Codex 额度美元估算</title>
+<title>Codex Quota USD</title>
 <style>
   :root {
     --bg:#f5f6f8; --panel:#fff; --panel2:#fafbfc; --ink:#15181d; --muted:#6b7280;
@@ -122,7 +122,7 @@ const panelHTML = `<!doctype html>
   .tag{display:inline-block;padding:1px 7px;border-radius:999px;font-size:11px;
        border:1px solid var(--line);color:var(--muted);white-space:nowrap}
   .tag.high,.tag.ok{color:var(--good);border-color:var(--good)}
-  .tag.medium{color:var(--warn);border-color:var(--warn)}
+  .tag.medium,.tag.warn{color:var(--warn);border-color:var(--warn)}
   .tag.low,.tag.none,.tag.bad{color:var(--bad);border-color:var(--bad)}
   .off{opacity:.45}
   .msg{padding:10px 13px;border-radius:8px;border:1px solid var(--line);
@@ -151,20 +151,24 @@ const panelHTML = `<!doctype html>
 </style>
 </head>
 <body>
-<h1>Codex 额度美元估算</h1>
-<div class="sub">按 OpenAI 官方 API 价目，推算每个凭据的每个额度窗口值多少美元</div>
+<h1 id="t-title"></h1>
+<div class="sub" id="t-sub"></div>
 
 <div class="bar">
-  <input id="key" type="password" placeholder="管理密钥" autocomplete="off" spellcheck="false">
-  <button id="load">加载</button>
-  <button class="ghost" id="forget">忘记密钥</button>
-  <button class="ghost" id="export">导出 JSON</button>
+  <input id="key" type="password" autocomplete="off" spellcheck="false">
+  <button id="load"></button>
+  <button class="ghost" id="forget"></button>
+  <button class="ghost" id="export"></button>
   <select id="sort">
-    <option value="quota">按最长窗口额度排序</option>
-    <option value="remain">按剩余排序</option>
-    <option value="used">按已用比例排序</option>
-    <option value="pace">按消耗节奏排序</option>
-    <option value="name">按名称排序</option>
+    <option value="quota"></option>
+    <option value="remain"></option>
+    <option value="used"></option>
+    <option value="pace"></option>
+    <option value="name"></option>
+  </select>
+  <select id="lang">
+    <option value="zh">中文</option>
+    <option value="en">English</option>
   </select>
   <span id="stamp" class="sub"></span>
 </div>
@@ -173,9 +177,9 @@ const panelHTML = `<!doctype html>
 <div id="wtotals"></div>
 <div id="cards" class="cards" hidden></div>
 <div id="chartbox" class="box" hidden>
-  <h2>全部凭据 · 用量走势
-    <span class="legend"><i class="sw bar"></i>每小时消耗（左轴）</span>
-    <span class="legend"><i class="sw ln good"></i>累计消耗（右轴）</span>
+  <h2><span id="t-chart"></span>
+    <span class="legend"><i class="sw bar"></i><span id="t-lg1"></span></span>
+    <span class="legend"><i class="sw ln good"></i><span id="t-lg2"></span></span>
   </h2>
   <div id="chart"></div>
 </div>
@@ -187,7 +191,7 @@ const panelHTML = `<!doctype html>
 </div>
 <div id="pricebox" class="box" hidden>
   <details>
-    <summary>当前生效价目表（美元 / 百万 token）</summary>
+    <summary id="t-prices"></summary>
     <div id="prices"></div>
   </details>
 </div>
@@ -195,7 +199,158 @@ const panelHTML = `<!doctype html>
 
 <script>
 (function () {
-  var STORE = "cwu.key";
+  var STORE = "cwu.key", LANGKEY = "cwu.lang";
+
+  // Every user-facing string lives here. Backend warnings arrive as structured
+  // codes rather than prose for the same reason: the panel, not the plugin,
+  // decides what language the operator reads.
+  var I18N = {
+    zh: {
+      title: "Codex 额度美元估算",
+      sub: "按 OpenAI 官方 API 价目，推算每个凭据的每个额度窗口值多少美元",
+      keyPlaceholder: "管理密钥", load: "加载", forget: "忘记密钥", exportJson: "导出 JSON",
+      sortQuota: "按最长窗口额度排序", sortRemain: "按剩余排序", sortUsed: "按已用比例排序",
+      sortPace: "按消耗节奏排序", sortName: "按名称排序",
+      chartTitle: "全部凭据 · 用量走势", legendBars: "每小时消耗（左轴）", legendLine: "累计消耗（右轴）",
+      pricesTitle: "当前生效价目表（美元 / 百万 token）",
+      updatedAt: "更新于 {0}",
+      needKey: "请先填入管理密钥。", keyRejected: "管理密钥被拒绝。", reqFailed: "请求失败：HTTP {0}",
+      loadFirst: "请先加载数据。",
+      warnStale: "{0} 个凭据的额度读数已经过期（长时间没有流量经过），下面显示的是最后一次观测值，不代表现在。",
+      warnWaiting: "{0} / {1} 个凭据还没有估算值。额度只有在「插件亲眼看到百分比至少走动 1 点」之后才能定价，正常使用中会自动补上。",
+      warnExternal: "{0} 的 {1} 窗口有 {2} 的额度被消耗但不在本插件账上，可能有其它客户端在共用该凭据",
+      warnUnpriced: "{0} 没有公开价目（凭据 {1}），其花费未计入估算",
+      warnPrice: "价目刷新失败：{0}",
+      totalsTitle: "{0} 窗口合计",
+      cCreds: "凭据数", cQuota: "额度总值", cSpent: "已用", cRemain: "剩余",
+      cPriced: "{0} 个已定价", cAtRisk: "{0} 个逼近上限",
+      cObserved: "实测消耗", cObservedN: "最长窗口内，插件亲眼记账部分",
+      cSaved: "缓存省下", cSavedN: "对比全价输入",
+      cRequests: "请求数", cFailedN: "{0} 次失败",
+      thCred: "凭据", thPlan: "套餐", thQuota: "{0} 额度", thStatus: "状态",
+      tagDisabled: "已停用", tagUnavailable: "不可用", tagStale: "读数陈旧",
+      rowTotals: "{0} 次累计 · {1}", rowObserved: "{0}前观测",
+      watching: "观测中", needTick: "待百分比走动 1%",
+      left: "剩", resetsIn: "{0}后重置",
+      paceFast: "偏快", paceSlow: "宽裕", paceNormal: "正常",
+      confHigh: "高置信", confMedium: "中置信", confLow: "低置信", confNone: "无估算",
+      mWindow: "窗口法", mDelta: "步进法",
+      wTitle: "{0} 窗口",
+      dObserved: "窗口实测消耗", dAttributed: "已归属消耗", dPending: " / 挂账 {0}",
+      dSaved: "缓存省下", dReqFail: "请求 / 失败", dAvg: "均价每次",
+      dInOut: "输入 / 输出", dCacheRead: "缓存读取",
+      dByWindow: "窗口法估算", dByDelta: "步进法估算", dNA: "不可用",
+      dSamples: "校准样本", dSamplesV: "{0} 条 / 覆盖 {1}",
+      dCoverage: "整窗覆盖", dYes: "是", dNoMid: "否（中途接管）",
+      dCycles: "已观察周期", dCyclesV: "{0} 次", dGranted: "，其中 {0} 次周期内重置",
+      dExternal: "外部消耗", dExternalV: "{0}（不在本插件账上）", dNone: "无",
+      dExhaust: "跑满预警", dWillExhaust: "会提前用完", dLasts: "够用到重置",
+      dPerDay: "日均消耗",
+      mtModel: "模型", mtReq: "请求", mtFail: "失败", mtIn: "输入", mtOut: "输出",
+      mtCache: "缓存命中", mtPrice: "单价(入/出)", mtAvg: "均价/次", mtUsd: "金额",
+      mtNoPrice: "无价目", mtReasoning: "(含推理 {0})",
+      capHourly: "每小时消耗", capCumulative: "累计",
+      capCurve: "额度百分比（{0}窗口）", capRef: "匀速参考线",
+      capCurveHint: "曲线高过虚线 = 照此速度会在重置前用完",
+      pModel: "模型", pIn: "输入", pOut: "输出", pCacheR: "缓存读", pCacheW: "缓存写",
+      pOverridden: "已覆盖",
+      footPrices: "价目来源：{0}", footVia: "（{0}）", footFetched: "，同步于 {0}",
+      viaHost: "经 CPA 代理", viaDirect: "直连",
+      footBody: "<b>窗口按长度识别</b>，不按上游的 primary/secondary 标签——这两个标签的含义变过一次" +
+        "（5 小时限额回归后，primary 从周窗口变成了 5 小时窗口）。同一笔花费同时计入所有窗口，" +
+        "所以每个窗口各自独立估算。<br>" +
+        "<b>窗口法</b>＝整周期实测消耗 ÷ 整周期百分比，只在插件看到周期从 0% 开始时可用；" +
+        "<b>步进法</b>＝Σ两次读数间的消耗 ÷ Σ百分比步进，中途安装也能收敛。" +
+        "校准样本有数量与时效上限，因此套餐变化后估算会跟着变，不会被旧数据永久拖住。<br>" +
+        "<b>节奏</b>＝额度消耗比例 ÷ 窗口时间流逝比例，大于 1 表示照此速度会在重置前用完。" +
+        "缓存读取与推理 token 分别是输入、输出的子集，不重复计费。",
+      noData: "暂无数据", thisHour: "本小时", hoursAgo: "小时前", now: "现在",
+      total: "累计", reqs: "次",
+      unitDay: "天", unitHour: "小时", unitMin: "分",
+      wDays: "{0} 天", wHours: "{0} 小时", wMins: "{0} 分",
+      locale: "zh-CN"
+    },
+    en: {
+      title: "Codex Quota USD",
+      sub: "What each credential's quota window is worth at public OpenAI API pricing",
+      keyPlaceholder: "Management key", load: "Load", forget: "Forget key", exportJson: "Export JSON",
+      sortQuota: "Sort by longest-window quota", sortRemain: "Sort by remaining", sortUsed: "Sort by used %",
+      sortPace: "Sort by burn pace", sortName: "Sort by name",
+      chartTitle: "All credentials · usage", legendBars: "Hourly spend (left axis)", legendLine: "Cumulative (right axis)",
+      pricesTitle: "Active rate card (USD per 1M tokens)",
+      updatedAt: "updated {0}",
+      needKey: "Enter the management key first.", keyRejected: "Management key rejected.",
+      reqFailed: "Request failed: HTTP {0}", loadFirst: "Load the data first.",
+      warnStale: "{0} credential(s) have stale quota readings (no traffic for a while). The figures below are the last observation, not the present.",
+      warnWaiting: "{0} of {1} credentials have no estimate yet. A quota can only be priced once its used-percentage has been watched moving at least one point, so these fill in during normal use.",
+      warnExternal: "{1} window of {0} shows {2} consumed that this plugin did not bill — another client may be sharing this credential",
+      warnUnpriced: "No public price for {0} (credential {1}); its spend is missing from the estimate",
+      warnPrice: "Price refresh is failing: {0}",
+      totalsTitle: "{0} window totals",
+      cCreds: "Credentials", cQuota: "Quota value", cSpent: "Spent", cRemain: "Remaining",
+      cPriced: "{0} priced", cAtRisk: "{0} near the limit",
+      cObserved: "Observed spend", cObservedN: "What the plugin billed itself, longest window",
+      cSaved: "Cache savings", cSavedN: "vs paying full input price",
+      cRequests: "Requests", cFailedN: "{0} failed",
+      thCred: "Credential", thPlan: "Plan", thQuota: "{0} quota", thStatus: "Status",
+      tagDisabled: "disabled", tagUnavailable: "unavailable", tagStale: "stale reading",
+      rowTotals: "{0} total · {1}", rowObserved: "observed {0} ago",
+      watching: "watching", needTick: "needs 1% of movement",
+      left: "left", resetsIn: "resets in {0}",
+      paceFast: "fast", paceSlow: "comfortable", paceNormal: "normal",
+      confHigh: "high", confMedium: "medium", confLow: "low", confNone: "none",
+      mWindow: "window", mDelta: "delta",
+      wTitle: "{0} window",
+      dObserved: "Observed spend this cycle", dAttributed: "Attributed", dPending: " / pending {0}",
+      dSaved: "Cache savings", dReqFail: "Requests / failed", dAvg: "Avg per request",
+      dInOut: "Input / output", dCacheRead: "Cache reads",
+      dByWindow: "Window estimate", dByDelta: "Delta estimate", dNA: "n/a",
+      dSamples: "Calibration", dSamplesV: "{0} samples / {1} covered",
+      dCoverage: "Full-cycle coverage", dYes: "yes", dNoMid: "no (joined mid-cycle)",
+      dCycles: "Cycles observed", dCyclesV: "{0}", dGranted: ", {0} granted mid-cycle",
+      dExternal: "External usage", dExternalV: "{0} (not on this ledger)", dNone: "none",
+      dExhaust: "Exhaustion", dWillExhaust: "runs out early", dLasts: "lasts to reset",
+      dPerDay: "Per day",
+      mtModel: "Model", mtReq: "Req", mtFail: "Failed", mtIn: "Input", mtOut: "Output",
+      mtCache: "Cache hit", mtPrice: "Rate (in/out)", mtAvg: "Avg/req", mtUsd: "Spend",
+      mtNoPrice: "no price", mtReasoning: "(incl. reasoning {0})",
+      capHourly: "hourly spend", capCumulative: "cumulative",
+      capCurve: "quota % ({0} window)", capRef: "constant-rate reference",
+      capCurveHint: "above the dashed line = runs out before reset at this rate",
+      pModel: "Model", pIn: "Input", pOut: "Output", pCacheR: "Cache read", pCacheW: "Cache write",
+      pOverridden: "overridden",
+      footPrices: "Prices: {0}", footVia: " ({0})", footFetched: ", fetched {0}",
+      viaHost: "via the CPA proxy", viaDirect: "direct",
+      footBody: "<b>Windows are keyed by length</b>, not by the upstream primary/secondary label — " +
+        "those swapped meaning once (when the 5-hour limit returned, primary went from the weekly " +
+        "window to the 5-hour one). The same spend counts against every window, so each is " +
+        "estimated independently.<br>" +
+        "<b>window</b> = observed spend for the cycle ÷ the cycle's percentage, available only when " +
+        "the plugin saw the cycle open at 0%; <b>delta</b> = Σ spend between readings ÷ Σ percentage " +
+        "steps, which converges even for a mid-cycle install. Calibration is bounded in count and " +
+        "age, so the estimate follows a plan change instead of being held back by old data.<br>" +
+        "<b>Pace</b> = quota consumed ÷ clock elapsed; above 1 means it runs out before it resets. " +
+        "Cache reads and reasoning tokens are subsets of input and output and are never billed twice.",
+      noData: "No data", thisHour: "this hour", hoursAgo: "h ago", now: "now",
+      total: "Total", reqs: "req",
+      unitDay: "d", unitHour: "h", unitMin: "m",
+      wDays: "{0}-day", wHours: "{0}-hour", wMins: "{0}-min",
+      locale: "en-US"
+    }
+  };
+
+  var LANG = localStorage.getItem(LANGKEY);
+  if (!LANG) {
+    LANG = (String(navigator.language || "").toLowerCase().indexOf("zh") === 0) ? "zh" : "en";
+  }
+  function t(k) {
+    var s = (I18N[LANG] && I18N[LANG][k]) || (I18N.en[k]) || k;
+    for (var i = 1; i < arguments.length; i++) {
+      s = s.split("{" + (i - 1) + "}").join(String(arguments[i]));
+    }
+    return s;
+  }
+
   var el = function (id) { return document.getElementById(id); };
   var keyBox = el("key"), alerts = el("alerts"), rows = el("rows"), cards = el("cards");
   var wrap = el("wrap"), stamp = el("stamp"), foot = el("foot"), head = el("head");
@@ -212,13 +367,26 @@ const panelHTML = `<!doctype html>
     return String(s === null || s === undefined ? "" : s)
       .replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;");
   }
+
+  // Money formatting is deliberately locale-independent: zh-CN and en-US group
+  // and punctuate numbers identically, and keeping it free of the language
+  // dictionary lets the chart tests exercise these helpers in isolation.
   function usd(v) {
     if (v === null || v === undefined || isNaN(v)) return "—";
     var a = Math.abs(v);
     if (a !== 0 && a < 0.01) return "$" + v.toFixed(4);
-    return "$" + Number(v).toLocaleString("zh-CN", { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+    return "$" + Number(v).toLocaleString("en-US", { minimumFractionDigits: 2, maximumFractionDigits: 2 });
   }
   function pct(v) { return (v === null || v === undefined) ? "—" : Number(v).toFixed(1) + "%"; }
+
+  // chartLabels supplies the few words the SVG builders need. Passing them in
+  // keeps those builders self-contained, which is what lets the chart test lift
+  // them straight out of the served page and run them on their own.
+  function chartLabels(L) {
+    return L || { noData: "No data", thisHour: "this hour", hoursAgo: "h ago",
+                  now: "now", total: "Total", reqs: "req" };
+  }
+
   function tok(v) {
     if (!v) return "0";
     if (v >= 1e6) return (v / 1e6).toFixed(2) + "M";
@@ -228,15 +396,16 @@ const panelHTML = `<!doctype html>
   function dur(s) {
     if (s === null || s === undefined) return "—";
     var h = Math.floor(s / 3600), d = Math.floor(h / 24);
-    if (d > 0) return d + " 天 " + (h % 24) + " 小时";
-    if (h > 0) return h + " 小时 " + Math.floor((s % 3600) / 60) + " 分";
-    return Math.floor(s / 60) + " 分";
+    var sep = LANG === "zh" ? " " : "";
+    if (d > 0) return d + t("unitDay") + sep + (h % 24) + t("unitHour");
+    if (h > 0) return h + t("unitHour") + sep + Math.floor((s % 3600) / 60) + t("unitMin");
+    return Math.floor(s / 60) + t("unitMin");
   }
   function wname(w) {
     var m = w.minutes;
-    if (m % 1440 === 0) return (m / 1440) + " 天";
-    if (m % 60 === 0) return (m / 60) + " 小时";
-    return m + " 分";
+    if (m % 1440 === 0) return t("wDays", m / 1440);
+    if (m % 60 === 0) return t("wHours", m / 60);
+    return t("wMins", m);
   }
   function heat(p) { return p >= 90 ? "var(--bad)" : p >= 70 ? "var(--warn)" : "var(--good)"; }
   function note(cls, text) {
@@ -261,12 +430,16 @@ const panelHTML = `<!doctype html>
     return { span: span, usd: usdB, pct: pctB, req: reqB };
   }
 
-  function agoLabel(ago) { return ago === 0 ? "本小时" : ago + " 小时前"; }
+  function agoLabel(ago, L) {
+    L = chartLabels(L);
+    return ago === 0 ? L.thisHour : ago + " " + L.hoursAgo;
+  }
 
   // Hourly spend as bars, with a cumulative-spend line on its own right-hand
   // axis. Inline SVG only, so the page needs no external chart library.
-  function drawChart(series, w, h, showAxis) {
-    if (!series || !series.length) return "<div class='sub'>暂无数据</div>";
+  function drawChart(series, w, h, showAxis, L) {
+    L = chartLabels(L);
+    if (!series || !series.length) return "<div class='sub'>" + L.noData + "</div>";
     var b = buildBuckets(series), span = b.span, i;
 
     var maxU = 0, total = 0;
@@ -299,8 +472,8 @@ const panelHTML = `<!doctype html>
       var bh = Math.max(b.usd[i] > 0 ? 1.5 : 0, ih * b.usd[i] / maxU);
       svg += "<rect x='" + (padL + i * bw + bw * 0.12).toFixed(2) + "' y='" + (padT + ih - bh).toFixed(2) +
              "' width='" + Math.max(0.6, bw * 0.76).toFixed(2) + "' height='" + bh.toFixed(2) +
-             "' rx='1' fill='var(--accent)' opacity='.62'><title>" + agoLabel(span - 1 - i) +
-             " · " + usd(b.usd[i]) + " · " + b.req[i] + " 次</title></rect>";
+             "' rx='1' fill='var(--accent)' opacity='.62'><title>" + agoLabel(span - 1 - i, L) +
+             " · " + usd(b.usd[i]) + " · " + b.req[i] + " " + L.reqs + "</title></rect>";
     }
 
     // Cumulative spend. Flat stretches are idle hours; a steepening slope is
@@ -313,13 +486,13 @@ const panelHTML = `<!doctype html>
            "stroke-linejoin='round' points='" + pts.join(" ") + "'/>";
     svg += "<circle cx='" + cx(span - 1).toFixed(1) + "' cy='" +
            (padT + ih - ih * cum[span - 1] / maxC).toFixed(1) +
-           "' r='3' fill='var(--good)'><title>累计 " + usd(total) + "</title></circle>";
+           "' r='3' fill='var(--good)'><title>" + L.total + " " + usd(total) + "</title></circle>";
 
     if (showAxis) {
       svg += "<text x='" + padL + "' y='" + (h - 4) + "' font-size='10' fill='var(--muted)'>" +
-             span + " 小时前</text>";
+             agoLabel(span, L) + "</text>";
       svg += "<text x='" + (w - padR) + "' y='" + (h - 4) + "' text-anchor='end' font-size='10' " +
-             "fill='var(--muted)'>现在</text>";
+             "fill='var(--muted)'>" + L.now + "</text>";
     }
     return svg + "</svg>";
   }
@@ -327,7 +500,8 @@ const panelHTML = `<!doctype html>
   // Quota percentage over time against a constant-rate reference. A curve above
   // the dashed line is the visual form of a pace ratio greater than one: the
   // window will be exhausted before it resets.
-  function drawQuotaCurve(series, windowMinutes, w, h) {
+  function drawQuotaCurve(series, windowMinutes, w, h, L) {
+    L = chartLabels(L);
     if (!series || !series.length) return "";
     var b = buildBuckets(series), span = b.span, i;
 
@@ -371,8 +545,7 @@ const panelHTML = `<!doctype html>
       var start = fill[first], endV = start + slope * (span - 1 - first);
       svg += "<line x1='" + cx(first).toFixed(1) + "' y1='" + cy(start).toFixed(1) +
              "' x2='" + cx(span - 1).toFixed(1) + "' y2='" + cy(endV).toFixed(1) +
-             "' stroke='var(--muted)' stroke-width='1.5' stroke-dasharray='4 3' opacity='.7'>" +
-             "<title>匀速参考线</title></line>";
+             "' stroke='var(--muted)' stroke-width='1.5' stroke-dasharray='4 3' opacity='.7'/>";
     }
 
     var pts = [];
@@ -384,70 +557,84 @@ const panelHTML = `<!doctype html>
     return svg + "</svg>";
   }
 
-  // Quota consumed versus clock elapsed. Above 1 means the window will run out
-  // early at the current rate.
+  function L() {
+    return { noData: t("noData"), thisHour: t("thisHour"), hoursAgo: t("hoursAgo"),
+             now: t("now"), total: t("total"), reqs: t("reqs") };
+  }
+
   function paceTag(w) {
     var r = w.pace_ratio;
     if (r === undefined || r === null) return "";
     var cls = r > 1.15 ? "bad" : (r < 0.85 ? "ok" : "");
-    var word = r > 1.15 ? "偏快" : (r < 0.85 ? "宽裕" : "正常");
+    var word = r > 1.15 ? t("paceFast") : (r < 0.85 ? t("paceSlow") : t("paceNormal"));
     return "<span class='tag " + cls + "'>" + word + " ×" + r.toFixed(2) + "</span>";
   }
 
   function windowCell(w) {
-    if (!w) return "<td class='num'><span class='tag'>无</span></td>";
+    if (!w) return "<td class='num'><span class='tag'>—</span></td>";
     var e = w.estimate || {};
     var waiting = e.method === "none";
     var p = w.used_percent || 0;
     var s = "<td><div class='wcell'>";
     s += "<div class='mlabel'><span>" + pct(p) + "</span><span>" +
-         (w.time_progress_percent !== undefined ? "时间 " + pct(w.time_progress_percent) : "") + "</span></div>";
+         (w.time_progress_percent !== undefined ? pct(w.time_progress_percent) : "") + "</span></div>";
     s += "<div class='meter'><i style='width:" + Math.min(100, p) + "%;background:" + heat(p) + "'></i></div>";
     if (w.time_progress_percent !== undefined) {
       s += "<div class='meter'><i style='width:" + Math.min(100, w.time_progress_percent) +
            "%;background:var(--muted);opacity:.5'></i></div>";
     }
-    s += "<div class='sub2'>" + (waiting ? "<span class='tag'>观测中</span>"
-         : "剩 <b>" + usd(e.remaining_usd) + "</b> / " + usd(e.quota_usd)) + "</div>";
-    s += "<div class='sub2'>" + paceTag(w) + " <span class='tag'>" + dur(w.reset_in_seconds) + "后重置</span></div>";
+    s += "<div class='sub2'>" + (waiting ? "<span class='tag'>" + t("watching") + "</span>"
+         : t("left") + " <b>" + usd(e.remaining_usd) + "</b> / " + usd(e.quota_usd)) + "</div>";
+    s += "<div class='sub2'>" + paceTag(w) + " <span class='tag'>" +
+         t("resetsIn", dur(w.reset_in_seconds)) + "</span></div>";
     return s + "</div></td>";
   }
 
+  function row2(k, v) { return "<div class='k'>" + esc(k) + "</div><div class='v'>" + v + "</div>"; }
+
   function windowDetail(w) {
     var e = w.estimate || {};
-    var t = w.tokens || {};
+    var tk = w.tokens || {};
     var kv = "<div class='kv'>" +
-      row2("窗口实测消耗", usd(w.usd_observed)) +
-      row2("已归属消耗", usd(e.attributed_usd) + "<span class='sub2'> / 挂账 " +
-           usd((w.usd_observed || 0) - (e.attributed_usd || 0)) + "</span>") +
-      row2("缓存省下", usd(w.saved_usd)) +
-      row2("请求 / 失败", (w.requests || 0) + " / " + (w.failed || 0) +
+      row2(t("dObserved"), usd(w.usd_observed)) +
+      row2(t("dAttributed"), usd(e.attributed_usd) + "<span class='sub2'>" +
+           t("dPending", usd((w.usd_observed || 0) - (e.attributed_usd || 0))) + "</span>") +
+      row2(t("dSaved"), usd(w.saved_usd)) +
+      row2(t("dReqFail"), (w.requests || 0) + " / " + (w.failed || 0) +
            (w.failure_rate ? " (" + pct(w.failure_rate) + ")" : "")) +
-      row2("均价每次", usd(w.avg_usd_per_request)) +
-      row2("输入 / 输出", tok(t.InputTokens) + " / " + tok(t.OutputTokens)) +
-      row2("缓存读取", tok(t.CacheReadTokens) + (w.cache_hit_rate !== undefined ? " (" + pct(w.cache_hit_rate) + ")" : "")) +
-      row2("窗口法估算", e.quota_usd_by_window ? usd(e.quota_usd_by_window) : "不可用") +
-      row2("步进法估算", e.quota_usd_by_delta ? usd(e.quota_usd_by_delta) : "不可用") +
-      row2("校准样本", (e.samples || 0) + " 条 / 覆盖 " + pct(e.evidence_percent)) +
-      row2("整窗覆盖", w.full_coverage ? "是" : "否（中途接管）") +
-      row2("已观察周期", (w.cycles || 0) + " 次" +
-           (w.granted_resets ? "，其中 <b>" + w.granted_resets + " 次周期内重置</b>" : "")) +
-      row2("外部消耗", w.unexplained_percent ? "<b>" + pct(w.unexplained_percent) + "</b>（不在本插件账上）" : "无") +
-      row2("跑满预警", w.will_exhaust_before_reset === true ? "<span class='tag bad'>会提前用完</span>" :
-           (w.will_exhaust_before_reset === false ? "<span class='tag ok'>够用到重置</span>" : "—")) +
-      row2("日均消耗", w.burn_usd_per_day === undefined ? "—" : usd(w.burn_usd_per_day)) +
+      row2(t("dAvg"), usd(w.avg_usd_per_request)) +
+      row2(t("dInOut"), tok(tk.InputTokens) + " / " + tok(tk.OutputTokens)) +
+      row2(t("dCacheRead"), tok(tk.CacheReadTokens) +
+           (w.cache_hit_rate !== undefined ? " (" + pct(w.cache_hit_rate) + ")" : "")) +
+      row2(t("dByWindow"), e.quota_usd_by_window ? usd(e.quota_usd_by_window) : t("dNA")) +
+      row2(t("dByDelta"), e.quota_usd_by_delta ? usd(e.quota_usd_by_delta) : t("dNA")) +
+      row2(t("dSamples"), t("dSamplesV", e.samples || 0, pct(e.evidence_percent))) +
+      row2(t("dCoverage"), w.full_coverage ? t("dYes") : t("dNoMid")) +
+      row2(t("dCycles"), t("dCyclesV", w.cycles || 0) +
+           (w.granted_resets ? "<b>" + t("dGranted", w.granted_resets) + "</b>" : "")) +
+      row2(t("dExternal"), w.unexplained_percent
+           ? "<b>" + t("dExternalV", pct(w.unexplained_percent)) + "</b>" : t("dNone")) +
+      row2(t("dExhaust"), w.will_exhaust_before_reset === true
+           ? "<span class='tag bad'>" + t("dWillExhaust") + "</span>"
+           : (w.will_exhaust_before_reset === false
+              ? "<span class='tag ok'>" + t("dLasts") + "</span>" : "—")) +
+      row2(t("dPerDay"), w.burn_usd_per_day === undefined ? "—" : usd(w.burn_usd_per_day)) +
       "</div>";
 
-    var m = "<table><thead><tr><th>模型</th><th>请求</th><th>失败</th><th>输入</th><th>输出</th>" +
-            "<th>缓存命中</th><th>单价(入/出)</th><th>均价/次</th><th>金额</th></tr></thead><tbody>";
+    var m = "<table><thead><tr><th>" + t("mtModel") + "</th><th>" + t("mtReq") + "</th><th>" +
+            t("mtFail") + "</th><th>" + t("mtIn") + "</th><th>" + t("mtOut") + "</th><th>" +
+            t("mtCache") + "</th><th>" + t("mtPrice") + "</th><th>" + t("mtAvg") + "</th><th>" +
+            t("mtUsd") + "</th></tr></thead><tbody>";
     (w.by_model || []).forEach(function (x) {
       var p = x.price || {};
-      m += "<tr><td>" + esc(x.model) + (x.unpriced ? " <span class='tag bad'>无价目</span>" : "") + "</td>" +
+      m += "<tr><td>" + esc(x.model) +
+           (x.unpriced ? " <span class='tag bad'>" + t("mtNoPrice") + "</span>" : "") + "</td>" +
            "<td class='num'>" + x.requests + "</td>" +
            "<td class='num'>" + (x.failed || 0) + "</td>" +
            "<td class='num'>" + tok(x.tokens.InputTokens) + "</td>" +
            "<td class='num'>" + tok(x.tokens.OutputTokens) +
-             (x.tokens.ReasoningTokens ? " <span class='sub2'>(含推理 " + tok(x.tokens.ReasoningTokens) + ")</span>" : "") + "</td>" +
+             (x.tokens.ReasoningTokens ? " <span class='sub2'>" +
+              t("mtReasoning", tok(x.tokens.ReasoningTokens)) + "</span>" : "") + "</td>" +
            "<td class='num'>" + (x.cache_hit_rate === undefined ? "—" : pct(x.cache_hit_rate)) + "</td>" +
            "<td class='num sub2'>" + (p.input === undefined ? "—" : "$" + p.input + " / $" + p.output) + "</td>" +
            "<td class='num'>" + (x.avg_usd === undefined ? "—" : usd(x.avg_usd)) + "</td>" +
@@ -455,27 +642,26 @@ const panelHTML = `<!doctype html>
     });
     m += "</tbody></table>";
 
-    return "<div class='wbox'><h3>" + wname(w) + " 窗口 · " +
-           (e.method === "none" ? "<span class='tag'>观测中</span>"
+    return "<div class='wbox'><h3>" + t("wTitle", wname(w)) + " · " +
+           (e.method === "none" ? "<span class='tag'>" + t("watching") + "</span>"
              : "<span class='tag " + esc(e.confidence) + "'>" + confWord(e.confidence) + "</span> " +
                "<span class='tag'>" + methodWord(e.method) + "</span>") + "</h3>" +
            kv + "<div style='margin-top:10px'>" + m + "</div></div>";
   }
-  function row2(k, v) { return "<div class='k'>" + esc(k) + "</div><div class='v'>" + v + "</div>"; }
 
   function detailRow(a) {
     var boxes = (a.windows || []).map(windowDetail).join("");
     var curveW = (a.windows || []).length ? a.windows[a.windows.length - 1].minutes : 0;
-    var curve = drawQuotaCurve(a.series, curveW, 300, 96);
+    var curve = drawQuotaCurve(a.series, curveW, 300, 96, L());
     var charts =
-      "<div style='margin-bottom:12px'>" + drawChart(a.series, 340, 80, false) +
-        "<div class='chartcap'><i class='sw bar'></i>每小时消耗 " +
-        "<i class='sw ln' style='margin-left:8px'></i>累计</div></div>" +
+      "<div style='margin-bottom:12px'>" + drawChart(a.series, 340, 80, false, L()) +
+        "<div class='chartcap'><i class='sw bar'></i>" + t("capHourly") +
+        " <i class='sw ln' style='margin-left:8px'></i>" + t("capCumulative") + "</div></div>" +
       (curve
-        ? "<div>" + curve + "<div class='chartcap'><i class='sw ln warn'></i>额度百分比（" +
-          (curveW ? wname({minutes: curveW}) : "") + "窗口） " +
-          "<i class='sw ln dash' style='margin-left:8px'></i>匀速参考线" +
-          "<br>曲线高过虚线 = 照此速度会在重置前用完</div></div>"
+        ? "<div>" + curve + "<div class='chartcap'><i class='sw ln warn'></i>" +
+          t("capCurve", curveW ? wname({ minutes: curveW }) : "") +
+          " <i class='sw ln dash' style='margin-left:8px'></i>" + t("capRef") +
+          "<br>" + t("capCurveHint") + "</div></div>"
         : "");
 
     return "<div class='wgrid'>" + boxes + "</div>" + charts;
@@ -483,8 +669,7 @@ const panelHTML = `<!doctype html>
 
   function sortAccounts(list) {
     var mode = el("sort").value;
-    function longest(a) { return a.longest || {}; }
-    function est(a) { return (longest(a).estimate) || {}; }
+    function est(a) { return ((a.longest || {}).estimate) || {}; }
     var c = {
       quota: function (a, b) { return (est(b).quota_usd || 0) - (est(a).quota_usd || 0); },
       remain: function (a, b) { return (est(b).remaining_usd || 0) - (est(a).remaining_usd || 0); },
@@ -496,9 +681,9 @@ const panelHTML = `<!doctype html>
   }
 
   function confWord(c) {
-    return { high: "高置信", medium: "中置信", low: "低置信", none: "无估算" }[c] || c;
+    return { high: t("confHigh"), medium: t("confMedium"), low: t("confLow"), none: t("confNone") }[c] || c;
   }
-  function methodWord(m) { return { window: "窗口法", delta: "步进法", none: "—" }[m] || m; }
+  function methodWord(m) { return { window: t("mWindow"), delta: t("mDelta"), none: "—" }[m] || m; }
 
   function card(k, v, n) {
     return "<div class='card'><div class='k'>" + esc(k) + "</div><div class='v'>" +
@@ -506,45 +691,70 @@ const panelHTML = `<!doctype html>
       (n ? "<div class='n'>" + esc(n) + "</div>" : "") + "</div>";
   }
 
+  // Backend warnings arrive as codes plus fields, so they render in whichever
+  // language is selected rather than whichever one the plugin was compiled with.
+  function warnText(w) {
+    switch (w.code) {
+      case "external_usage": return t("warnExternal", w.credential, w.window, pct(w.percent));
+      case "unpriced_models": return t("warnUnpriced", (w.models || []).join(", "), w.credential);
+      case "price_refresh_failed": return t("warnPrice", w.message);
+      default: return w.message || w.code || "";
+    }
+  }
+
+  function applyStatic() {
+    document.documentElement.lang = LANG === "zh" ? "zh-CN" : "en";
+    el("t-title").textContent = t("title");
+    el("t-sub").textContent = t("sub");
+    keyBox.placeholder = t("keyPlaceholder");
+    el("load").textContent = t("load");
+    el("forget").textContent = t("forget");
+    el("export").textContent = t("exportJson");
+    el("t-chart").textContent = t("chartTitle");
+    el("t-lg1").textContent = t("legendBars");
+    el("t-lg2").textContent = t("legendLine");
+    el("t-prices").textContent = t("pricesTitle");
+    var opts = el("sort").options;
+    var names = ["sortQuota", "sortRemain", "sortUsed", "sortPace", "sortName"];
+    for (var i = 0; i < opts.length; i++) opts[i].textContent = t(names[i]);
+    el("lang").value = LANG;
+  }
+
   function render(data) {
     last = data;
     alerts.innerHTML = "";
-    (data.warnings || []).forEach(function (w) { note("warn", w); });
+    (data.warnings || []).forEach(function (w) { note("warn", warnText(w)); });
 
     var accounts = data.accounts || [];
     var stale = accounts.filter(function (a) { return a.stale; });
-    if (stale.length) {
-      note("warn", stale.length + " 个凭据的额度读数已经过期（长时间没有流量经过），下面显示的是最后一次观测值，不代表现在。");
-    }
+    if (stale.length) note("warn", t("warnStale", stale.length));
     var waiting = accounts.filter(function (a) {
       return !a.longest || !a.longest.estimate || a.longest.estimate.method === "none";
     });
-    if (waiting.length) {
-      note("warn", waiting.length + " / " + accounts.length +
-        " 个凭据还没有估算值。额度只有在「插件亲眼看到百分比至少走动 1 点」之后才能定价，正常使用中会自动补上。");
-    }
+    if (waiting.length) note("warn", t("warnWaiting", waiting.length, accounts.length));
 
     // One summary block per window length: the 5-hour and the weekly limit are
     // separate quotas, and the same spend counts against both.
     var wt = data.window_totals || [];
-    wtotals.innerHTML = wt.map(function (t) {
-      return "<div class='box'><h2>" + wname(t) + " 窗口合计</h2><div class='cards' style='margin:0'>" +
-        card("凭据数", t.credentials, t.estimated + " 个已定价" + (t.at_risk ? " · " + t.at_risk + " 个逼近上限" : "")) +
-        card("额度总值", usd(t.quota_usd)) +
-        card("已用", usd(t.spent_usd)) +
-        card("剩余", usd(t.remaining_usd)) +
+    wtotals.innerHTML = wt.map(function (x) {
+      return "<div class='box'><h2>" + t("totalsTitle", wname(x)) + "</h2><div class='cards' style='margin:0'>" +
+        card(t("cCreds"), x.credentials,
+             t("cPriced", x.estimated) + (x.at_risk ? " · " + t("cAtRisk", x.at_risk) : "")) +
+        card(t("cQuota"), usd(x.quota_usd)) +
+        card(t("cSpent"), usd(x.spent_usd)) +
+        card(t("cRemain"), usd(x.remaining_usd)) +
         "</div></div>";
     }).join("");
 
-    var t = data.totals || {};
+    var tot = data.totals || {};
     cards.innerHTML =
-      card("凭据数", t.credentials) +
-      card("实测消耗", usd(t.window_usd_observed), "最长窗口内，插件亲眼记账部分") +
-      card("缓存省下", usd(t.cache_saved_usd), "对比全价输入") +
-      card("请求数", (t.requests || 0).toLocaleString("zh-CN"), (t.failed || 0) + " 次失败");
+      card(t("cCreds"), tot.credentials) +
+      card(t("cObserved"), usd(tot.window_usd_observed), t("cObservedN")) +
+      card(t("cSaved"), usd(tot.cache_saved_usd), t("cSavedN")) +
+      card(t("cRequests"), (tot.requests || 0).toLocaleString(t("locale")), t("cFailedN", tot.failed || 0));
     cards.hidden = false;
 
-    chart.innerHTML = drawChart(data.fleet_series, 1000, 165, true);
+    chart.innerHTML = drawChart(data.fleet_series, 1000, 165, true, L());
     chartbox.hidden = false;
 
     // Columns follow whatever window lengths upstream is actually reporting.
@@ -558,9 +768,9 @@ const panelHTML = `<!doctype html>
       });
       lengths.sort(function (a, b) { return a - b; });
     }
-    head.innerHTML = "<th>凭据</th><th>套餐</th>" +
-      lengths.map(function (m) { return "<th>" + wname({minutes: m}) + " 额度</th>"; }).join("") +
-      "<th>状态</th>";
+    head.innerHTML = "<th>" + t("thCred") + "</th><th>" + t("thPlan") + "</th>" +
+      lengths.map(function (m) { return "<th>" + t("thQuota", wname({ minutes: m })) + "</th>"; }).join("") +
+      "<th>" + t("thStatus") + "</th>";
 
     rows.innerHTML = "";
     sortAccounts(accounts).forEach(function (a, i) {
@@ -570,16 +780,17 @@ const panelHTML = `<!doctype html>
       var tr = document.createElement("tr");
       tr.className = "main" + (a.disabled ? " off" : "");
       var tags = "";
-      if (a.disabled) tags += " <span class='tag'>已停用</span>";
-      if (a.unavailable) tags += " <span class='tag bad'>不可用</span>";
-      if (a.stale) tags += " <span class='tag warn'>读数陈旧</span>";
+      if (a.disabled) tags += " <span class='tag'>" + t("tagDisabled") + "</span>";
+      if (a.unavailable) tags += " <span class='tag bad'>" + t("tagUnavailable") + "</span>";
+      if (a.stale) tags += " <span class='tag warn'>" + t("tagStale") + "</span>";
       if (a.limit_reached_type) tags += " <span class='tag bad'>" + esc(a.limit_reached_type) + "</span>";
 
       var html =
         "<td><span class='toggle' data-i='" + i + "'>▸</span> <span class='name'>" +
           esc(a.label || a.auth_id) + "</span>" + tags +
-          "<div class='sub2'>" + (a.total_requests || 0) + " 次累计 · " + usd(a.total_usd) +
-          (a.observed_age_seconds !== undefined ? " · " + dur(a.observed_age_seconds) + "前观测" : "") +
+          "<div class='sub2'>" + t("rowTotals", a.total_requests || 0, usd(a.total_usd)) +
+          (a.observed_age_seconds !== undefined
+            ? " · " + t("rowObserved", dur(a.observed_age_seconds)) : "") +
           "</div></td>" +
         "<td>" + esc(a.plan_type || "—") +
           (a.active_limit ? "<div class='sub2'>" + esc(a.active_limit) + "</div>" : "") + "</td>";
@@ -587,7 +798,7 @@ const panelHTML = `<!doctype html>
 
       var le = (a.longest && a.longest.estimate) || {};
       html += "<td>" + (le.method === "none" || !le.method
-        ? "<span class='tag'>待百分比走动 1%</span>"
+        ? "<span class='tag'>" + t("needTick") + "</span>"
         : "<span class='tag " + esc(le.confidence) + "'>" + confWord(le.confidence) + "</span> " +
           "<span class='tag'>" + methodWord(le.method) + " " + pct(le.evidence_percent) + "</span>") + "</td>";
       tr.innerHTML = html;
@@ -605,20 +816,14 @@ const panelHTML = `<!doctype html>
     });
     wrap.hidden = false;
 
-    stamp.textContent = "更新于 " + new Date().toLocaleTimeString("zh-CN");
-    var via = { host: "经 CPA 代理", direct: "直连" }[data.price_transport] || "";
+    stamp.textContent = t("updatedAt", new Date().toLocaleTimeString(t("locale")));
+    var via = data.price_transport === "host" ? t("viaHost")
+            : (data.price_transport === "direct" ? t("viaDirect") : "");
     foot.innerHTML =
-      "价目来源：" + esc(data.price_source || "内置表") +
-      (via ? "（" + via + "）" : "") +
-      (data.price_fetched ? "，同步于 " + esc(data.price_fetched) : "") + "<br>" +
-      "<b>窗口按长度识别</b>，不按上游的 primary/secondary 标签——这两个标签的含义变过一次" +
-      "（5 小时限额回归后，primary 从周窗口变成了 5 小时窗口）。同一笔花费同时计入所有窗口，" +
-      "所以每个窗口各自独立估算。<br>" +
-      "<b>窗口法</b>＝整周期实测消耗 ÷ 整周期百分比，只在插件看到周期从 0% 开始时可用；" +
-      "<b>步进法</b>＝Σ两次读数间的消耗 ÷ Σ百分比步进，中途安装也能收敛。" +
-      "校准样本有数量与时效上限，因此套餐变化后估算会跟着变，不会被旧数据永久拖住。<br>" +
-      "<b>节奏</b>＝额度消耗比例 ÷ 窗口时间流逝比例，大于 1 表示照此速度会在重置前用完。" +
-      "缓存读取与推理 token 分别是输入、输出的子集，不重复计费。";
+      t("footPrices", esc(data.price_source || "builtin")) +
+      (via ? t("footVia", via) : "") +
+      (data.price_fetched ? t("footFetched", esc(data.price_fetched)) : "") + "<br>" +
+      t("footBody");
     loadPrices();
   }
 
@@ -626,17 +831,20 @@ const panelHTML = `<!doctype html>
     return fetch(base() + "/v0/management/codex-weekly-usd/" + path, {
       headers: { "X-Management-Key": keyBox.value.trim() }, cache: "no-store"
     }).then(function (r) {
-      if (r.status === 401 || r.status === 403) throw new Error("管理密钥被拒绝。");
-      if (!r.ok) throw new Error("请求失败：HTTP " + r.status);
+      if (r.status === 401 || r.status === 403) throw new Error(t("keyRejected"));
+      if (!r.ok) throw new Error(t("reqFailed", r.status));
       return r.json();
     });
   }
 
   function loadPrices() {
     api("prices").then(function (p) {
-      var h = "<table><thead><tr><th>模型</th><th>输入</th><th>输出</th><th>缓存读</th><th>缓存写</th></tr></thead><tbody>";
+      var h = "<table><thead><tr><th>" + t("pModel") + "</th><th>" + t("pIn") + "</th><th>" +
+              t("pOut") + "</th><th>" + t("pCacheR") + "</th><th>" + t("pCacheW") +
+              "</th></tr></thead><tbody>";
       (p.models || []).forEach(function (m) {
-        h += "<tr><td>" + esc(m.model) + (m.overridden ? " <span class='tag'>已覆盖</span>" : "") + "</td>" +
+        h += "<tr><td>" + esc(m.model) +
+             (m.overridden ? " <span class='tag'>" + t("pOverridden") + "</span>" : "") + "</td>" +
              "<td class='num'>$" + m.input + "</td><td class='num'>$" + m.output + "</td>" +
              "<td class='num'>" + (m.cache_read ? "$" + m.cache_read : "—") + "</td>" +
              "<td class='num'>" + (m.cache_write ? "$" + m.cache_write : "—") + "</td></tr>";
@@ -647,7 +855,7 @@ const panelHTML = `<!doctype html>
   }
 
   function load() {
-    if (!keyBox.value.trim()) { alerts.innerHTML = ""; note("warn", "请先填入管理密钥。"); return; }
+    if (!keyBox.value.trim()) { alerts.innerHTML = ""; note("warn", t("needKey")); return; }
     localStorage.setItem(STORE, keyBox.value.trim());
     api("data").then(render).catch(function (err) {
       alerts.innerHTML = ""; note("bad", err.message);
@@ -658,6 +866,12 @@ const panelHTML = `<!doctype html>
 
   el("load").addEventListener("click", load);
   el("sort").addEventListener("change", function () { if (last) render(last); });
+  el("lang").addEventListener("change", function (ev) {
+    LANG = ev.target.value;
+    try { localStorage.setItem(LANGKEY, LANG); } catch (e) { /* private mode */ }
+    applyStatic();
+    if (last) render(last);
+  });
   keyBox.addEventListener("keydown", function (e) { if (e.key === "Enter") load(); });
   el("forget").addEventListener("click", function () {
     localStorage.removeItem(STORE); keyBox.value = ""; last = null;
@@ -666,13 +880,14 @@ const panelHTML = `<!doctype html>
     if (timer) { clearInterval(timer); timer = null; }
   });
   el("export").addEventListener("click", function () {
-    if (!last) { note("warn", "请先加载数据。"); return; }
+    if (!last) { note("warn", t("loadFirst")); return; }
     var blob = new Blob([JSON.stringify(last, null, 2)], { type: "application/json" });
     var url = URL.createObjectURL(blob), a = document.createElement("a");
-    a.href = url; a.download = "codex-weekly-usd-" + new Date().toISOString().slice(0, 10) + ".json";
+    a.href = url; a.download = "codex-quota-usd-" + new Date().toISOString().slice(0, 10) + ".json";
     a.click(); URL.revokeObjectURL(url);
   });
 
+  applyStatic();
   if (keyBox.value) load();
   timer = setInterval(function () { if (keyBox.value.trim()) load(); }, 60000);
 })();

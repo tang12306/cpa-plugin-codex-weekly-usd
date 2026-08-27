@@ -18,9 +18,24 @@ function lift(name) {
   return html.slice(start, i + 1);
 }
 
-const src = ["usd", "pct", "buildBuckets", "agoLabel", "drawChart", "drawQuotaCurve"]
+// liftVar grabs an object literal by balancing braces, so the translation
+// dictionaries can be evaluated exactly rather than pattern-matched.
+function liftVar(name) {
+  const start = html.indexOf("  var " + name + " = {");
+  if (start < 0) throw new Error("var not found in panel: " + name);
+  let depth = 0, i = html.indexOf("{", start);
+  const from = i;
+  for (; i < html.length; i++) {
+    if (html[i] === "{") depth++;
+    else if (html[i] === "}" && --depth === 0) break;
+  }
+  return html.slice(from, i + 1);
+}
+
+const src = ["usd", "pct", "chartLabels", "buildBuckets", "agoLabel", "drawChart", "drawQuotaCurve"]
   .map(lift).join("\n");
 eval(src);
+const I18N = eval("(" + liftVar("I18N") + ")");
 
 let failures = 0;
 function check(name, got, want) {
@@ -52,7 +67,7 @@ check("renders svg", svg.startsWith("<svg"), true);
 check("one bar per bucket", (svg.match(/<rect /g) || []).length, 48);
 check("has cumulative polyline", (svg.match(/<polyline /g) || []).length, 1);
 check("axis shows cumulative total", svg.includes("$24.00"), true);
-check("bar tooltip labels now", svg.includes("本小时"), true);
+check("bar tooltip labels now", svg.includes("this hour"), true);
 
 // The cumulative line must be flat while nothing is spent, then rise.
 const pts = svg.match(/points='([^']+)'/)[1].split(" ").map(p => p.split(",").map(Number));
@@ -77,7 +92,35 @@ check("rollover restarts the curve", rpts.length, 12);
 // One reading is not a trend and must render nothing at all.
 check("single point draws nothing",
   drawQuotaCurve([{ ago: 0, usd: 1, requests: 1, percent: 5 }], 10080, 300, 96), "");
-check("empty series handled", drawChart([], 300, 76, false).includes("暂无数据"), true);
+check("empty series handled", drawChart([], 300, 76, false).includes("No data"), true);
+
+// The SVG builders take their few words as an argument rather than reading a
+// language global, which is what lets this file run them outside a browser.
+const zh = { noData: "暂无数据", thisHour: "本小时", hoursAgo: "小时前",
+             now: "现在", total: "累计", reqs: "次" };
+const zhSvg = drawChart(series, 1000, 165, true, zh);
+check("labels are translatable", zhSvg.includes("本小时") && zhSvg.includes("累计"), true);
+check("translated chart keeps geometry", (zhSvg.match(/<rect /g) || []).length, 48);
+check("empty series translatable", drawChart([], 300, 76, false, zh).includes("暂无数据"), true);
+
+console.log();
+console.log("=".repeat(74));
+console.log("H. translation dictionaries");
+console.log("=".repeat(74));
+const zhKeys = Object.keys(I18N.zh), enKeys = Object.keys(I18N.en);
+const missingEn = zhKeys.filter(k => !(k in I18N.en));
+const missingZh = enKeys.filter(k => !(k in I18N.zh));
+check("languages offered", Object.keys(I18N).sort().join(","), "en,zh");
+check("dictionary is substantial", zhKeys.length > 60, true);
+check("no key missing from en", missingEn.join(",") || "none", "none");
+check("no key missing from zh", missingZh.join(",") || "none", "none");
+// A key present but left as the other language's text is worse than a missing
+// key: it looks translated and is not.
+const identical = zhKeys.filter(k =>
+  typeof I18N.zh[k] === "string" && I18N.zh[k] === I18N.en[k] &&
+  /[A-Za-z]{4}/.test(I18N.zh[k]) && k !== "locale");
+check("no untranslated leftovers", identical.join(",") || "none", "none");
+check("every value is a string", zhKeys.every(k => typeof I18N.zh[k] === "string"), true);
 
 console.log();
 console.log("=".repeat(74));

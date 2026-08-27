@@ -130,13 +130,19 @@ price_overrides:
 
 ## Dashboard
 
-The panel is in Simplified Chinese and shows, per credential:
+**The panel speaks English and Simplified Chinese**, switchable in the toolbar and
+remembered in the browser; the first visit follows the browser's language.
+Backend warnings travel as structured codes rather than finished sentences, so
+they switch language with everything else instead of leaving the page half
+translated.
+
+Per credential:
 
 - **额度 / 时间双进度条** — quota consumed against clock elapsed, side by side.
   The comparison is the fastest read on who is over-consuming.
 - **节奏** — `used_percent ÷ time_progress_percent`. Above 1.15 is flagged 偏快,
   below 0.85 is 宽裕. Above 1 means the window runs out before it resets.
-- **周额度 / 已用 / 剩余 / 日均** in USD, plus a reset countdown.
+- **Quota / spent / remaining / per-day** in USD for every window, plus a reset countdown.
 - **依据** — which estimator produced the number and how much evidence backs it.
 
 Expanding a row adds a per-model table (requests, failures, input/output tokens
@@ -246,7 +252,7 @@ replays them over a synthetic multi-hour series, so what is asserted is
 byte-for-byte what a browser receives: bar count, cumulative monotonicity,
 points per known hour, rollover restart, and the degenerate cases.
 
-Currently 77 checks. The scenario is arithmetic rather than opinion: every request costs exactly
+Currently 91 checks. The scenario is arithmetic rather than opinion: every request costs exactly
 $2.00 at gpt-5.6-sol public pricing and moves the percentage by exactly one
 point, so the answer must be $200. Covered: both estimators agreeing, cache-read
 carve-out, reasoning tokens not double-billed, unknown models flagged, restart

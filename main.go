@@ -89,9 +89,9 @@ const (
 // Stamped at build time so a fork does not have to edit source to identify
 // itself:
 //
-//	go build -ldflags "-X main.pluginVersion=2.0.0 -X main.repository=github.com/owner/repo"
+//	go build -ldflags "-X main.pluginVersion=2.1.0 -X main.repository=github.com/owner/repo"
 var (
-	pluginVersion = "2.0.0"
+	pluginVersion = "2.1.0"
 	pluginAuthor  = "tang12306"
 	repository    = "github.com/tang12306/cpa-plugin-codex-weekly-usd"
 )
@@ -242,8 +242,8 @@ func managementRegistration() json.RawMessage {
 		"resources": []map[string]any{
 			{
 				"Path":        "/panel",
-				"Menu":        "额度美元",
-				"Description": "按 OpenAI 官方 API 价目，推算每个凭据每个额度窗口值多少美元。",
+				"Menu":        "Quota USD",
+				"Description": "按 OpenAI 官方 API 价目推算每个凭据每个额度窗口值多少美元（面板支持中英文）。Values each Codex credential's quota windows in USD at public OpenAI API pricing.",
 			},
 		},
 	}

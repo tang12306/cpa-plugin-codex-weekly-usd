@@ -912,7 +912,9 @@ func (a *App) Report() map[string]any {
 	a.mu.Unlock()
 
 	rows := make([]map[string]any, 0, len(accounts))
-	warnings := make([]string, 0)
+	// Warnings are structured rather than prose: the panel renders them in the
+	// language the operator picked, so the text cannot live here.
+	warnings := make([]map[string]any, 0)
 	totals := map[int]*windowTotals{}
 	var totalWindowUSD, totalSaved float64
 	var totalReqs, totalFailed int64
@@ -997,11 +999,12 @@ func (a *App) Report() map[string]any {
 				t.AtRisk++
 			}
 			if w.UnexplainedPct > 1 {
-				warnings = append(warnings, fmt.Sprintf("%s 的 %s 窗口有 %.0f%% 的额度被消耗但不在本插件账上，可能有其它客户端在共用该凭据",
-					displayName(acct, a), windowLabel(w.Minutes), w.UnexplainedPct))
-			}
-			if w.GrantedResets > 0 {
-				entry["note"] = fmt.Sprintf("观察到 %d 次周期内重置", w.GrantedResets)
+				warnings = append(warnings, map[string]any{
+					"code":       "external_usage",
+					"credential": displayName(acct, a),
+					"window":     windowLabel(w.Minutes),
+					"percent":    round2(w.UnexplainedPct),
+				})
 			}
 
 			if w.Percent > bindingPct {
@@ -1038,8 +1041,11 @@ func (a *App) Report() map[string]any {
 		}
 		if len(acct.UnpricedList) > 0 {
 			row["unpriced_models"] = acct.UnpricedList
-			warnings = append(warnings, fmt.Sprintf("%s 没有公开价目（凭据 %s），其花费未计入估算",
-				strings.Join(acct.UnpricedList, "、"), displayName(acct, a)))
+			warnings = append(warnings, map[string]any{
+				"code":       "unpriced_models",
+				"credential": displayName(acct, a),
+				"models":     acct.UnpricedList,
+			})
 		}
 		if acct.Credits.LimitReached != "" {
 			row["limit_reached_type"] = acct.Credits.LimitReached
@@ -1098,7 +1104,7 @@ func (a *App) Report() map[string]any {
 
 	priceSnapshot := a.prices.Snapshot()
 	if msg, _ := priceSnapshot["last_error"].(string); msg != "" {
-		warnings = append(warnings, "价目刷新失败："+msg)
+		warnings = append(warnings, map[string]any{"code": "price_refresh_failed", "message": msg})
 	}
 
 	return map[string]any{
