@@ -22,8 +22,8 @@ type managementResponse struct {
 // HandleManagement serves both route families.
 //
 // /panel is reachable without the management key, so it must never contain
-// data: it ships an empty shell that asks the operator for the key and then
-// calls the authenticated /data route itself.
+// data: it ships an empty shell that asks the operator for the management key
+// and then calls the authenticated /data route itself.
 func (a *App) HandleManagement(payload []byte) json.RawMessage {
 	var req managementRequest
 	_ = json.Unmarshal(payload, &req)
@@ -70,7 +70,7 @@ const panelHTML = `<!doctype html>
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Codex 周额度美元估算</title>
+<title>Codex 额度美元估算</title>
 <style>
   :root {
     --bg:#f5f6f8; --panel:#fff; --panel2:#fafbfc; --ink:#15181d; --muted:#6b7280;
@@ -89,6 +89,7 @@ const panelHTML = `<!doctype html>
        font:14px/1.55 ui-sans-serif,system-ui,-apple-system,"Segoe UI","PingFang SC","Microsoft YaHei",sans-serif}
   h1{font-size:19px;margin:0 0 2px;letter-spacing:.3px}
   h2{font-size:14px;margin:0 0 10px;color:var(--muted);font-weight:600}
+  h3{font-size:13px;margin:0 0 8px;color:var(--muted);font-weight:600}
   .sub{color:var(--muted);font-size:13px}
   .bar{display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin:16px 0}
   input,button,select{font:inherit;padding:7px 11px;border-radius:7px;
@@ -98,15 +99,15 @@ const panelHTML = `<!doctype html>
   button:hover{background:var(--accent);color:#fff}
   button.ghost{border-color:var(--line);color:var(--muted)}
   button.ghost:hover{background:var(--line);color:var(--ink)}
-  .cards{display:grid;grid-template-columns:repeat(auto-fit,minmax(158px,1fr));gap:10px;margin-bottom:16px}
+  .cards{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:10px;margin-bottom:10px}
   .card{background:var(--panel);border:1px solid var(--line);border-radius:10px;padding:12px 14px}
   .card .k{color:var(--muted);font-size:12px}
-  .card .v{font-size:22px;font-weight:650;margin-top:3px;font-variant-numeric:tabular-nums}
+  .card .v{font-size:21px;font-weight:650;margin-top:3px;font-variant-numeric:tabular-nums}
   .card .n{font-size:12px;color:var(--muted);font-weight:400}
   .box{background:var(--panel);border:1px solid var(--line);border-radius:10px;padding:14px 16px;margin-bottom:16px}
   .wrap{overflow-x:auto;background:var(--panel);border:1px solid var(--line);border-radius:10px}
-  table{border-collapse:collapse;width:100%;min-width:1080px}
-  th,td{padding:9px 12px;text-align:right;border-bottom:1px solid var(--line);white-space:nowrap}
+  table{border-collapse:collapse;width:100%;min-width:1100px}
+  th,td{padding:9px 12px;text-align:right;border-bottom:1px solid var(--line);white-space:nowrap;vertical-align:top}
   th{font-size:12px;color:var(--muted);font-weight:600;position:sticky;top:0;background:var(--panel);z-index:1}
   th:first-child,td:first-child{text-align:left}
   tbody tr:last-child>td{border-bottom:none}
@@ -114,10 +115,10 @@ const panelHTML = `<!doctype html>
   td.num{font-variant-numeric:tabular-nums}
   .name{font-weight:600}
   .sub2{font-size:12px;color:var(--muted);font-weight:400}
-  .dual{display:flex;flex-direction:column;gap:3px;width:132px}
-  .meter{position:relative;height:7px;border-radius:4px;background:var(--line);overflow:hidden}
+  .wcell{display:flex;flex-direction:column;gap:3px;min-width:140px;align-items:flex-end}
+  .meter{position:relative;height:7px;border-radius:4px;background:var(--line);overflow:hidden;width:132px}
   .meter>i{position:absolute;inset:0 auto 0 0;display:block;border-radius:4px}
-  .mlabel{display:flex;justify-content:space-between;font-size:11px;color:var(--muted)}
+  .mlabel{display:flex;justify-content:space-between;font-size:11px;color:var(--muted);width:132px}
   .tag{display:inline-block;padding:1px 7px;border-radius:999px;font-size:11px;
        border:1px solid var(--line);color:var(--muted);white-space:nowrap}
   .tag.high,.tag.ok{color:var(--good);border-color:var(--good)}
@@ -132,7 +133,8 @@ const panelHTML = `<!doctype html>
   tr.detail>td{background:var(--panel2);padding:14px 16px}
   tr.detail table{min-width:0;width:auto}
   tr.detail th,tr.detail td{border-bottom:1px solid var(--grid);padding:6px 14px 6px 0}
-  .grid2{display:grid;grid-template-columns:minmax(420px,1.6fr) minmax(240px,1fr);gap:22px;align-items:start}
+  .wgrid{display:grid;grid-template-columns:repeat(auto-fit,minmax(330px,1fr));gap:18px;margin-bottom:16px}
+  .wbox{border:1px solid var(--line);border-radius:9px;padding:12px 14px;background:var(--panel)}
   .kv{display:grid;grid-template-columns:auto auto;gap:3px 14px;font-size:12.5px}
   .kv .k{color:var(--muted)}
   .kv .v{text-align:right;font-variant-numeric:tabular-nums}
@@ -149,8 +151,8 @@ const panelHTML = `<!doctype html>
 </style>
 </head>
 <body>
-<h1>Codex 周额度美元估算</h1>
-<div class="sub">按 OpenAI 官方 API 价目,推算每个凭据的周额度值多少美元</div>
+<h1>Codex 额度美元估算</h1>
+<div class="sub">按 OpenAI 官方 API 价目，推算每个凭据的每个额度窗口值多少美元</div>
 
 <div class="bar">
   <input id="key" type="password" placeholder="管理密钥" autocomplete="off" spellcheck="false">
@@ -158,7 +160,7 @@ const panelHTML = `<!doctype html>
   <button class="ghost" id="forget">忘记密钥</button>
   <button class="ghost" id="export">导出 JSON</button>
   <select id="sort">
-    <option value="quota">按周额度排序</option>
+    <option value="quota">按最长窗口额度排序</option>
     <option value="remain">按剩余排序</option>
     <option value="used">按已用比例排序</option>
     <option value="pace">按消耗节奏排序</option>
@@ -168,6 +170,7 @@ const panelHTML = `<!doctype html>
 </div>
 
 <div id="alerts"></div>
+<div id="wtotals"></div>
 <div id="cards" class="cards" hidden></div>
 <div id="chartbox" class="box" hidden>
   <h2>全部凭据 · 用量走势
@@ -178,12 +181,7 @@ const panelHTML = `<!doctype html>
 </div>
 <div id="wrap" class="wrap" hidden>
   <table>
-    <thead>
-      <tr>
-        <th>凭据</th><th>套餐</th><th>额度 / 时间进度</th><th>节奏</th>
-        <th>周额度</th><th>已用</th><th>剩余</th><th>日均</th><th>重置倒计时</th><th>依据</th>
-      </tr>
-    </thead>
+    <thead><tr id="head"></tr></thead>
     <tbody id="rows"></tbody>
   </table>
 </div>
@@ -200,8 +198,8 @@ const panelHTML = `<!doctype html>
   var STORE = "cwu.key";
   var el = function (id) { return document.getElementById(id); };
   var keyBox = el("key"), alerts = el("alerts"), rows = el("rows"), cards = el("cards");
-  var wrap = el("wrap"), stamp = el("stamp"), foot = el("foot");
-  var chartbox = el("chartbox"), chart = el("chart"), pricebox = el("pricebox");
+  var wrap = el("wrap"), stamp = el("stamp"), foot = el("foot"), head = el("head");
+  var chartbox = el("chartbox"), chart = el("chart"), pricebox = el("pricebox"), wtotals = el("wtotals");
   var last = null, timer = null;
 
   keyBox.value = localStorage.getItem(STORE) || "";
@@ -230,7 +228,15 @@ const panelHTML = `<!doctype html>
   function dur(s) {
     if (s === null || s === undefined) return "—";
     var h = Math.floor(s / 3600), d = Math.floor(h / 24);
-    return d > 0 ? d + " 天 " + (h % 24) + " 小时" : h + " 小时 " + Math.floor((s % 3600) / 60) + " 分";
+    if (d > 0) return d + " 天 " + (h % 24) + " 小时";
+    if (h > 0) return h + " 小时 " + Math.floor((s % 3600) / 60) + " 分";
+    return Math.floor(s / 60) + " 分";
+  }
+  function wname(w) {
+    var m = w.minutes;
+    if (m % 1440 === 0) return (m / 1440) + " 天";
+    if (m % 60 === 0) return (m / 60) + " 小时";
+    return m + " 分";
   }
   function heat(p) { return p >= 90 ? "var(--bad)" : p >= 70 ? "var(--warn)" : "var(--good)"; }
   function note(cls, text) {
@@ -378,34 +384,63 @@ const panelHTML = `<!doctype html>
     return svg + "</svg>";
   }
 
-  function dualMeter(a) {
-    var q = a.used_percent || 0, t = a.time_progress_percent;
-    var s = "<div class='dual'>";
-    s += "<div class='mlabel'><span>额度</span><span>" + pct(q) + "</span></div>";
-    s += "<div class='meter'><i style='width:" + Math.min(100, q) + "%;background:" + heat(q) + "'></i></div>";
-    if (t !== undefined && t !== null) {
-      s += "<div class='mlabel'><span>时间</span><span>" + pct(t) + "</span></div>";
-      s += "<div class='meter'><i style='width:" + Math.min(100, t) +
-           "%;background:var(--muted);opacity:.55'></i></div>";
-    }
-    return s + "</div>";
-  }
-
   // Quota consumed versus clock elapsed. Above 1 means the window will run out
   // early at the current rate.
-  function paceTag(a) {
-    var r = a.pace_ratio;
-    if (r === undefined || r === null) return "<span class='tag'>—</span>";
+  function paceTag(w) {
+    var r = w.pace_ratio;
+    if (r === undefined || r === null) return "";
     var cls = r > 1.15 ? "bad" : (r < 0.85 ? "ok" : "");
     var word = r > 1.15 ? "偏快" : (r < 0.85 ? "宽裕" : "正常");
     return "<span class='tag " + cls + "'>" + word + " ×" + r.toFixed(2) + "</span>";
   }
 
-  function detailRow(a) {
-    var e = a.estimate || {};
+  function windowCell(w) {
+    if (!w) return "<td class='num'><span class='tag'>无</span></td>";
+    var e = w.estimate || {};
+    var waiting = e.method === "none";
+    var p = w.used_percent || 0;
+    var s = "<td><div class='wcell'>";
+    s += "<div class='mlabel'><span>" + pct(p) + "</span><span>" +
+         (w.time_progress_percent !== undefined ? "时间 " + pct(w.time_progress_percent) : "") + "</span></div>";
+    s += "<div class='meter'><i style='width:" + Math.min(100, p) + "%;background:" + heat(p) + "'></i></div>";
+    if (w.time_progress_percent !== undefined) {
+      s += "<div class='meter'><i style='width:" + Math.min(100, w.time_progress_percent) +
+           "%;background:var(--muted);opacity:.5'></i></div>";
+    }
+    s += "<div class='sub2'>" + (waiting ? "<span class='tag'>观测中</span>"
+         : "剩 <b>" + usd(e.remaining_usd) + "</b> / " + usd(e.quota_usd)) + "</div>";
+    s += "<div class='sub2'>" + paceTag(w) + " <span class='tag'>" + dur(w.reset_in_seconds) + "后重置</span></div>";
+    return s + "</div></td>";
+  }
+
+  function windowDetail(w) {
+    var e = w.estimate || {};
+    var t = w.tokens || {};
+    var kv = "<div class='kv'>" +
+      row2("窗口实测消耗", usd(w.usd_observed)) +
+      row2("已归属消耗", usd(e.attributed_usd) + "<span class='sub2'> / 挂账 " +
+           usd((w.usd_observed || 0) - (e.attributed_usd || 0)) + "</span>") +
+      row2("缓存省下", usd(w.saved_usd)) +
+      row2("请求 / 失败", (w.requests || 0) + " / " + (w.failed || 0) +
+           (w.failure_rate ? " (" + pct(w.failure_rate) + ")" : "")) +
+      row2("均价每次", usd(w.avg_usd_per_request)) +
+      row2("输入 / 输出", tok(t.InputTokens) + " / " + tok(t.OutputTokens)) +
+      row2("缓存读取", tok(t.CacheReadTokens) + (w.cache_hit_rate !== undefined ? " (" + pct(w.cache_hit_rate) + ")" : "")) +
+      row2("窗口法估算", e.quota_usd_by_window ? usd(e.quota_usd_by_window) : "不可用") +
+      row2("步进法估算", e.quota_usd_by_delta ? usd(e.quota_usd_by_delta) : "不可用") +
+      row2("校准样本", (e.samples || 0) + " 条 / 覆盖 " + pct(e.evidence_percent)) +
+      row2("整窗覆盖", w.full_coverage ? "是" : "否（中途接管）") +
+      row2("已观察周期", (w.cycles || 0) + " 次" +
+           (w.granted_resets ? "，其中 <b>" + w.granted_resets + " 次周期内重置</b>" : "")) +
+      row2("外部消耗", w.unexplained_percent ? "<b>" + pct(w.unexplained_percent) + "</b>（不在本插件账上）" : "无") +
+      row2("跑满预警", w.will_exhaust_before_reset === true ? "<span class='tag bad'>会提前用完</span>" :
+           (w.will_exhaust_before_reset === false ? "<span class='tag ok'>够用到重置</span>" : "—")) +
+      row2("日均消耗", w.burn_usd_per_day === undefined ? "—" : usd(w.burn_usd_per_day)) +
+      "</div>";
+
     var m = "<table><thead><tr><th>模型</th><th>请求</th><th>失败</th><th>输入</th><th>输出</th>" +
             "<th>缓存命中</th><th>单价(入/出)</th><th>均价/次</th><th>金额</th></tr></thead><tbody>";
-    (a.by_model || []).forEach(function (x) {
+    (w.by_model || []).forEach(function (x) {
       var p = x.price || {};
       m += "<tr><td>" + esc(x.model) + (x.unpriced ? " <span class='tag bad'>无价目</span>" : "") + "</td>" +
            "<td class='num'>" + x.requests + "</td>" +
@@ -420,53 +455,55 @@ const panelHTML = `<!doctype html>
     });
     m += "</tbody></table>";
 
-    var t = a.window_tokens || {};
-    var kv = "<div class='kv'>" +
-      row2("窗口实测消耗", usd(a.window_usd_observed)) +
-      row2("已归属消耗", usd(e.attributed_usd) + "<span class='sub2'> / 挂账 " +
-           usd((a.window_usd_observed || 0) - (e.attributed_usd || 0)) + "</span>") +
-      row2("缓存省下", usd(a.window_saved_usd)) +
-      row2("请求 / 失败", (a.window_requests || 0) + " / " + (a.window_failed || 0) +
-           (a.failure_rate ? " (" + pct(a.failure_rate) + ")" : "")) +
-      row2("均价每次", usd(a.avg_usd_per_request)) +
-      row2("输入 / 输出", tok(t.InputTokens) + " / " + tok(t.OutputTokens)) +
-      row2("缓存读取", tok(t.CacheReadTokens) + (a.cache_hit_rate !== undefined ? " (" + pct(a.cache_hit_rate) + ")" : "")) +
-      row2("窗口法估算", e.quota_usd_by_window ? usd(e.quota_usd_by_window) : "不可用") +
-      row2("步进法估算", e.quota_usd_by_delta ? usd(e.quota_usd_by_delta) : "不可用") +
-      row2("校准样本", (a.calibration || {}).samples + " 次 / 累计 " + pct((a.calibration || {}).percent)) +
-      row2("整窗覆盖", a.window_full_coverage ? "是" : "否（中途接管）") +
-      row2("跑满预警", a.will_exhaust_before_reset === true ? "<span class='tag bad'>会提前用完</span>" :
-           (a.will_exhaust_before_reset === false ? "<span class='tag ok'>够用到重置</span>" : "—")) +
-      row2("续航", a.runway_days === undefined ? "—" : a.runway_days + " 天") +
-      row2("最后观测", a.observed_age_seconds === undefined ? "—" : dur(a.observed_age_seconds) + "前") +
-      "</div>";
+    return "<div class='wbox'><h3>" + wname(w) + " 窗口 · " +
+           (e.method === "none" ? "<span class='tag'>观测中</span>"
+             : "<span class='tag " + esc(e.confidence) + "'>" + confWord(e.confidence) + "</span> " +
+               "<span class='tag'>" + methodWord(e.method) + "</span>") + "</h3>" +
+           kv + "<div style='margin-top:10px'>" + m + "</div></div>";
+  }
+  function row2(k, v) { return "<div class='k'>" + esc(k) + "</div><div class='v'>" + v + "</div>"; }
 
-    var curve = drawQuotaCurve(a.series, a.window_minutes, 300, 96);
+  function detailRow(a) {
+    var boxes = (a.windows || []).map(windowDetail).join("");
+    var curveW = (a.windows || []).length ? a.windows[a.windows.length - 1].minutes : 0;
+    var curve = drawQuotaCurve(a.series, curveW, 300, 96);
     var charts =
-      "<div style='margin-bottom:12px'>" + drawChart(a.series, 300, 76, false) +
+      "<div style='margin-bottom:12px'>" + drawChart(a.series, 340, 80, false) +
         "<div class='chartcap'><i class='sw bar'></i>每小时消耗 " +
         "<i class='sw ln' style='margin-left:8px'></i>累计</div></div>" +
       (curve
-        ? "<div style='margin-bottom:12px'>" + curve +
-          "<div class='chartcap'><i class='sw ln warn'></i>额度百分比 " +
+        ? "<div>" + curve + "<div class='chartcap'><i class='sw ln warn'></i>额度百分比（" +
+          (curveW ? wname({minutes: curveW}) : "") + "窗口） " +
           "<i class='sw ln dash' style='margin-left:8px'></i>匀速参考线" +
           "<br>曲线高过虚线 = 照此速度会在重置前用完</div></div>"
         : "");
 
-    return "<div class='grid2'><div>" + m + "</div><div>" + charts + kv + "</div></div>";
+    return "<div class='wgrid'>" + boxes + "</div>" + charts;
   }
-  function row2(k, v) { return "<div class='k'>" + esc(k) + "</div><div class='v'>" + v + "</div>"; }
 
   function sortAccounts(list) {
     var mode = el("sort").value;
+    function longest(a) { return a.longest || {}; }
+    function est(a) { return (longest(a).estimate) || {}; }
     var c = {
-      quota: function (a, b) { return (b.estimate.quota_usd || 0) - (a.estimate.quota_usd || 0); },
-      remain: function (a, b) { return (b.estimate.remaining_usd || 0) - (a.estimate.remaining_usd || 0); },
-      used: function (a, b) { return (b.used_percent || 0) - (a.used_percent || 0); },
-      pace: function (a, b) { return (b.pace_ratio || 0) - (a.pace_ratio || 0); },
+      quota: function (a, b) { return (est(b).quota_usd || 0) - (est(a).quota_usd || 0); },
+      remain: function (a, b) { return (est(b).remaining_usd || 0) - (est(a).remaining_usd || 0); },
+      used: function (a, b) { return ((b.binding || {}).used_percent || 0) - ((a.binding || {}).used_percent || 0); },
+      pace: function (a, b) { return ((b.binding || {}).pace_ratio || 0) - ((a.binding || {}).pace_ratio || 0); },
       name: function (a, b) { return String(a.label).localeCompare(String(b.label)); }
     }[mode];
     return list.slice().sort(c);
+  }
+
+  function confWord(c) {
+    return { high: "高置信", medium: "中置信", low: "低置信", none: "无估算" }[c] || c;
+  }
+  function methodWord(m) { return { window: "窗口法", delta: "步进法", none: "—" }[m] || m; }
+
+  function card(k, v, n) {
+    return "<div class='card'><div class='k'>" + esc(k) + "</div><div class='v'>" +
+      (v === undefined || v === null ? "—" : v) + "</div>" +
+      (n ? "<div class='n'>" + esc(n) + "</div>" : "") + "</div>";
   }
 
   function render(data) {
@@ -475,63 +512,90 @@ const panelHTML = `<!doctype html>
     (data.warnings || []).forEach(function (w) { note("warn", w); });
 
     var accounts = data.accounts || [];
-    var waitingList = accounts.filter(function (a) {
-      return !a.estimate || a.estimate.method === "none";
-    });
-    if (waitingList.length) {
-      note("warn", waitingList.length + " / " + accounts.length +
-        " 个凭据还没有估算值。额度只有在「插件亲眼看到百分比至少走动 1 点」之后才能定价,正常使用中会自动补上。");
+    var stale = accounts.filter(function (a) { return a.stale; });
+    if (stale.length) {
+      note("warn", stale.length + " 个凭据的额度读数已经过期（长时间没有流量经过），下面显示的是最后一次观测值，不代表现在。");
     }
+    var waiting = accounts.filter(function (a) {
+      return !a.longest || !a.longest.estimate || a.longest.estimate.method === "none";
+    });
+    if (waiting.length) {
+      note("warn", waiting.length + " / " + accounts.length +
+        " 个凭据还没有估算值。额度只有在「插件亲眼看到百分比至少走动 1 点」之后才能定价，正常使用中会自动补上。");
+    }
+
+    // One summary block per window length: the 5-hour and the weekly limit are
+    // separate quotas, and the same spend counts against both.
+    var wt = data.window_totals || [];
+    wtotals.innerHTML = wt.map(function (t) {
+      return "<div class='box'><h2>" + wname(t) + " 窗口合计</h2><div class='cards' style='margin:0'>" +
+        card("凭据数", t.credentials, t.estimated + " 个已定价" + (t.at_risk ? " · " + t.at_risk + " 个逼近上限" : "")) +
+        card("额度总值", usd(t.quota_usd)) +
+        card("已用", usd(t.spent_usd)) +
+        card("剩余", usd(t.remaining_usd)) +
+        "</div></div>";
+    }).join("");
 
     var t = data.totals || {};
     cards.innerHTML =
-      card("凭据数", t.credentials, (t.estimated || 0) + " 个已定价" +
-           (t.at_risk ? " · " + t.at_risk + " 个逼近上限" : "")) +
-      card("周额度总值", usd(t.quota_usd), "折合官方 API 计费") +
-      card("已用", usd(t.spent_usd), "按百分比推算") +
-      card("剩余", usd(t.remaining_usd), "本窗口内") +
-      card("实测消耗", usd(t.window_usd_observed), "插件亲眼记账部分") +
+      card("凭据数", t.credentials) +
+      card("实测消耗", usd(t.window_usd_observed), "最长窗口内，插件亲眼记账部分") +
       card("缓存省下", usd(t.cache_saved_usd), "对比全价输入") +
-      card("请求数", (t.window_requests || 0).toLocaleString("zh-CN"),
-           (t.window_failed || 0) + " 次失败");
+      card("请求数", (t.requests || 0).toLocaleString("zh-CN"), (t.failed || 0) + " 次失败");
     cards.hidden = false;
 
     chart.innerHTML = drawChart(data.fleet_series, 1000, 165, true);
     chartbox.hidden = false;
 
+    // Columns follow whatever window lengths upstream is actually reporting.
+    var lengths = [];
+    wt.forEach(function (x) { lengths.push(x.minutes); });
+    if (!lengths.length) {
+      accounts.forEach(function (a) {
+        (a.windows || []).forEach(function (w) {
+          if (lengths.indexOf(w.minutes) < 0) lengths.push(w.minutes);
+        });
+      });
+      lengths.sort(function (a, b) { return a - b; });
+    }
+    head.innerHTML = "<th>凭据</th><th>套餐</th>" +
+      lengths.map(function (m) { return "<th>" + wname({minutes: m}) + " 额度</th>"; }).join("") +
+      "<th>状态</th>";
+
     rows.innerHTML = "";
     sortAccounts(accounts).forEach(function (a, i) {
-      var e = a.estimate || {};
-      var waiting = e.method === "none";
-      var money = function (v) { return waiting ? "<span class='tag'>观测中</span>" : usd(v); };
+      var byLen = {};
+      (a.windows || []).forEach(function (w) { byLen[w.minutes] = w; });
 
       var tr = document.createElement("tr");
       tr.className = "main" + (a.disabled ? " off" : "");
-      tr.innerHTML =
+      var tags = "";
+      if (a.disabled) tags += " <span class='tag'>已停用</span>";
+      if (a.unavailable) tags += " <span class='tag bad'>不可用</span>";
+      if (a.stale) tags += " <span class='tag warn'>读数陈旧</span>";
+      if (a.limit_reached_type) tags += " <span class='tag bad'>" + esc(a.limit_reached_type) + "</span>";
+
+      var html =
         "<td><span class='toggle' data-i='" + i + "'>▸</span> <span class='name'>" +
-          esc(a.label || a.auth_id) + "</span>" +
-          (a.disabled ? " <span class='tag'>已停用</span>" : "") +
-          (a.unavailable ? " <span class='tag bad'>不可用</span>" : "") +
-          "<div class='sub2'>" + (a.by_model || []).length + " 个模型 · " +
-          (a.window_requests || 0) + " 次请求" +
-          (a.active_limit ? " · " + esc(a.active_limit) : "") + "</div></td>" +
-        "<td>" + esc(a.plan_type || "—") + "<div class='sub2'>" + esc(a.window_label || "") + " 窗口</div></td>" +
-        "<td>" + dualMeter(a) + "</td>" +
-        "<td>" + paceTag(a) + "</td>" +
-        "<td class='num'>" + money(e.quota_usd) + "</td>" +
-        "<td class='num'>" + money(e.spent_usd) + "</td>" +
-        "<td class='num'>" + money(e.remaining_usd) + "</td>" +
-        "<td class='num'>" + (waiting || a.burn_usd_per_day === undefined ? "—" : usd(a.burn_usd_per_day)) + "</td>" +
-        "<td class='num'>" + dur(a.reset_in_seconds) + "</td>" +
-        "<td>" + (waiting
-          ? "<span class='tag'>待百分比走动 1%</span>"
-          : "<span class='tag " + esc(e.confidence) + "'>" + confWord(e.confidence) + "</span> " +
-            "<span class='tag'>" + methodWord(e.method) + " " + pct(e.evidence_percent) + "</span>") + "</td>";
+          esc(a.label || a.auth_id) + "</span>" + tags +
+          "<div class='sub2'>" + (a.total_requests || 0) + " 次累计 · " + usd(a.total_usd) +
+          (a.observed_age_seconds !== undefined ? " · " + dur(a.observed_age_seconds) + "前观测" : "") +
+          "</div></td>" +
+        "<td>" + esc(a.plan_type || "—") +
+          (a.active_limit ? "<div class='sub2'>" + esc(a.active_limit) + "</div>" : "") + "</td>";
+      lengths.forEach(function (m) { html += windowCell(byLen[m]); });
+
+      var le = (a.longest && a.longest.estimate) || {};
+      html += "<td>" + (le.method === "none" || !le.method
+        ? "<span class='tag'>待百分比走动 1%</span>"
+        : "<span class='tag " + esc(le.confidence) + "'>" + confWord(le.confidence) + "</span> " +
+          "<span class='tag'>" + methodWord(le.method) + " " + pct(le.evidence_percent) + "</span>") + "</td>";
+      tr.innerHTML = html;
       rows.appendChild(tr);
 
       var dr = document.createElement("tr");
       dr.className = "detail"; dr.hidden = true;
-      dr.innerHTML = "<td colspan='10'>" + detailRow(a) + "</td>";
+      dr.innerHTML = "<td colspan='" + (lengths.length + 3) + "'>" + detailRow(a) + "</td>";
       rows.appendChild(dr);
 
       tr.querySelector(".toggle").addEventListener("click", function (ev) {
@@ -547,23 +611,15 @@ const panelHTML = `<!doctype html>
       "价目来源：" + esc(data.price_source || "内置表") +
       (via ? "（" + via + "）" : "") +
       (data.price_fetched ? "，同步于 " + esc(data.price_fetched) : "") + "<br>" +
-      "<b>窗口法</b>＝整窗实测消耗 ÷ 整窗百分比，只在插件看到窗口从 0% 开始时可用；" +
+      "<b>窗口按长度识别</b>，不按上游的 primary/secondary 标签——这两个标签的含义变过一次" +
+      "（5 小时限额回归后，primary 从周窗口变成了 5 小时窗口）。同一笔花费同时计入所有窗口，" +
+      "所以每个窗口各自独立估算。<br>" +
+      "<b>窗口法</b>＝整周期实测消耗 ÷ 整周期百分比，只在插件看到周期从 0% 开始时可用；" +
       "<b>步进法</b>＝Σ两次读数间的消耗 ÷ Σ百分比步进，中途安装也能收敛。" +
-      "置信度反映插件亲眼看着消耗掉的额度比例。<br>" +
+      "校准样本有数量与时效上限，因此套餐变化后估算会跟着变，不会被旧数据永久拖住。<br>" +
       "<b>节奏</b>＝额度消耗比例 ÷ 窗口时间流逝比例，大于 1 表示照此速度会在重置前用完。" +
       "缓存读取与推理 token 分别是输入、输出的子集，不重复计费。";
     loadPrices();
-  }
-
-  function confWord(c) {
-    return { high: "高置信", medium: "中置信", low: "低置信", none: "无估算" }[c] || c;
-  }
-  function methodWord(m) { return { window: "窗口法", delta: "步进法", none: "—" }[m] || m; }
-
-  function card(k, v, n) {
-    return "<div class='card'><div class='k'>" + esc(k) + "</div><div class='v'>" +
-      (v === undefined || v === null ? "—" : v) + "</div>" +
-      (n ? "<div class='n'>" + esc(n) + "</div>" : "") + "</div>";
   }
 
   function api(path) {
@@ -596,6 +652,7 @@ const panelHTML = `<!doctype html>
     api("data").then(render).catch(function (err) {
       alerts.innerHTML = ""; note("bad", err.message);
       cards.hidden = wrap.hidden = chartbox.hidden = pricebox.hidden = true;
+      wtotals.innerHTML = "";
     });
   }
 
@@ -605,7 +662,7 @@ const panelHTML = `<!doctype html>
   el("forget").addEventListener("click", function () {
     localStorage.removeItem(STORE); keyBox.value = ""; last = null;
     cards.hidden = wrap.hidden = chartbox.hidden = pricebox.hidden = true;
-    alerts.innerHTML = ""; stamp.textContent = "";
+    alerts.innerHTML = ""; stamp.textContent = ""; wtotals.innerHTML = "";
     if (timer) { clearInterval(timer); timer = null; }
   });
   el("export").addEventListener("click", function () {

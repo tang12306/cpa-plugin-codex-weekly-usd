@@ -42,6 +42,7 @@ type usageRecord struct {
 	ExecutorType string              `json:"ExecutorType"`
 	Model        string              `json:"Model"`
 	Alias        string              `json:"Alias"`
+	APIKey       string              `json:"APIKey"`
 	AuthID       string              `json:"AuthID"`
 	AuthIndex    string              `json:"AuthIndex"`
 	AuthType     string              `json:"AuthType"`
@@ -51,20 +52,38 @@ type usageRecord struct {
 	Headers      map[string][]string `json:"ResponseHeaders"`
 }
 
-// rateLimit is the Codex quota snapshot carried on every upstream response.
-type rateLimit struct {
-	Percent      float64
-	WindowMin    int
-	ResetAt      int64
-	ResetAfter   int64
-	SecPercent   float64
-	SecWindowMin int
-	PlanType     string
-	ActiveLimit  string
-	Found        bool
+// windowReading is one quota window as reported on a single upstream response.
+//
+// Upstream labels its windows "primary" and "secondary", but those labels are
+// not stable: before OpenAI reinstated the 5-hour limit, primary was the weekly
+// window and secondary was absent; afterwards primary became the 5-hour window
+// and the weekly one moved to secondary. Windows are therefore keyed by their
+// length, never by the label they arrived under.
+type windowReading struct {
+	Minutes    int
+	Percent    float64
+	ResetAt    int64
+	ResetAfter int64
 }
 
-// ModelAgg accumulates one model's contribution inside the current window.
+// creditInfo captures the separate credit balance, which can exhaust and
+// produce a 429 while the percentage counters are still well under 100.
+type creditInfo struct {
+	HasCredits   bool   `json:"has_credits"`
+	Unlimited    bool   `json:"unlimited"`
+	Balance      string `json:"balance,omitempty"`
+	LimitReached string `json:"limit_reached_type,omitempty"`
+}
+
+type rateLimit struct {
+	Windows     []windowReading
+	PlanType    string
+	ActiveLimit string
+	Credits     creditInfo
+	Found       bool
+}
+
+// ModelAgg accumulates one model's contribution inside a window.
 type ModelAgg struct {
 	Requests int64   `json:"requests"`
 	Failed   int64   `json:"failed"`
@@ -87,51 +106,77 @@ type HourAgg struct {
 	CacheRead int64   `json:"c"`
 }
 
-// hourRetention bounds the series at ten days, comfortably more than the seven
-// day quota window.
+// hourRetention bounds the series at ten days, comfortably more than the
+// longest quota window.
 const hourRetention = 240
 
-// Account is the per-credential accumulator. Everything the estimate needs
-// survives a restart, so the plugin does not have to re-learn a whole window.
+// Sample is one calibration observation: a percentage step and the spend that
+// produced it.
+type Sample struct {
+	DP  float64 `json:"dp"`
+	USD float64 `json:"usd"`
+	TS  int64   `json:"ts"`
+}
+
+const (
+	// maxSamples bounds the calibration so it tracks the quota as it is now.
+	// An unbounded sum cannot follow a plan change, a window-semantics change,
+	// or a re-priced model: old evidence would outvote new evidence forever and
+	// confidence would ratchet up while accuracy fell.
+	maxSamples = 160
+	// sampleMaxAgeDays drops evidence that is too old to describe the present.
+	sampleMaxAgeDays = 21
+)
+
+// Window is one quota window's accounting and calibration, keyed by length.
+type Window struct {
+	Minutes int `json:"minutes"`
+
+	Percent    float64 `json:"used_percent"`
+	ResetAt    int64   `json:"reset_at"`
+	ObservedAt int64   `json:"observed_at"`
+
+	// Current cycle. Key is the reset timestamp that identifies the cycle.
+	Key          int64                `json:"key"`
+	Start        int64                `json:"start"`
+	FullCoverage bool                 `json:"full_coverage"`
+	USD          float64              `json:"usd"`
+	Requests     int64                `json:"requests"`
+	Failed       int64                `json:"failed"`
+	SavedUSD     float64              `json:"saved_usd"`
+	Tokens       Tokens               `json:"tokens"`
+	ByModel      map[string]*ModelAgg `json:"by_model"`
+
+	// Calibration, bounded in both count and age.
+	LastPercent float64  `json:"last_percent"`
+	HasLast     bool     `json:"has_last"`
+	PendingUSD  float64  `json:"pending_usd"`
+	Samples     []Sample `json:"samples"`
+
+	// Diagnostics.
+	Cycles         int64   `json:"cycles"`
+	GrantedResets  int64   `json:"granted_resets"`
+	UnexplainedPct float64 `json:"unexplained_percent"`
+
+	// resumed marks a window restored from disk whose first fresh reading has
+	// not been seen yet. Deliberately not persisted.
+	resumed bool
+}
+
+// Account is the per-credential accumulator.
 type Account struct {
-	AuthID      string `json:"auth_id"`
-	AuthIndex   string `json:"auth_index"`
-	PlanType    string `json:"plan_type"`
-	ActiveLimit string `json:"active_limit"`
-	Provider    string `json:"provider"`
+	AuthID      string     `json:"auth_id"`
+	AuthIndex   string     `json:"auth_index"`
+	PlanType    string     `json:"plan_type"`
+	ActiveLimit string     `json:"active_limit"`
+	Provider    string     `json:"provider"`
+	Credits     creditInfo `json:"credits"`
 
-	// Latest quota snapshot from the upstream headers.
-	Percent      float64 `json:"used_percent"`
-	WindowMin    int     `json:"window_minutes"`
-	ResetAt      int64   `json:"reset_at"`
-	ObservedAt   int64   `json:"observed_at"`
-	SecPercent   float64 `json:"secondary_used_percent"`
-	SecWindowMin int     `json:"secondary_window_minutes"`
-	HasQuota     bool    `json:"has_quota_data"`
-
-	// Current window accounting.
-	WindowKey      int64                `json:"window_key"`
-	WindowStart    int64                `json:"window_start"`
-	WindowFirstPct float64              `json:"window_first_percent"`
-	WindowFullCov  bool                 `json:"window_full_coverage"`
-	WindowUSD      float64              `json:"window_usd"`
-	WindowReqs     int64                `json:"window_requests"`
-	WindowFailed   int64                `json:"window_failed"`
-	WindowSavedUSD float64              `json:"window_saved_usd"`
-	WindowTokens   Tokens               `json:"window_tokens"`
-	ByModel        map[string]*ModelAgg `json:"by_model"`
-
-	// Hours is the rolling hourly series, keyed by unix hour as a string
+	// Windows is keyed by window length in minutes, rendered as a string
 	// because JSON object keys must be strings.
-	Hours map[string]*HourAgg `json:"hours"`
+	Windows map[string]*Window `json:"windows"`
 
-	// Delta calibration. Kept across windows: a quota is a quota.
-	LastPercent float64 `json:"last_percent"`
-	HasLast     bool    `json:"has_last"`
-	PendingUSD  float64 `json:"pending_usd"`
-	CalUSD      float64 `json:"cal_usd"`
-	CalPct      float64 `json:"cal_percent"`
-	CalSamples  int     `json:"cal_samples"`
+	Hours map[string]*HourAgg `json:"hours"`
 
 	UnpricedReqs int64    `json:"unpriced_requests"`
 	UnpricedList []string `json:"unpriced_models,omitempty"`
@@ -140,9 +185,9 @@ type Account struct {
 	TotalUSD  float64 `json:"total_usd"`
 	TotalReqs int64   `json:"total_requests"`
 
-	// resumed marks an account restored from disk whose first fresh reading has
-	// not been seen yet. Deliberately not persisted.
-	resumed bool
+	// Legacy flat fields, read once for migration and then left empty.
+	LegacyWindowMin int     `json:"window_minutes,omitempty"`
+	LegacyPercent   float64 `json:"used_percent,omitempty"`
 }
 
 type stateFile struct {
@@ -151,6 +196,9 @@ type stateFile struct {
 	Accounts map[string]*Account `json:"accounts"`
 }
 
+// stateVersion 2 introduced per-length windows and bounded calibration.
+const stateVersion = 2
+
 // App owns all mutable plugin state.
 type App struct {
 	mu       sync.Mutex
@@ -158,14 +206,14 @@ type App struct {
 	accounts map[string]*Account
 	prices   *priceBook
 
-	dirty      bool
-	events     []json.RawMessage
-	authCache  []authEntry
-	authFetch  time.Time
-	stopOnce   sync.Once
-	stop       chan struct{}
-	started    bool
-	startedAt  time.Time
+	dirty     bool
+	events    []json.RawMessage
+	authCache []authEntry
+	authFetch time.Time
+	stopOnce  sync.Once
+	stop      chan struct{}
+	started   bool
+	startedAt time.Time
 }
 
 type authEntry struct {
@@ -265,6 +313,22 @@ func (a *App) Shutdown() {
 	a.Flush()
 }
 
+func (acct *Account) window(minutes int) *Window {
+	if acct.Windows == nil {
+		acct.Windows = map[string]*Window{}
+	}
+	key := strconv.Itoa(minutes)
+	w := acct.Windows[key]
+	if w == nil {
+		w = &Window{Minutes: minutes, ByModel: map[string]*ModelAgg{}}
+		acct.Windows[key] = w
+	}
+	if w.ByModel == nil {
+		w.ByModel = map[string]*ModelAgg{}
+	}
+	return w
+}
+
 // HandleUsage is the hot path. It runs inline with request completion, so it
 // only touches memory: disk writes are left to the flush ticker.
 func (a *App) HandleUsage(payload []byte) {
@@ -296,7 +360,13 @@ func (a *App) HandleUsage(payload []byte) {
 	cfg := a.cfg
 	acct := a.accounts[key]
 	if acct == nil {
-		acct = &Account{AuthID: rec.AuthID, AuthIndex: rec.AuthIndex, FirstSeen: time.Now().Unix(), ByModel: map[string]*ModelAgg{}}
+		acct = &Account{
+			AuthID:    rec.AuthID,
+			AuthIndex: rec.AuthIndex,
+			FirstSeen: time.Now().Unix(),
+			Windows:   map[string]*Window{},
+			Hours:     map[string]*HourAgg{},
+		}
 		a.accounts[key] = acct
 	}
 	a.mu.Unlock()
@@ -317,42 +387,137 @@ func (a *App) HandleUsage(payload []byte) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 
-	if acct.ByModel == nil {
-		acct.ByModel = map[string]*ModelAgg{}
-	}
 	if rec.AuthIndex != "" {
 		acct.AuthIndex = rec.AuthIndex
 	}
 	if rec.Provider != "" {
 		acct.Provider = rec.Provider
 	}
-
 	if rl.Found {
-		// A changed reset timestamp means the quota window rolled over.
-		if acct.WindowKey == 0 || absInt64(rl.ResetAt-acct.WindowKey) > 120 {
-			acct.startWindow(rl, now)
+		if rl.PlanType != "" {
+			acct.PlanType = rl.PlanType
 		}
-		a.observePercent(acct, rl, now)
+		if rl.ActiveLimit != "" {
+			acct.ActiveLimit = rl.ActiveLimit
+		}
+		acct.Credits = rl.Credits
 	}
 
-	// Bill this request after the percent observation: the headers are emitted
-	// when the upstream stream opens, so they describe the state *before* this
-	// request was counted.
-	acct.PendingUSD += cost
-	acct.WindowUSD += cost
-	acct.WindowSavedUSD += saved
-	acct.WindowReqs++
-	acct.WindowTokens.add(rec.Detail)
+	// Every window reported on this response is advanced and billed. The same
+	// dollars count against both the 5-hour and the weekly limit, so each window
+	// keeps its own ledger rather than sharing one.
+	for _, wr := range rl.Windows {
+		w := acct.window(wr.Minutes)
+		w.advance(wr, now)
+		w.bill(cost, saved, rec, model, priced)
+	}
+
 	acct.TotalUSD += cost
 	acct.TotalReqs++
-	if rec.Failed {
-		acct.WindowFailed++
+	if !priced && !rec.Failed {
+		acct.UnpricedReqs++
+		acct.noteUnpriced(model)
+	}
+	acct.recordHour(now, cost, rec, rl)
+
+	a.dirty = true
+	if cfg.EventLog {
+		a.appendEvent(rec, model, cost, priced, rl, now)
+	}
+}
+
+// advance folds a fresh reading into one window, opening a new cycle when the
+// old one ended and calibrating from the percentage step.
+func (w *Window) advance(r windowReading, now time.Time) {
+	switch {
+	case w.Key == 0 || (r.ResetAt > 0 && absInt64(r.ResetAt-w.Key) > 120):
+		// The reset timestamp moved: the cycle rolled over normally.
+		w.startCycle(r, now, false)
+
+	case w.HasLast && r.Percent < w.LastPercent-0.001:
+		// The percentage fell while the reset timestamp stayed put. Upstream
+		// granted a mid-cycle reset. Without this branch the old cycle's spend
+		// would be divided by the new small percentage and the quota estimate
+		// would explode.
+		w.startCycle(r, now, true)
 	}
 
-	agg := acct.ByModel[model]
+	// First reading after a restart. Traffic served while the plugin was down is
+	// inside the percentage but not inside our ledger, so anything that depends
+	// on having watched every dollar has to be invalidated.
+	if w.resumed {
+		w.resumed = false
+		if w.HasLast && r.Percent > w.LastPercent+0.001 {
+			w.FullCoverage = false
+			w.PendingUSD = 0
+			w.LastPercent = r.Percent
+		}
+	}
+
+	if w.HasLast && r.Percent > w.LastPercent {
+		dp := r.Percent - w.LastPercent
+		if w.PendingUSD > 0 {
+			w.Samples = append(w.Samples, Sample{DP: dp, USD: w.PendingUSD, TS: now.Unix()})
+			w.pruneSamples(now)
+		} else {
+			// The percentage moved but we billed nothing for it: another client
+			// is spending this credential's quota. Worth surfacing rather than
+			// silently skipping, because it also means our ledger undercounts.
+			w.UnexplainedPct += dp
+		}
+		w.PendingUSD = 0
+	}
+
+	w.LastPercent = r.Percent
+	w.HasLast = true
+	w.Percent = r.Percent
+	w.ResetAt = r.ResetAt
+	w.ObservedAt = now.Unix()
+}
+
+// startCycle resets per-cycle accounting. Calibration samples deliberately
+// survive: they measure the size of the quota, which a rollover does not change.
+func (w *Window) startCycle(r windowReading, now time.Time, granted bool) {
+	w.Key = r.ResetAt
+	if r.ResetAt > 0 && w.Minutes > 0 {
+		w.Start = r.ResetAt - int64(w.Minutes)*60
+	} else {
+		w.Start = now.Unix()
+	}
+	// Full coverage means the first reading of this cycle showed nothing spent,
+	// so every dollar since then is money this plugin actually saw.
+	w.FullCoverage = r.Percent <= 0
+	w.USD = 0
+	w.Requests = 0
+	w.Failed = 0
+	w.SavedUSD = 0
+	w.Tokens = Tokens{}
+	w.ByModel = map[string]*ModelAgg{}
+	// Pending spend belonged to the cycle that just closed and can no longer be
+	// attributed to a percentage move, so it is dropped rather than mixed in.
+	w.PendingUSD = 0
+	w.HasLast = false
+	w.LastPercent = 0
+	w.Cycles++
+	if granted {
+		w.GrantedResets++
+	}
+}
+
+func (w *Window) bill(cost, saved float64, rec usageRecord, model string, priced bool) {
+	w.PendingUSD += cost
+	w.USD += cost
+	w.SavedUSD += saved
+	w.Requests++
+	w.Tokens.add(rec.Detail)
+	if rec.Failed {
+		w.Failed++
+	}
+
+	agg := w.ByModel[model]
 	if agg == nil {
 		agg = &ModelAgg{}
-		acct.ByModel[model] = agg
+		w.ByModel[model] = agg
 	}
 	agg.Requests++
 	agg.Tokens.add(rec.Detail)
@@ -363,93 +528,23 @@ func (a *App) HandleUsage(payload []byte) {
 	}
 	if !priced && !rec.Failed {
 		agg.Unpriced++
-		acct.UnpricedReqs++
-		acct.noteUnpriced(model)
-	}
-
-	acct.recordHour(now, cost, rec, rl)
-
-	a.dirty = true
-	if cfg.EventLog {
-		a.appendEvent(rec, model, cost, priced, rl, now)
 	}
 }
 
-// observePercent folds a fresh quota reading into the delta calibration.
-//
-// Between two consecutive readings the percentage moved by dp, and the money
-// that moved it is exactly the spend accumulated since the previous reading.
-// Summing both sides across many readings yields a quota estimate that does not
-// care when the plugin was installed, which is what makes it usable on day one.
-func (a *App) observePercent(acct *Account, rl rateLimit, now time.Time) {
-	// First reading after a restart. Traffic served while the plugin was down is
-	// inside the percentage but not inside our ledger, so anything that depends
-	// on having watched every dollar has to be invalidated.
-	if acct.resumed {
-		acct.resumed = false
-		if acct.HasLast && rl.Percent > acct.LastPercent+0.001 {
-			acct.WindowFullCov = false
-			// Stale pending spend would otherwise be paired with a percentage
-			// step that also contains unobserved downtime spend, which would
-			// quietly bias the calibration low.
-			acct.PendingUSD = 0
-			acct.LastPercent = rl.Percent
+// pruneSamples keeps calibration bounded in both count and age so the estimate
+// follows the quota as it is now rather than as it was.
+func (w *Window) pruneSamples(now time.Time) {
+	cutoff := now.AddDate(0, 0, -sampleMaxAgeDays).Unix()
+	kept := w.Samples[:0]
+	for _, s := range w.Samples {
+		if s.TS >= cutoff {
+			kept = append(kept, s)
 		}
 	}
-
-	if acct.HasLast && rl.Percent > acct.LastPercent {
-		dp := rl.Percent - acct.LastPercent
-		if acct.PendingUSD > 0 {
-			acct.CalPct += dp
-			acct.CalUSD += acct.PendingUSD
-			acct.CalSamples++
-		}
-		acct.PendingUSD = 0
+	w.Samples = kept
+	if len(w.Samples) > maxSamples {
+		w.Samples = append([]Sample(nil), w.Samples[len(w.Samples)-maxSamples:]...)
 	}
-
-	acct.LastPercent = rl.Percent
-	acct.HasLast = true
-	acct.Percent = rl.Percent
-	acct.WindowMin = rl.WindowMin
-	acct.ResetAt = rl.ResetAt
-	acct.ObservedAt = now.Unix()
-	acct.SecPercent = rl.SecPercent
-	acct.SecWindowMin = rl.SecWindowMin
-	acct.HasQuota = true
-	if rl.PlanType != "" {
-		acct.PlanType = rl.PlanType
-	}
-	if rl.ActiveLimit != "" {
-		acct.ActiveLimit = rl.ActiveLimit
-	}
-}
-
-// startWindow resets per-window accounting. Calibration state deliberately
-// survives, because the quota it measures is a property of the plan.
-func (acct *Account) startWindow(rl rateLimit, now time.Time) {
-	acct.WindowKey = rl.ResetAt
-	acct.WindowMin = rl.WindowMin
-	if rl.WindowMin > 0 && rl.ResetAt > 0 {
-		acct.WindowStart = rl.ResetAt - int64(rl.WindowMin)*60
-	} else {
-		acct.WindowStart = now.Unix()
-	}
-	acct.WindowFirstPct = rl.Percent
-	// Full coverage means the first reading of this window showed nothing
-	// spent, so every dollar since then is money this plugin actually saw.
-	acct.WindowFullCov = rl.Percent <= 0
-	acct.WindowUSD = 0
-	acct.WindowReqs = 0
-	acct.WindowFailed = 0
-	acct.WindowSavedUSD = 0
-	acct.WindowTokens = Tokens{}
-	acct.ByModel = map[string]*ModelAgg{}
-	// Hours is a rolling time series, not window state, so it is not reset.
-	// Pending spend belonged to the window that just closed and can no longer
-	// be attributed to a percentage move, so it is dropped rather than mixed in.
-	acct.PendingUSD = 0
-	acct.HasLast = false
-	acct.LastPercent = 0
 }
 
 // recordHour folds one request into the rolling hourly series and drops buckets
@@ -473,8 +568,10 @@ func (acct *Account) recordHour(now time.Time, cost float64, rec usageRecord, rl
 	if rec.Failed {
 		bucket.Failed++
 	}
-	if rl.Found {
-		bucket.Percent = rl.Percent
+	// The series tracks the longest window, which is the one whose curve spans
+	// enough hours to be worth drawing.
+	if w := longestReading(rl); w != nil {
+		bucket.Percent = w.Percent
 	}
 
 	if len(acct.Hours) > hourRetention+24 {
@@ -485,6 +582,16 @@ func (acct *Account) recordHour(now time.Time, cost float64, rec usageRecord, rl
 			}
 		}
 	}
+}
+
+func longestReading(rl rateLimit) *windowReading {
+	var best *windowReading
+	for i := range rl.Windows {
+		if best == nil || rl.Windows[i].Minutes > best.Minutes {
+			best = &rl.Windows[i]
+		}
+	}
+	return best
 }
 
 func (acct *Account) noteUnpriced(model string) {
@@ -498,7 +605,7 @@ func (acct *Account) noteUnpriced(model string) {
 	}
 }
 
-// Estimate is the derived view of one account.
+// Estimate is the derived view of one window.
 type Estimate struct {
 	QuotaUSD      float64 `json:"quota_usd"`
 	SpentUSD      float64 `json:"spent_usd"`
@@ -509,44 +616,51 @@ type Estimate struct {
 	Method        string  `json:"method"`
 	Confidence    string  `json:"confidence"`
 	Evidence      float64 `json:"evidence_percent"`
+	Samples       int     `json:"samples"`
 }
 
-func (acct *Account) Estimate() Estimate {
+func (w *Window) Estimate() Estimate {
 	var e Estimate
 
 	// Spend that the latest percentage reading has actually had a chance to
 	// account for. PendingUSD is everything billed after that reading, so
-	// dividing the raw window total by the percentage would overstate the quota.
-	e.AttributedUSD = acct.WindowUSD - acct.PendingUSD
+	// dividing the raw cycle total by the percentage would overstate the quota.
+	e.AttributedUSD = w.USD - w.PendingUSD
 	if e.AttributedUSD < 0 {
 		e.AttributedUSD = 0
 	}
 
-	if acct.CalPct > 0 && acct.CalUSD > 0 {
-		e.QuotaByDelta = acct.CalUSD / (acct.CalPct / 100)
+	var sumDP, sumUSD float64
+	for _, s := range w.Samples {
+		sumDP += s.DP
+		sumUSD += s.USD
 	}
-	if acct.WindowFullCov && acct.Percent > 0 && e.AttributedUSD > 0 {
-		e.QuotaByWindow = e.AttributedUSD / (acct.Percent / 100)
+	e.Samples = len(w.Samples)
+	if sumDP > 0 && sumUSD > 0 {
+		e.QuotaByDelta = sumUSD / (sumDP / 100)
+	}
+	if w.FullCoverage && w.Percent > 0 && e.AttributedUSD > 0 {
+		e.QuotaByWindow = e.AttributedUSD / (w.Percent / 100)
 	}
 
-	// A fully observed window is the stronger measurement because it prices the
-	// whole window against the whole percentage, with no attribution guesswork.
+	// A fully observed cycle is the stronger measurement because it prices the
+	// whole cycle against the whole percentage, with no attribution guesswork.
 	switch {
-	case e.QuotaByWindow > 0 && acct.Percent >= 3:
+	case e.QuotaByWindow > 0 && w.Percent >= 3:
 		e.QuotaUSD, e.Method = e.QuotaByWindow, "window"
-		e.Evidence = acct.Percent
+		e.Evidence = w.Percent
 	case e.QuotaByDelta > 0:
 		e.QuotaUSD, e.Method = e.QuotaByDelta, "delta"
-		e.Evidence = acct.CalPct
+		e.Evidence = sumDP
 	case e.QuotaByWindow > 0:
 		e.QuotaUSD, e.Method = e.QuotaByWindow, "window"
-		e.Evidence = acct.Percent
+		e.Evidence = w.Percent
 	default:
 		e.Method = "none"
 	}
 
 	if e.QuotaUSD > 0 {
-		e.SpentUSD = e.QuotaUSD * acct.Percent / 100
+		e.SpentUSD = e.QuotaUSD * w.Percent / 100
 		e.RemainingUSD = e.QuotaUSD - e.SpentUSD
 	}
 
@@ -578,31 +692,40 @@ func parseRateLimit(headers map[string][]string) rateLimit {
 	}
 	get := func(name string) string { return lower[name] }
 
-	pct, okPct := parseFloat(get("x-codex-primary-used-percent"))
-	win, okWin := parseInt(get("x-codex-primary-window-minutes"))
-	if !okPct || !okWin || win <= 0 {
+	// Both slots are read the same way and stored under their length. Upstream
+	// has already swapped which slot carries which window once.
+	for _, slot := range []string{"primary", "secondary"} {
+		pct, okPct := parseFloat(get("x-codex-" + slot + "-used-percent"))
+		win, okWin := parseInt(get("x-codex-" + slot + "-window-minutes"))
+		if !okPct || !okWin || win <= 0 {
+			continue
+		}
+		r := windowReading{Minutes: int(win), Percent: clampPercent(pct)}
+		if v, ok := parseInt(get("x-codex-" + slot + "-reset-at")); ok {
+			r.ResetAt = v
+		}
+		if v, ok := parseInt(get("x-codex-" + slot + "-reset-after-seconds")); ok {
+			r.ResetAfter = v
+			if r.ResetAt == 0 {
+				r.ResetAt = time.Now().Unix() + v
+			}
+		}
+		rl.Windows = append(rl.Windows, r)
+		rl.Found = true
+	}
+	if !rl.Found {
 		return rl
 	}
-	rl.Found = true
-	rl.Percent = clampPercent(pct)
-	rl.WindowMin = int(win)
-	if v, ok := parseInt(get("x-codex-primary-reset-at")); ok {
-		rl.ResetAt = v
-	}
-	if v, ok := parseInt(get("x-codex-primary-reset-after-seconds")); ok {
-		rl.ResetAfter = v
-		if rl.ResetAt == 0 {
-			rl.ResetAt = time.Now().Unix() + v
-		}
-	}
-	if v, ok := parseFloat(get("x-codex-secondary-used-percent")); ok {
-		rl.SecPercent = clampPercent(v)
-	}
-	if v, ok := parseInt(get("x-codex-secondary-window-minutes")); ok {
-		rl.SecWindowMin = int(v)
-	}
+	sort.Slice(rl.Windows, func(i, j int) bool { return rl.Windows[i].Minutes < rl.Windows[j].Minutes })
+
 	rl.PlanType = get("x-codex-plan-type")
 	rl.ActiveLimit = get("x-codex-active-limit")
+	rl.Credits = creditInfo{
+		HasCredits:   strings.EqualFold(get("x-codex-credits-has-credits"), "true"),
+		Unlimited:    strings.EqualFold(get("x-codex-credits-unlimited"), "true"),
+		Balance:      get("x-codex-credits-balance"),
+		LimitReached: get("x-codex-rate-limit-reached-type"),
+	}
 	return rl
 }
 
@@ -616,15 +739,39 @@ func (a *App) loadState() {
 		hostLog("warn", "state.json is unreadable, starting fresh: "+err.Error())
 		return
 	}
+	migrated := 0
 	for k, v := range sf.Accounts {
 		if v == nil {
 			continue
 		}
-		if v.ByModel == nil {
-			v.ByModel = map[string]*ModelAgg{}
+		if v.Hours == nil {
+			v.Hours = map[string]*HourAgg{}
 		}
-		v.resumed = true
+		if len(v.Windows) == 0 && v.LegacyWindowMin > 0 {
+			// Version 1 tracked a single window and summed calibration across
+			// every cycle forever. Those sums mixed percentage steps from two
+			// differently sized windows once upstream swapped primary and
+			// secondary, and a 1% step is worth wildly different money in a
+			// 5-hour window than in a weekly one. The cycle counters carry over;
+			// the calibration cannot and is dropped rather than kept wrong.
+			w := &Window{Minutes: v.LegacyWindowMin, Percent: v.LegacyPercent, ByModel: map[string]*ModelAgg{}}
+			v.Windows = map[string]*Window{strconv.Itoa(v.LegacyWindowMin): w}
+			migrated++
+		}
+		v.LegacyWindowMin, v.LegacyPercent = 0, 0
+		for _, w := range v.Windows {
+			if w == nil {
+				continue
+			}
+			if w.ByModel == nil {
+				w.ByModel = map[string]*ModelAgg{}
+			}
+			w.resumed = true
+		}
 		a.accounts[k] = v
+	}
+	if migrated > 0 {
+		hostLog("info", fmt.Sprintf("migrated %d credential(s) to per-length windows; prior calibration discarded because it mixed window sizes", migrated))
 	}
 }
 
@@ -635,7 +782,7 @@ func (a *App) Flush() {
 		a.mu.Unlock()
 		return
 	}
-	snapshot := stateFile{Version: 1, SavedAt: time.Now().UTC(), Accounts: make(map[string]*Account, len(a.accounts))}
+	snapshot := stateFile{Version: stateVersion, SavedAt: time.Now().UTC(), Accounts: make(map[string]*Account, len(a.accounts))}
 	for k, v := range a.accounts {
 		snapshot.Accounts[k] = v
 	}
@@ -660,21 +807,23 @@ func (a *App) Flush() {
 
 func (a *App) appendEvent(rec usageRecord, model string, cost float64, priced bool, rl rateLimit, now time.Time) {
 	ev := map[string]any{
-		"ts":       now.UTC().Format(time.RFC3339),
-		"auth_id":  rec.AuthID,
-		"model":    model,
-		"usd":      round6(cost),
-		"priced":   priced,
-		"failed":   rec.Failed,
-		"in":       rec.Detail.Input,
-		"out":      rec.Detail.Output,
-		"reason":   rec.Detail.Reasoning,
-		"cache_r":  rec.Detail.CacheRead,
-		"cache_w":  rec.Detail.CacheWrite,
+		"ts":      now.UTC().Format(time.RFC3339),
+		"auth_id": rec.AuthID,
+		"model":   model,
+		"usd":     round6(cost),
+		"priced":  priced,
+		"failed":  rec.Failed,
+		"in":      rec.Detail.Input,
+		"out":     rec.Detail.Output,
+		"reason":  rec.Detail.Reasoning,
+		"cache_r": rec.Detail.CacheRead,
+		"cache_w": rec.Detail.CacheWrite,
 	}
-	if rl.Found {
-		ev["pct"] = rl.Percent
-		ev["reset_at"] = rl.ResetAt
+	for _, w := range rl.Windows {
+		ev["pct_"+strconv.Itoa(w.Minutes)] = w.Percent
+	}
+	if rl.Credits.LimitReached != "" {
+		ev["limit_reached"] = rl.Credits.LimitReached
 	}
 	if raw, err := json.Marshal(ev); err == nil {
 		a.events = append(a.events, raw)
@@ -759,49 +908,155 @@ func (a *App) Report() map[string]any {
 		accounts = append(accounts, acct)
 	}
 	cfg := a.cfg
+	staleAfter := time.Duration(cfg.StaleAfterMinutes) * time.Minute
 	a.mu.Unlock()
 
 	rows := make([]map[string]any, 0, len(accounts))
-	var totalQuota, totalSpent, totalRemaining, totalWindowUSD, totalSaved float64
-	var totalReqs, totalFailed int64
-	estimated, atRisk := 0, 0
 	warnings := make([]string, 0)
+	totals := map[int]*windowTotals{}
+	var totalWindowUSD, totalSaved float64
+	var totalReqs, totalFailed int64
 
 	for _, acct := range accounts {
-		est := acct.Estimate()
-		if est.Method != "none" {
-			estimated++
+		windows := make([]map[string]any, 0, len(acct.Windows))
+		lengths := make([]int, 0, len(acct.Windows))
+		for _, w := range acct.Windows {
+			if w != nil {
+				lengths = append(lengths, w.Minutes)
+			}
+		}
+		sort.Ints(lengths)
+
+		var binding map[string]any
+		var bindingPct float64 = -1
+		for _, m := range lengths {
+			w := acct.Windows[strconv.Itoa(m)]
+			est := w.Estimate()
+			entry := map[string]any{
+				"minutes":              w.Minutes,
+				"label":                windowLabel(w.Minutes),
+				"used_percent":         round2(w.Percent),
+				"usd_observed":         round4(w.USD),
+				"requests":             w.Requests,
+				"failed":               w.Failed,
+				"saved_usd":            round4(w.SavedUSD),
+				"tokens":               w.Tokens,
+				"full_coverage":        w.FullCoverage,
+				"cycles":               w.Cycles,
+				"granted_resets":       w.GrantedResets,
+				"unexplained_percent":  round2(w.UnexplainedPct),
+				"estimate":             est,
+				"by_model":             modelRows(a, w),
+			}
+			if w.ResetAt > 0 {
+				reset := time.Unix(w.ResetAt, 0)
+				entry["reset_at"] = reset.UTC().Format(time.RFC3339)
+				entry["reset_in_seconds"] = int64(math.Max(0, time.Until(reset).Seconds()))
+			}
+			if w.Start > 0 && w.Minutes > 0 {
+				total := float64(w.Minutes) * 60
+				timePct := clampPercent(now.Sub(time.Unix(w.Start, 0)).Seconds() / total * 100)
+				entry["time_progress_percent"] = round2(timePct)
+				if timePct > 1 {
+					entry["pace_ratio"] = round2(w.Percent / timePct)
+				}
+			}
+			if est.QuotaUSD > 0 && w.Start > 0 {
+				elapsed := now.Sub(time.Unix(w.Start, 0)).Hours()
+				if elapsed > 0.05 {
+					perDay := est.SpentUSD / (elapsed / 24)
+					entry["burn_usd_per_day"] = round2(perDay)
+					if perDay > 0 {
+						daysLeft := est.RemainingUSD / perDay
+						entry["runway_days"] = round4(daysLeft)
+						entry["will_exhaust_before_reset"] = daysLeft < time.Until(time.Unix(w.ResetAt, 0)).Hours()/24
+					}
+				}
+			}
+			if w.Requests > 0 {
+				entry["avg_usd_per_request"] = round6(w.USD / float64(w.Requests))
+				entry["failure_rate"] = round2(float64(w.Failed) / float64(w.Requests) * 100)
+			}
+			if w.Tokens.Input > 0 {
+				entry["cache_hit_rate"] = round2(float64(w.Tokens.CacheRead) / float64(w.Tokens.Input) * 100)
+			}
+
+			t := totals[w.Minutes]
+			if t == nil {
+				t = &windowTotals{Minutes: w.Minutes}
+				totals[w.Minutes] = t
+			}
+			t.Credentials++
+			t.QuotaUSD += est.QuotaUSD
+			t.SpentUSD += est.SpentUSD
+			t.RemainingUSD += est.RemainingUSD
+			if est.Method != "none" {
+				t.Estimated++
+			}
+			if w.Percent >= 90 {
+				t.AtRisk++
+			}
+			if w.UnexplainedPct > 1 {
+				warnings = append(warnings, fmt.Sprintf("%s 的 %s 窗口有 %.0f%% 的额度被消耗但不在本插件账上，可能有其它客户端在共用该凭据",
+					displayName(acct, a), windowLabel(w.Minutes), w.UnexplainedPct))
+			}
+			if w.GrantedResets > 0 {
+				entry["note"] = fmt.Sprintf("观察到 %d 次周期内重置", w.GrantedResets)
+			}
+
+			if w.Percent > bindingPct {
+				bindingPct, binding = w.Percent, entry
+			}
+			windows = append(windows, entry)
+		}
+
+		// The longest window is the headline figure: it is the one that decides
+		// how much a credential is worth over a full billing cycle.
+		var longest map[string]any
+		if len(windows) > 0 {
+			longest = windows[len(windows)-1]
+			totalWindowUSD += toF(longest["usd_observed"])
+			totalSaved += toF(longest["saved_usd"])
+			totalReqs += toI(longest["requests"])
+			totalFailed += toI(longest["failed"])
 		}
 
 		row := map[string]any{
-			"auth_id":                acct.AuthID,
-			"provider":               acct.Provider,
-			"plan_type":              acct.PlanType,
-			"active_limit":           acct.ActiveLimit,
-			"has_quota_data":         acct.HasQuota,
-			"used_percent":           round2(acct.Percent),
-			"secondary_used_percent": round2(acct.SecPercent),
-			"window_minutes":         acct.WindowMin,
-			"window_label":           windowLabel(acct.WindowMin),
-			"window_usd_observed":    round4(acct.WindowUSD),
-			"window_requests":        acct.WindowReqs,
-			"window_failed":          acct.WindowFailed,
-			"window_saved_usd":       round4(acct.WindowSavedUSD),
-			"window_tokens":          acct.WindowTokens,
-			"window_full_coverage":   acct.WindowFullCov,
-			"total_usd":              round4(acct.TotalUSD),
-			"total_requests":         acct.TotalReqs,
-			"unpriced_requests":      acct.UnpricedReqs,
-			"estimate":               est,
-			"calibration": map[string]any{
-				"samples": acct.CalSamples,
-				"percent": round2(acct.CalPct),
-				"usd":     round4(acct.CalUSD),
-			},
+			"auth_id":        acct.AuthID,
+			"provider":       acct.Provider,
+			"plan_type":      acct.PlanType,
+			"active_limit":   acct.ActiveLimit,
+			"credits":        acct.Credits,
+			"has_quota_data": len(windows) > 0,
+			"windows":        windows,
+			"binding":        binding,
+			"longest":        longest,
+			"total_usd":      round4(acct.TotalUSD),
+			"total_requests": acct.TotalReqs,
+			"unpriced_requests": acct.UnpricedReqs,
+			"series":            seriesOf(acct, now),
 		}
 		if len(acct.UnpricedList) > 0 {
 			row["unpriced_models"] = acct.UnpricedList
-			warnings = append(warnings, fmt.Sprintf("no public price for %s (credential %s); its spend is missing from the estimate", strings.Join(acct.UnpricedList, ", "), displayName(acct, a)))
+			warnings = append(warnings, fmt.Sprintf("%s 没有公开价目（凭据 %s），其花费未计入估算",
+				strings.Join(acct.UnpricedList, "、"), displayName(acct, a)))
+		}
+		if acct.Credits.LimitReached != "" {
+			row["limit_reached_type"] = acct.Credits.LimitReached
+		}
+
+		// Staleness: a reading from days ago must not be presented as current.
+		var newest int64
+		for _, w := range acct.Windows {
+			if w != nil && w.ObservedAt > newest {
+				newest = w.ObservedAt
+			}
+		}
+		if newest > 0 {
+			age := int64(now.Sub(time.Unix(newest, 0)).Seconds())
+			row["observed_at"] = time.Unix(newest, 0).UTC().Format(time.RFC3339)
+			row["observed_age_seconds"] = age
+			row["stale"] = staleAfter > 0 && time.Duration(age)*time.Second > staleAfter
 		}
 
 		if entry, ok := a.lookupAuth(acct); ok {
@@ -814,131 +1069,138 @@ func (a *App) Report() map[string]any {
 			row["label"] = acct.AuthID
 		}
 
-		if acct.ResetAt > 0 {
-			reset := time.Unix(acct.ResetAt, 0)
-			row["reset_at"] = reset.UTC().Format(time.RFC3339)
-			row["reset_in_seconds"] = int64(math.Max(0, time.Until(reset).Seconds()))
-		}
-		if acct.ObservedAt > 0 {
-			row["observed_at"] = time.Unix(acct.ObservedAt, 0).UTC().Format(time.RFC3339)
-			row["observed_age_seconds"] = int64(now.Sub(time.Unix(acct.ObservedAt, 0)).Seconds())
-		}
-
-		// How far through the window the clock is. Comparing it against the
-		// percentage consumed is the fastest way to see who is burning too fast.
-		if acct.WindowStart > 0 && acct.WindowMin > 0 {
-			total := float64(acct.WindowMin) * 60
-			elapsedSec := now.Sub(time.Unix(acct.WindowStart, 0)).Seconds()
-			timePct := clampPercent(elapsedSec / total * 100)
-			row["time_progress_percent"] = round2(timePct)
-			if timePct > 1 {
-				// >1 means the quota is being spent faster than the clock runs.
-				row["pace_ratio"] = round2(acct.Percent / timePct)
-			}
-		}
-
-		// Burn rate and runway, derived from the portion of the window elapsed.
-		if est.QuotaUSD > 0 && acct.WindowStart > 0 && acct.WindowMin > 0 {
-			elapsed := now.Sub(time.Unix(acct.WindowStart, 0)).Hours()
-			if elapsed > 0.25 {
-				perDay := est.SpentUSD / (elapsed / 24)
-				row["burn_usd_per_day"] = round2(perDay)
-				if perDay > 0 {
-					daysLeft := est.RemainingUSD / perDay
-					row["runway_days"] = round2(daysLeft)
-					windowDaysLeft := time.Until(time.Unix(acct.ResetAt, 0)).Hours() / 24
-					row["will_exhaust_before_reset"] = daysLeft < windowDaysLeft
-				}
-			}
-		}
-
-		if acct.WindowReqs > 0 {
-			row["avg_usd_per_request"] = round6(acct.WindowUSD / float64(acct.WindowReqs))
-			row["failure_rate"] = round2(float64(acct.WindowFailed) / float64(acct.WindowReqs) * 100)
-		}
-		if acct.WindowTokens.Input > 0 {
-			row["cache_hit_rate"] = round2(float64(acct.WindowTokens.CacheRead) / float64(acct.WindowTokens.Input) * 100)
-		}
-		row["series"] = seriesOf(acct, now)
-
-		models := make([]map[string]any, 0, len(acct.ByModel))
-		for name, agg := range acct.ByModel {
-			entry := map[string]any{
-				"model":     name,
-				"requests":  agg.Requests,
-				"failed":    agg.Failed,
-				"usd":       round4(agg.USD),
-				"saved_usd": round4(agg.SavedUSD),
-				"tokens":    agg.Tokens,
-				"unpriced":  agg.Unpriced,
-			}
-			if agg.Requests > 0 {
-				entry["avg_usd"] = round6(agg.USD / float64(agg.Requests))
-			}
-			if agg.Tokens.Input > 0 {
-				entry["cache_hit_rate"] = round2(float64(agg.Tokens.CacheRead) / float64(agg.Tokens.Input) * 100)
-			}
-			if price, ok := a.prices.Lookup(name); ok {
-				entry["price"] = price
-			}
-			models = append(models, entry)
-		}
-		sort.Slice(models, func(i, j int) bool {
-			return models[i]["usd"].(float64) > models[j]["usd"].(float64)
-		})
-		row["by_model"] = models
-
-		totalQuota += est.QuotaUSD
-		totalSpent += est.SpentUSD
-		totalRemaining += est.RemainingUSD
-		totalWindowUSD += acct.WindowUSD
-		totalSaved += acct.WindowSavedUSD
-		totalReqs += acct.WindowReqs
-		totalFailed += acct.WindowFailed
-		if est.QuotaUSD > 0 && acct.Percent >= 90 {
-			atRisk++
-		}
 		rows = append(rows, row)
 	}
 
 	sort.Slice(rows, func(i, j int) bool {
-		return quotaOf(rows[i]) > quotaOf(rows[j])
+		return longestQuota(rows[i]) > longestQuota(rows[j])
 	})
+
+	lengths := make([]int, 0, len(totals))
+	for m := range totals {
+		lengths = append(lengths, m)
+	}
+	sort.Ints(lengths)
+	windowTotalRows := make([]map[string]any, 0, len(lengths))
+	for _, m := range lengths {
+		t := totals[m]
+		windowTotalRows = append(windowTotalRows, map[string]any{
+			"minutes":       m,
+			"label":         windowLabel(m),
+			"credentials":   t.Credentials,
+			"estimated":     t.Estimated,
+			"at_risk":       t.AtRisk,
+			"quota_usd":     round2(t.QuotaUSD),
+			"spent_usd":     round2(t.SpentUSD),
+			"remaining_usd": round2(t.RemainingUSD),
+		})
+	}
 
 	priceSnapshot := a.prices.Snapshot()
 	if msg, _ := priceSnapshot["last_error"].(string); msg != "" {
-		warnings = append(warnings, "price catalog refresh is failing: "+msg)
+		warnings = append(warnings, "价目刷新失败："+msg)
 	}
 
 	return map[string]any{
-		"generated_at":   now.UTC().Format(time.RFC3339),
-		"plugin":         pluginID,
-		"plugin_version": pluginVersion,
+		"generated_at":    now.UTC().Format(time.RFC3339),
+		"plugin":          pluginID,
+		"plugin_version":  pluginVersion,
 		"price_source":    priceSnapshot["source"],
 		"price_transport": priceSnapshot["transport"],
 		"price_fetched":   priceSnapshot["fetched_at"],
-		"data_dir":       cfg.DataDir,
-		"accounts":       rows,
-		"warnings":       warnings,
-		"fleet_series":   fleetSeries(accounts, now),
+		"data_dir":        cfg.DataDir,
+		"accounts":        rows,
+		"warnings":        warnings,
+		"fleet_series":    fleetSeries(accounts, now),
+		"window_totals":   windowTotalRows,
 		"totals": map[string]any{
 			"credentials":         len(rows),
-			"estimated":           estimated,
-			"at_risk":             atRisk,
-			"quota_usd":           round2(totalQuota),
-			"spent_usd":           round2(totalSpent),
-			"remaining_usd":       round2(totalRemaining),
 			"window_usd_observed": round4(totalWindowUSD),
 			"cache_saved_usd":     round4(totalSaved),
-			"window_requests":     totalReqs,
-			"window_failed":       totalFailed,
+			"requests":            totalReqs,
+			"failed":              totalFailed,
 		},
 	}
 }
 
+type windowTotals struct {
+	Minutes                            int
+	Credentials, Estimated, AtRisk     int
+	QuotaUSD, SpentUSD, RemainingUSD   float64
+}
+
+func modelRows(a *App, w *Window) []map[string]any {
+	models := make([]map[string]any, 0, len(w.ByModel))
+	for name, agg := range w.ByModel {
+		entry := map[string]any{
+			"model":     name,
+			"requests":  agg.Requests,
+			"failed":    agg.Failed,
+			"usd":       round4(agg.USD),
+			"saved_usd": round4(agg.SavedUSD),
+			"tokens":    agg.Tokens,
+			"unpriced":  agg.Unpriced,
+		}
+		if agg.Requests > 0 {
+			entry["avg_usd"] = round6(agg.USD / float64(agg.Requests))
+		}
+		if agg.Tokens.Input > 0 {
+			entry["cache_hit_rate"] = round2(float64(agg.Tokens.CacheRead) / float64(agg.Tokens.Input) * 100)
+		}
+		if price, ok := a.prices.Lookup(name); ok {
+			entry["price"] = price
+		}
+		models = append(models, entry)
+	}
+	sort.Slice(models, func(i, j int) bool {
+		return models[i]["usd"].(float64) > models[j]["usd"].(float64)
+	})
+	return models
+}
+
+func longestQuota(row map[string]any) float64 {
+	longest, _ := row["longest"].(map[string]any)
+	if longest == nil {
+		return 0
+	}
+	if est, ok := longest["estimate"].(Estimate); ok {
+		return est.QuotaUSD
+	}
+	return 0
+}
+
+func toF(v any) float64 {
+	f, _ := v.(float64)
+	return f
+}
+
+func toI(v any) int64 {
+	i, _ := v.(int64)
+	return i
+}
+
+func displayName(acct *Account, a *App) string {
+	if entry, ok := a.lookupAuth(acct); ok {
+		return firstNonEmpty(entry.Label, entry.Email, entry.Name)
+	}
+	return acct.AuthID
+}
+
+func windowLabel(minutes int) string {
+	switch {
+	case minutes <= 0:
+		return ""
+	case minutes%(60*24) == 0:
+		return strconv.Itoa(minutes/(60*24)) + "d"
+	case minutes%60 == 0:
+		return strconv.Itoa(minutes/60) + "h"
+	default:
+		return strconv.Itoa(minutes) + "m"
+	}
+}
+
 // seriesOf flattens the hourly buckets into an ascending series the dashboard
-// can draw directly: hours ago, spend in that hour, cumulative spend, and the
-// quota percentage as last seen in that hour.
+// can draw directly.
 func seriesOf(acct *Account, now time.Time) []map[string]any {
 	if len(acct.Hours) == 0 {
 		return nil
@@ -1015,33 +1277,6 @@ func fleetSeries(accounts []*Account, now time.Time) []map[string]any {
 		})
 	}
 	return out
-}
-
-func quotaOf(row map[string]any) float64 {
-	if est, ok := row["estimate"].(Estimate); ok {
-		return est.QuotaUSD
-	}
-	return 0
-}
-
-func displayName(acct *Account, a *App) string {
-	if entry, ok := a.lookupAuth(acct); ok {
-		return firstNonEmpty(entry.Label, entry.Email, entry.Name)
-	}
-	return acct.AuthID
-}
-
-func windowLabel(minutes int) string {
-	switch {
-	case minutes <= 0:
-		return ""
-	case minutes%(60*24) == 0:
-		return strconv.Itoa(minutes/(60*24)) + "d"
-	case minutes%60 == 0:
-		return strconv.Itoa(minutes/60) + "h"
-	default:
-		return strconv.Itoa(minutes) + "m"
-	}
 }
 
 func parseFloat(s string) (float64, bool) {

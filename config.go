@@ -42,6 +42,10 @@ type Config struct {
 
 	// FlushSeconds debounces state writes so the hot path stays in memory.
 	FlushSeconds int `yaml:"flush_seconds"`
+
+	// StaleAfterMinutes marks a credential whose last quota reading is older
+	// than this, so a days-old percentage is never shown as if it were current.
+	StaleAfterMinutes int `yaml:"stale_after_minutes"`
 }
 
 func defaultConfig() Config {
@@ -54,6 +58,7 @@ func defaultConfig() Config {
 		EventLog:              true,
 		EventLogKeepDays:      60,
 		FlushSeconds:          15,
+		StaleAfterMinutes:     360,
 	}
 }
 
@@ -79,6 +84,11 @@ func (c *Config) normalize() {
 	if c.FlushSeconds <= 0 {
 		c.FlushSeconds = def.FlushSeconds
 	}
+	if c.StaleAfterMinutes < 0 {
+		c.StaleAfterMinutes = 0
+	} else if c.StaleAfterMinutes == 0 {
+		c.StaleAfterMinutes = def.StaleAfterMinutes
+	}
 }
 
 func (c Config) priceRefresh() time.Duration {
@@ -98,6 +108,7 @@ func configFields() []map[string]any {
 		{"Name": "event_log", "Type": "boolean", "Description": "Write one JSON line per request for auditing the estimate."},
 		{"Name": "event_log_keep_days", "Type": "integer", "Description": "Days of event log to retain."},
 		{"Name": "flush_seconds", "Type": "integer", "Description": "Seconds between state snapshots to disk."},
+		{"Name": "stale_after_minutes", "Type": "integer", "Description": "Flag a credential whose newest quota reading is older than this."},
 	}
 }
 

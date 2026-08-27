@@ -1,15 +1,21 @@
 // Package main implements the codex-weekly-usd CLIProxyAPI plugin.
 //
-// The plugin answers one question: for every Codex credential, what is the
-// weekly quota actually worth in US dollars if the same traffic had been billed
-// through the public OpenAI API?
+// The plugin answers one question per quota window: for every Codex credential,
+// what is that window's allowance actually worth in US dollars if the same
+// traffic had been billed through the public OpenAI API?
 //
 // It pairs two facts that arrive together on every request:
 //
 //	numerator   token counters from UsageRecord.Detail, priced at public rates
-//	denominator the x-codex-primary-used-percent response header
+//	denominator the used-percentage reported for that window
 //
 // quota_usd = spend_usd / (used_percent / 100)
+//
+// A credential can be under more than one limit at once — currently a 5-hour
+// window and a weekly one — and the same spend counts against every one of
+// them, so each window keeps its own ledger and its own estimate. Windows are
+// identified by their length, never by the primary/secondary label they arrive
+// under: upstream has already swapped those labels once.
 package main
 
 /*
@@ -77,15 +83,15 @@ import (
 const (
 	abiVersion uint32 = 1
 	pluginID          = "codex-weekly-usd"
-	pluginName        = "Codex Weekly USD"
+	pluginName        = "Codex Quota USD"
 )
 
 // Stamped at build time so a fork does not have to edit source to identify
 // itself:
 //
-//	go build -ldflags "-X main.pluginVersion=1.3.0 -X main.repository=github.com/owner/repo"
+//	go build -ldflags "-X main.pluginVersion=2.0.0 -X main.repository=github.com/owner/repo"
 var (
-	pluginVersion = "1.3.0"
+	pluginVersion = "2.0.0"
 	pluginAuthor  = "tang12306"
 	repository    = "github.com/tang12306/cpa-plugin-codex-weekly-usd"
 )
@@ -236,8 +242,8 @@ func managementRegistration() json.RawMessage {
 		"resources": []map[string]any{
 			{
 				"Path":        "/panel",
-				"Menu":        "周额度美元",
-				"Description": "按 OpenAI 官方 API 价目，推算每个凭据的周额度值多少美元。",
+				"Menu":        "额度美元",
+				"Description": "按 OpenAI 官方 API 价目，推算每个凭据每个额度窗口值多少美元。",
 			},
 		},
 	}

@@ -2,7 +2,11 @@
 
 A CLIProxyAPI plugin that answers one question per credential:
 
-> **This account's weekly quota — what is it worth in US dollars at public OpenAI API pricing?**
+> **This account's quota — what is it worth in US dollars at public OpenAI API pricing?**
+
+A credential sits under several limits at once (currently a 5-hour window and a
+weekly one) and the same spend counts against all of them, so every window keeps
+its own ledger and its own estimate.
 
 ## How it works
 
@@ -11,7 +15,7 @@ request produces token counters. The plugin pairs them:
 
 ```
 numerator     tokens from UsageRecord.Detail, priced at the public rate card
-denominator   x-codex-primary-used-percent
+denominator   that window's used-percentage
 
 quota_usd = spend_usd / (used_percent / 100)
 ```
@@ -19,14 +23,26 @@ quota_usd = spend_usd / (used_percent / 100)
 Real headers from `chatgpt.com/backend-api/codex`:
 
 ```
-x-codex-primary-used-percent: 71
-x-codex-primary-window-minutes: 10080      <- 7 days
-x-codex-primary-reset-at: 1787453974
+x-codex-primary-window-minutes:   300      <- 5 hours
+x-codex-primary-used-percent:     100
+x-codex-secondary-window-minutes: 10080    <- 7 days
+x-codex-secondary-used-percent:   63
 x-codex-plan-type: team
 x-codex-active-limit: premium
 ```
 
 These are present on **200 responses**, not only on 429s.
+
+### Windows are keyed by length, not by the primary/secondary label
+
+Those labels are not stable. Before the 5-hour limit was reinstated, `primary`
+was the weekly window and `secondary` was absent; afterwards `primary` became
+the 5-hour window and the weekly one moved to `secondary`.
+
+Treating `primary` as "the window" loses the weekly history outright, and worse,
+one percentage point of a weekly window is worth an order of magnitude more than
+one point of a 5-hour window — averaging both into one calibration produces a
+number that means nothing. Windows are therefore filed under `window_minutes`.
 
 ### Two independent estimators
 
@@ -43,6 +59,11 @@ why a fresh install still converges instead of reporting nonsense.
 The reported `confidence` tracks how much of the quota the plugin has actually
 watched being spent: `high` ≥ 25 points, `medium` ≥ 8, `low` below that, `none`
 before the first tick.
+
+**Calibration is bounded** — 160 samples, 21 days. An unbounded sum cannot follow
+a plan change, a window-semantics change or a re-priced model: old evidence would
+outvote new evidence forever while the evidence count ratcheted into the hundreds,
+so confidence would climb as accuracy fell.
 
 ### Attribution
 
@@ -65,6 +86,21 @@ would inflate every estimate.
 
 A model with no published cache-write rate has those tokens folded back into
 fresh input rather than charged nothing.
+
+### Upstream-granted mid-cycle resets
+
+OpenAI frequently hands quota back before a cycle ends: **the percentage drops
+while `reset_at` stays put**. Detecting rollovers by `reset_at` alone misses this,
+leaving pre-reset spend on the books to be divided by a small post-reset
+percentage, which blows the estimate up. A falling percentage therefore also
+starts a new cycle, and is counted separately and shown in the panel.
+
+### Quota spent by someone else
+
+If the percentage moves while this plugin billed nothing for it, another client
+is sharing the credential. That sample is skipped so it cannot pollute the
+calibration, and the amount accumulates into `unexplained_percent` and raises a
+warning — because it also means this plugin's ledger is undercounting.
 
 ### Restart safety
 
@@ -210,7 +246,7 @@ replays them over a synthetic multi-hour series, so what is asserted is
 byte-for-byte what a browser receives: bar count, cumulative monotonicity,
 points per known hour, rollover restart, and the degenerate cases.
 
-Currently 66 checks. The scenario is arithmetic rather than opinion: every request costs exactly
+Currently 77 checks. The scenario is arithmetic rather than opinion: every request costs exactly
 $2.00 at gpt-5.6-sol public pricing and moves the percentage by exactly one
 point, so the answer must be $200. Covered: both estimators agreeing, cache-read
 carve-out, reasoning tokens not double-billed, unknown models flagged, restart

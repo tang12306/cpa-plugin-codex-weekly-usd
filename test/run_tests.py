@@ -2,9 +2,9 @@
 """Known-answer tests for the codex-weekly-usd plugin, driven through the real
 C ABI via harness.c.
 
-The scenario is built so the correct output is arithmetic, not opinion: every
-request costs exactly $2.00 at gpt-5.6-sol public pricing and moves the upstream
-percentage by exactly one point, so the weekly quota must come out as $200.
+The scenarios are built so the correct output is arithmetic, not opinion: every
+request costs exactly $2.00 at gpt-5.6-sol public pricing, and the percentage
+steps are chosen so the quota must come out at a round number.
 """
 import base64
 import json
@@ -23,41 +23,54 @@ os.makedirs(BUILD, exist_ok=True)
 IN_TOKENS = 200_000
 OUT_TOKENS = 33_333
 COST = IN_TOKENS / 1e6 * 5 + OUT_TOKENS / 1e6 * 30  # $2.00 (to 5 decimals)
-RESET_AT = 1787424611
-WINDOW_MIN = 10080
-
-def config(price_url=""):
-    """Plugin config block. An empty price_source_url freezes pricing at the
-    built-in table, which is what most scenarios want; scenario G sets it so the
-    catalog fetch runs."""
-    return ("enabled: true\npriority: 100\ndata_dir: %s\n"
-            "price_source_url: \"%s\"\nevent_log: true\nflush_seconds: 1\n"
-            % (DATA_DIR, price_url))
+WEEK = 10080
+FIVEH = 300
+RESET_W = 1787424611
+RESET_5 = 1787400000
 
 failures = []
 
 
-def usage(percent, model="gpt-5.6-sol", reset_at=RESET_AT, cache_read=0, failed=False):
+def config(price_url=""):
+    return ("enabled: true\npriority: 100\ndata_dir: %s\n"
+            "price_source_url: \"%s\"\nevent_log: true\nflush_seconds: 1\n"
+            % (DATA_DIR, price_url))
+
+
+def usage(windows, model="gpt-5.6-sol", cache_read=0, failed=False, extra_headers=None):
+    """windows: list of (minutes, percent, reset_at) in slot order.
+
+    The first entry is emitted as "primary" and the second as "secondary".
+    Which window occupies which slot is deliberately a test parameter: upstream
+    has already swapped them once, and the plugin must not care.
+    """
+    headers = {
+        "X-Codex-Plan-Type": ["team"],
+        "X-Codex-Active-Limit": ["premium"],
+    }
+    for slot, (minutes, percent, reset_at) in zip(("Primary", "Secondary"), windows):
+        headers["X-Codex-%s-Used-Percent" % slot] = [str(percent)]
+        headers["X-Codex-%s-Window-Minutes" % slot] = [str(minutes)]
+        headers["X-Codex-%s-Reset-At" % slot] = [str(reset_at)]
+    if extra_headers:
+        headers.update(extra_headers)
     return {
         "Provider": "codex", "ExecutorType": "codex", "Model": model, "Alias": "",
         "AuthID": "codex-demo-team.json", "AuthIndex": "0", "AuthType": "codex",
-        "RequestedAt": "2026-08-20T13:00:00Z", "Failed": failed,
+        "RequestedAt": "2026-08-27T04:00:00Z", "Failed": failed,
         "Detail": {
             "InputTokens": IN_TOKENS, "OutputTokens": OUT_TOKENS,
             "ReasoningTokens": 12_000, "CachedTokens": cache_read,
             "CacheReadTokens": cache_read, "CacheCreationTokens": 0,
             "TotalTokens": IN_TOKENS + OUT_TOKENS,
         },
-        "ResponseHeaders": {
-            "X-Codex-Primary-Used-Percent": [str(percent)],
-            "X-Codex-Primary-Window-Minutes": [str(WINDOW_MIN)],
-            "X-Codex-Primary-Reset-At": [str(reset_at)],
-            "X-Codex-Primary-Reset-After-Seconds": ["192290"],
-            "X-Codex-Secondary-Used-Percent": ["0"],
-            "X-Codex-Secondary-Window-Minutes": ["0"],
-            "X-Codex-Plan-Type": ["team"], "X-Codex-Active-Limit": ["premium"],
-        },
+        "ResponseHeaders": headers,
     }
+
+
+def weekly(percent, **kw):
+    """One window only, in the primary slot: the pre-5h-limit header shape."""
+    return usage([(WEEK, percent, RESET_W)], **kw)
 
 
 def script(steps, path, tail=True, price_url="", route="data"):
@@ -87,6 +100,13 @@ def run(steps, path=None, price_url="", route="data"):
     return json.loads(bodies[-1])
 
 
+def win(report, minutes, account=0):
+    for w in report["accounts"][account]["windows"]:
+        if w["minutes"] == minutes:
+            return w
+    return None
+
+
 def check(name, got, want, tol=0.02):
     ok = abs(got - want) <= tol if isinstance(want, float) else got == want
     print("  %-46s %-22s %s" % (name, got, "OK" if ok else "FAIL (want %s)" % (want,)))
@@ -98,9 +118,9 @@ print("=" * 74)
 print("A. fresh install, 6 requests at $2.00 each, 1% per request")
 print("=" * 74)
 shutil.rmtree(DATA_DIR, ignore_errors=True)
-rep = run([("usage.handle", usage(i)) for i in range(6)])
-acct = rep["accounts"][0]
-est = acct["estimate"]
+rep = run([("usage.handle", weekly(i)) for i in range(6)])
+w = win(rep, WEEK)
+est = w["estimate"]
 check("quota_usd", round(est["quota_usd"], 2), 200.00)
 check("quota_usd_by_window", round(est["quota_usd_by_window"], 2), 200.00)
 check("quota_usd_by_delta", round(est["quota_usd_by_delta"], 2), 200.00)
@@ -110,78 +130,169 @@ check("attributed_usd (5 x $2)", round(est["attributed_usd"], 2), 10.00)
 check("spent_usd (= quota x 5%)", round(est["spent_usd"], 2), 10.00)
 check("remaining_usd", round(est["remaining_usd"], 2), 190.00)
 check("method", est["method"], "window")
-check("window_full_coverage", acct["window_full_coverage"], True)
-check("window_label", acct["window_label"], "7d")
-check("calibration samples", acct["calibration"]["samples"], 5)
+check("full_coverage", w["full_coverage"], True)
+check("window label", w["label"], "7d")
+check("calibration samples", est["samples"], 5)
 
 print()
 print("=" * 74)
 print("B. cache-read tokens are carved out of input, not billed on top")
 print("=" * 74)
 shutil.rmtree(DATA_DIR, ignore_errors=True)
-rep = run([("usage.handle", usage(0, cache_read=100_000))])
-acct = rep["accounts"][0]
-# 100k fresh input @ $5 + 100k cache-read @ $0.50 + 33,333 output @ $30
+rep = run([("usage.handle", weekly(0, cache_read=100_000))])
+w = win(rep, WEEK)
 want = 100_000 / 1e6 * 5 + 100_000 / 1e6 * 0.5 + OUT_TOKENS / 1e6 * 30
-check("cached request cost", round(acct["window_usd_observed"], 4), round(want, 4))
-check("reasoning tokens recorded", acct["window_tokens"]["ReasoningTokens"], 12000)
+check("cached request cost", round(w["usd_observed"], 4), round(want, 4))
+check("reasoning tokens recorded", w["tokens"]["ReasoningTokens"], 12000)
 
 print()
 print("=" * 74)
 print("C. restart with a gap: percentage moved while the plugin was down")
 print("=" * 74)
 shutil.rmtree(DATA_DIR, ignore_errors=True)
-run([("usage.handle", usage(i)) for i in range(6)])          # first process
-rep = run([("usage.handle", usage(20))])                      # restart; 6% -> 20%
-acct = rep["accounts"][0]
-est = acct["estimate"]
-check("window_full_coverage invalidated", acct["window_full_coverage"], False)
+run([("usage.handle", weekly(i)) for i in range(6)])
+rep = run([("usage.handle", weekly(20))])
+w = win(rep, WEEK)
+est = w["estimate"]
+check("full_coverage invalidated", w["full_coverage"], False)
 check("by_window suppressed", est["quota_usd_by_window"], 0.0)
 check("falls back to calibration", est["method"], "delta")
 check("quota still ~$200", round(est["quota_usd"], 2), 200.00)
 
 print()
 print("=" * 74)
-print("D. window rollover: per-window counters reset, calibration survives")
+print("D. cycle rollover: per-cycle counters reset, calibration survives")
 print("=" * 74)
 shutil.rmtree(DATA_DIR, ignore_errors=True)
-steps = [("usage.handle", usage(i)) for i in range(6)]
-steps += [("usage.handle", usage(i, reset_at=RESET_AT + 7 * 86400)) for i in range(3)]
+steps = [("usage.handle", weekly(i)) for i in range(6)]
+steps += [("usage.handle", usage([(WEEK, i, RESET_W + 7 * 86400)])) for i in range(3)]
 rep = run(steps)
-acct = rep["accounts"][0]
-est = acct["estimate"]
-check("window_requests reset", acct["window_requests"], 3)
-check("calibration survived rollover", acct["calibration"]["samples"], 7)
-check("quota still ~$200", round(est["quota_usd"], 2), 200.00)
-check("new window full coverage", acct["window_full_coverage"], True)
+w = win(rep, WEEK)
+check("requests reset", w["requests"], 3)
+check("cycles counted", w["cycles"], 2)
+check("calibration survived rollover", w["estimate"]["samples"], 7)
+check("quota still ~$200", round(w["estimate"]["quota_usd"], 2), 200.00)
+check("new cycle full coverage", w["full_coverage"], True)
 
 print()
 print("=" * 74)
-print("E. derived metrics: cache savings, failures, pace, hourly series")
+print("E. the 5-hour and weekly limits are priced independently")
 print("=" * 74)
 shutil.rmtree(DATA_DIR, ignore_errors=True)
-rep = run([("usage.handle", usage(0)),
-           ("usage.handle", usage(1, cache_read=100_000)),
-           ("usage.handle", usage(2, failed=True))])
-acct = rep["accounts"][0]
-# 100k cache-read tokens cost $0.50/M instead of $5/M -> $0.45 saved
-check("cache saved usd", round(acct["window_saved_usd"], 4), 0.45)
-check("cache hit rate", round(acct["cache_hit_rate"], 1), round(100_000 / 600_000 * 100, 1))
-check("failed request counted", acct["window_failed"], 1)
-check("failed marked on model row", acct["by_model"][0]["failed"], 1)
-check("failure rate", round(acct["failure_rate"], 1), round(1 / 3 * 100, 1))
-check("hourly series present", len(acct["series"]) >= 1, True)
-check("series carries spend", acct["series"][-1]["usd"] > 0, True)
-check("series carries percent", "percent" in acct["series"][-1], True)
-check("fleet series present", len(rep["fleet_series"]) >= 1, True)
-check("time progress reported", "time_progress_percent" in acct, True)
-check("pace ratio reported", "pace_ratio" in acct, True)
-check("totals carry savings", round(rep["totals"]["cache_saved_usd"], 4), 0.45)
-check("totals carry failures", rep["totals"]["window_failed"], 1)
+# Weekly moves 1 point per request, the 5-hour window 5 points, for the same
+# $2.00. The quotas must therefore differ by exactly 5x.
+steps = [("usage.handle", usage([(FIVEH, i * 5, RESET_5), (WEEK, i, RESET_W)])) for i in range(6)]
+rep = run(steps)
+w5, w7 = win(rep, FIVEH), win(rep, WEEK)
+check("5h quota  = $10 / 25%", round(w5["estimate"]["quota_usd"], 2), 40.00)
+check("7d quota  = $10 / 5%", round(w7["estimate"]["quota_usd"], 2), 200.00)
+check("5h label", w5["label"], "5h")
+check("both windows billed the same spend", round(w5["usd_observed"], 4), round(w7["usd_observed"], 4))
+check("binding window is the fuller one", rep["accounts"][0]["binding"]["minutes"], FIVEH)
+check("headline window is the longest", rep["accounts"][0]["longest"]["minutes"], WEEK)
+check("window totals cover both", len(rep["window_totals"]), 2)
 
 print()
 print("=" * 74)
-print("F. panel is unauthenticated, carries no data, and ships the charts")
+print("F. primary/secondary swapping slots must not corrupt a window")
+print("=" * 74)
+shutil.rmtree(DATA_DIR, ignore_errors=True)
+# Phase 1 is the old header shape (weekly in the primary slot, no 5h window).
+steps = [("usage.handle", usage([(WEEK, i, RESET_W)])) for i in range(6)]
+# Phase 2 is the shape upstream switched to: 5h primary, weekly secondary.
+steps += [("usage.handle", usage([(FIVEH, i * 5, RESET_5), (WEEK, 6 + i, RESET_W)])) for i in range(6)]
+rep = run(steps)
+w7 = win(rep, WEEK)
+check("weekly window kept its identity", w7["minutes"], WEEK)
+check("weekly cycles not restarted", w7["cycles"], 1)
+check("weekly quota still ~$200", round(w7["estimate"]["quota_usd"], 2), 200.00)
+check("weekly gained more samples", w7["estimate"]["samples"] > 5, True)
+check("5h window created separately", win(rep, FIVEH)["minutes"], FIVEH)
+
+print()
+print("=" * 74)
+print("G. an upstream-granted mid-cycle reset must not inflate the quota")
+print("=" * 74)
+shutil.rmtree(DATA_DIR, ignore_errors=True)
+steps = [("usage.handle", weekly(i)) for i in range(6)]
+# Percentage falls back to zero while the reset timestamp stays put: OpenAI
+# handed back the quota mid-cycle. Without detection the pre-reset spend would
+# be divided by the new small percentage.
+steps += [("usage.handle", weekly(0))]
+steps += [("usage.handle", weekly(i)) for i in range(1, 4)]
+rep = run(steps)
+w = win(rep, WEEK)
+check("granted reset detected", w["granted_resets"], 1)
+check("cycle spend restarted", w["requests"], 4)
+check("quota not inflated", round(w["estimate"]["quota_usd"], 2), 200.00)
+
+print()
+print("=" * 74)
+print("H. calibration is bounded, so evidence cannot ratchet up forever")
+print("=" * 74)
+shutil.rmtree(DATA_DIR, ignore_errors=True)
+# 400 percentage steps across four cycles: far more samples than the cap.
+steps = []
+for cycle in range(4):
+    reset = RESET_W + cycle * 7 * 86400
+    for i in range(101):
+        steps.append(("usage.handle", usage([(WEEK, i, reset)])))
+rep = run(steps)
+w = win(rep, WEEK)
+est = w["estimate"]
+check("samples capped", est["samples"] <= 160, True)
+check("evidence stays bounded", est["evidence_percent"] <= 160.0, True)
+check("quota still ~$200", round(est["quota_usd"], 2), 200.00)
+check("all four cycles seen", w["cycles"], 4)
+
+print()
+print("=" * 74)
+print("I. quota consumed with no spend of ours is reported, not swallowed")
+print("=" * 74)
+shutil.rmtree(DATA_DIR, ignore_errors=True)
+rep = run([
+    ("usage.handle", weekly(0)),
+    ("usage.handle", weekly(1)),
+    ("usage.handle", weekly(2, failed=True)),   # pairs, leaves pending at 0
+    ("usage.handle", weekly(8, failed=True)),   # +6 points with nothing billed
+])
+w = win(rep, WEEK)
+check("unexplained percent recorded", round(w["unexplained_percent"], 2), 6.00)
+check("failed requests counted", w["failed"], 2)
+check("warning raised", any("其它客户端" in x for x in rep["warnings"]), True)
+
+print()
+print("=" * 74)
+print("J. credit exhaustion is captured even when percentages look fine")
+print("=" * 74)
+shutil.rmtree(DATA_DIR, ignore_errors=True)
+rep = run([("usage.handle", weekly(1, extra_headers={
+    "X-Codex-Credits-Has-Credits": ["False"],
+    "X-Codex-Credits-Unlimited": ["False"],
+    "X-Codex-Rate-Limit-Reached-Type": ["workspace_owner_credits_depleted"],
+}))])
+acct = rep["accounts"][0]
+check("limit reason surfaced", acct["limit_reached_type"], "workspace_owner_credits_depleted")
+check("credits recorded", acct["credits"]["has_credits"], False)
+
+print()
+print("=" * 74)
+print("K. price catalog is fetched through the host, not by dialling out")
+print("=" * 74)
+shutil.rmtree(DATA_DIR, ignore_errors=True)
+rep = run([("sleep", 400), ("usage.handle", weekly(0, model="harness-model"))],
+          price_url="https://harness.invalid/catalog.json")
+w = win(rep, WEEK)
+want = IN_TOKENS / 1e6 * 3 + OUT_TOKENS / 1e6 * 9
+check("priced from host-fetched catalog", round(w["usd_observed"], 4), round(want, 4))
+check("model was not left unpriced", rep["accounts"][0]["unpriced_requests"], 0)
+prices = run([("sleep", 400)], price_url="https://harness.invalid/catalog.json", route="prices")
+check("transport recorded as host", prices["transport"], "host")
+check("builtin table still merged", any(m["model"] == "gpt-5.6-sol" for m in prices["models"]), True)
+
+print()
+print("=" * 74)
+print("L. panel is unauthenticated, carries no data, and ships the charts")
 print("=" * 74)
 panel_script = os.path.join(BUILD, "panel.txt")
 script([], panel_script, tail=False)
@@ -202,25 +313,6 @@ check("ships constant-rate reference", "stroke-dasharray" in html, True)
 check("charts are inline svg only", "<script src" not in html and "http://" not in html, True)
 with open(os.path.join(BUILD, "panel.html"), "w", encoding="utf-8") as fh:
     fh.write(html)
-
-print()
-print("=" * 74)
-print("G. price catalog is fetched through the host, not by dialling out")
-print("=" * 74)
-shutil.rmtree(DATA_DIR, ignore_errors=True)
-# The harness answers host.http.do with a one-model catalog priced at
-# input $3 / output $9, so 200k in + 33,333 out must come to $0.90.
-rep = run([("sleep", 400), ("usage.handle", usage(0, model="harness-model"))],
-          price_url="https://harness.invalid/catalog.json")
-acct = rep["accounts"][0]
-want = IN_TOKENS / 1e6 * 3 + OUT_TOKENS / 1e6 * 9
-check("priced from host-fetched catalog", round(acct["window_usd_observed"], 4), round(want, 4))
-check("model was not left unpriced", acct["unpriced_requests"], 0)
-
-prices = run([("sleep", 400)], price_url="https://harness.invalid/catalog.json", route="prices")
-check("transport recorded as host", prices["transport"], "host")
-check("catalog model present", any(m["model"] == "harness-model" for m in prices["models"]), True)
-check("builtin table still merged", any(m["model"] == "gpt-5.6-sol" for m in prices["models"]), True)
 
 print()
 print("=" * 74)
