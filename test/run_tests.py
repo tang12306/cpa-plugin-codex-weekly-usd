@@ -30,6 +30,12 @@ RESET_5 = 1787400000
 
 failures = []
 
+# Without these the harness produces nothing and every assertion silently reads
+# an empty result, which looks like a hung suite rather than a missing build.
+for _path, _hint in ((SO, "make build"), (HARNESS, "make build/harness")):
+    if not os.path.exists(_path):
+        sys.exit("missing %s - run `%s` first" % (_path, _hint))
+
 
 def config(price_url=""):
     return ("enabled: true\npriority: 100\ndata_dir: %s\n"

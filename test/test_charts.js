@@ -3,7 +3,14 @@
 // multi-hour series and checked coordinate by coordinate.
 const fs = require("fs");
 
-const html = fs.readFileSync(process.argv[2], "utf8");
+const panelPath = process.argv[2];
+if (!panelPath || !fs.existsSync(panelPath)) {
+  // run_tests.py writes this from the panel the plugin actually serves; without
+  // it there is nothing meaningful to assert against.
+  console.error("missing panel html - run `make test` (or python3 test/run_tests.py) first");
+  process.exit(2);
+}
+const html = fs.readFileSync(panelPath, "utf8");
 
 // Lift the chart helpers plus the formatters they depend on out of the page.
 function lift(name) {
