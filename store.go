@@ -199,6 +199,7 @@ type stateFile struct {
 	Version  int                 `json:"version"`
 	SavedAt  time.Time           `json:"saved_at"`
 	Accounts map[string]*Account `json:"accounts"`
+	Rotator  RotatorState        `json:"rotator,omitempty"`
 }
 
 // stateVersion 2 introduced per-length windows and bounded calibration;
@@ -213,6 +214,8 @@ type App struct {
 	cfg      Config
 	accounts map[string]*Account
 	prices   *priceBook
+
+	rot *rotator
 
 	dirty     bool
 	events    []json.RawMessage
@@ -247,6 +250,7 @@ func newApp(cfg Config) (*App, error) {
 		stop:      make(chan struct{}),
 		startedAt: time.Now(),
 	}
+	app.rot = newRotator(app)
 	app.prices.setOverrides(cfg.PriceOverrides)
 	app.loadState()
 	app.start()
@@ -274,6 +278,7 @@ func (a *App) start() {
 	}
 	a.started = true
 	go a.loop()
+	go a.rot.loop(a.stop)
 }
 
 func (a *App) loop() {
@@ -789,6 +794,15 @@ func (a *App) loadState() {
 	if migrated > 0 {
 		hostLog("info", fmt.Sprintf("migrated %d credential(s) to per-length windows; prior calibration discarded because it mixed window sizes", migrated))
 	}
+	a.rot.restore(sf.Rotator)
+}
+
+// markDirty flags the state for the next flush without holding any other lock,
+// so callers that own a different lock can use it safely.
+func (a *App) markDirty() {
+	a.mu.Lock()
+	a.dirty = true
+	a.mu.Unlock()
 }
 
 // Flush writes the state snapshot and drains the buffered event log.
@@ -798,7 +812,7 @@ func (a *App) Flush() {
 		a.mu.Unlock()
 		return
 	}
-	snapshot := stateFile{Version: stateVersion, SavedAt: time.Now().UTC(), Accounts: make(map[string]*Account, len(a.accounts))}
+	snapshot := stateFile{Version: stateVersion, SavedAt: time.Now().UTC(), Accounts: make(map[string]*Account, len(a.accounts)), Rotator: a.rot.snapshot()}
 	for k, v := range a.accounts {
 		snapshot.Accounts[k] = v
 	}
@@ -1140,6 +1154,10 @@ func (a *App) Report() map[string]any {
 	// go in front of the accounting ones.
 	models, modelWarnings := modelHealth(entries, accounts, now)
 	warnings = append(modelWarnings, warnings...)
+	rotatorReport := a.rot.Report(cfg.Rotator)
+	if extra, _ := rotatorReport["warnings"].([]map[string]any); len(extra) > 0 {
+		warnings = append(extra, warnings...)
+	}
 
 	return map[string]any{
 		"generated_at":    now.UTC().Format(time.RFC3339),
@@ -1152,6 +1170,7 @@ func (a *App) Report() map[string]any {
 		"accounts":        rows,
 		"warnings":        warnings,
 		"models":          models,
+		"rotator":         rotatorReport,
 		"fleet_series":    fleetSeries(accounts, now),
 		"window_totals":   windowTotalRows,
 		"totals": map[string]any{

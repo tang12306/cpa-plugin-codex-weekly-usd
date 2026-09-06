@@ -36,6 +36,22 @@ func (a *App) HandleManagement(payload []byte) json.RawMessage {
 		return marshalResponse(a.prices.Snapshot())
 	case strings.HasSuffix(path, "/data"):
 		return marshalResponse(a.Report())
+	case strings.HasSuffix(path, "/rotate"):
+		// Evaluate the pool now instead of waiting for the next check. POST
+		// only: this one can change which credentials are enabled, and a route
+		// that acts must not be reachable by following a link. It sits under
+		// /v0/management, so it carries the management key like everything else
+		// that is not the panel shell.
+		if !strings.EqualFold(req.Method, "POST") {
+			return jsonResponse(405, "application/json; charset=utf-8",
+				[]byte(`{"error":"POST required"}`))
+		}
+		cfg := a.rot.config()
+		if !cfg.Enabled {
+			return marshalResponse(map[string]any{"error": "rotator is disabled", "rotator": a.rot.Report(cfg)})
+		}
+		a.rot.tick(true)
+		return marshalResponse(a.rot.Report(a.rot.config()))
 	default:
 		return marshalResponse(map[string]any{"error": "unknown route: " + req.Path})
 	}
@@ -184,6 +200,15 @@ const panelHTML = `<!doctype html>
   <div class="mwrap"><table id="modeltable"></table></div>
   <div class="chartcap" id="t-modelhint"></div>
 </div>
+<div id="rotbox" class="box" hidden>
+  <h2><span id="t-rot"></span> <span class="legend" id="rot-status"></span></h2>
+  <div class="mwrap"><table id="rottable"></table></div>
+  <div class="chartcap" id="t-rothint"></div>
+  <details id="rotlogbox" hidden>
+    <summary id="t-rotlog"></summary>
+    <div class="mwrap"><table id="rotlog"></table></div>
+  </details>
+</div>
 <div id="wtotals"></div>
 <div id="cards" class="cards" hidden></div>
 <div id="chartbox" class="box" hidden>
@@ -232,6 +257,26 @@ const panelHTML = `<!doctype html>
       msDown: "全部冷却", msDegraded: "部分冷却", msOK: "正常", msSingle: "单点凭据",
       csCooling: "冷却", csRecovering: "待验证", csOK: "正常", csDisabled: "已停用",
       mhEstimated: "估计", mhBlocks: "累计 {0} 次冷却", mhReason: "原因：{0}",
+      rotTitle: "凭据轮换",
+      rotHint: "轮换器维持固定数量的凭据处于启用状态，在成员快耗尽之前把它换掉。" +
+        "代理的 fill-first 会在一个凭据被拒时于同一请求内改用下一个，所以只要替补已经在池子里，" +
+        "换人对调用方是无感的。<b>判定用的是实探读数</b>——已停用的凭据仍可能被别处消耗，存档数据只能算线索。" +
+        "「可撑」按剩余美元 ÷ 当前消耗速度估算；百分比在不同套餐上不等值，所以排序不看百分比。" +
+        "同时合格时优先用<b>更早作废</b>的额度。",
+      rotOff: "未启用", rotDry: "空跑（只决策不写入）", rotOn: "运行中",
+      rotPool: "池 {0} 个", rotFloor: "阈值 {0}%", rotSwept: "{0}前评估",
+      rotChanges: "今日 {0}/{1} 次改动",
+      rtCred: "凭据", rtRole: "角色", rtHead: "余量", rtWindow: "绑定窗口",
+      rtReset: "重置", rtServe: "可撑", rtVerdict: "判定",
+      rtActive: "启用中", rtStandby: "备用",
+      rtOK: "合格", rtSafe: "合格 · 可撑住",
+      skDead: "token 失效", skExhausted: "已耗尽", skFloor: "低于阈值",
+      skProbe: "探测失败", skExcluded: "配置排除", skRecent: "刚轮换过",
+      rotLogTitle: "轮换记录", rlAt: "时间", rlAction: "动作", rlCred: "凭据", rlWhy: "原因",
+      rlEnable: "启用", rlDisable: "停用", rlDry: "空跑",
+      warnRotStuck: "轮换器判定当前池子人手不足，但没有任何备用凭据合格，因此**没有动任何东西**——" +
+        "现有凭据保持启用。请补充可用账号，或检查是否所有备用号都已耗尽/失效。",
+      warnRotDry: "轮换器处于空跑模式：它会照常判断并记录，但不会真的改写凭据。确认记录无误后把 dry_run 关掉。",
       mhWindowFull: "{0} 窗口已打满", mhLastOK: "最后成功于 {0}前",
       updatedAt: "更新于 {0}",
       needKey: "请先填入管理密钥。", keyRejected: "管理密钥被拒绝。", reqFailed: "请求失败：HTTP {0}",
@@ -315,6 +360,32 @@ const panelHTML = `<!doctype html>
       msDown: "all cooling", msDegraded: "partly cooling", msOK: "healthy", msSingle: "single credential",
       csCooling: "cooling", csRecovering: "unverified", csOK: "ok", csDisabled: "disabled",
       mhEstimated: "estimated", mhBlocks: "{0} lockouts so far", mhReason: "reason: {0}",
+      rotTitle: "Credential rotation",
+      rotHint: "The rotator holds a fixed number of credentials enabled and replaces a member " +
+        "before it runs out. The proxy's fill-first selector retries a refused request on the " +
+        "next enabled credential, so a handover is invisible to callers as long as the " +
+        "replacement is already in the pool. <b>Decisions use a live reading</b>: a disabled " +
+        "credential can still be spent elsewhere, so stored percentages are evidence rather " +
+        "than fact. \"Covers\" is remaining dollars divided by the current spend rate - a " +
+        "percentage point is worth different money on different plans, so ranking never uses " +
+        "percentages. Between candidates that both qualify, the allowance that <b>expires " +
+        "soonest</b> is spent first.",
+      rotOff: "off", rotDry: "dry run (decides, writes nothing)", rotOn: "running",
+      rotPool: "pool of {0}", rotFloor: "floor {0}%", rotSwept: "evaluated {0} ago",
+      rotChanges: "{0}/{1} changes today",
+      rtCred: "Credential", rtRole: "Role", rtHead: "Headroom", rtWindow: "Binding window",
+      rtReset: "Resets", rtServe: "Covers", rtVerdict: "Verdict",
+      rtActive: "enabled", rtStandby: "standby",
+      rtOK: "eligible", rtSafe: "eligible · covers the horizon",
+      skDead: "token rejected", skExhausted: "exhausted", skFloor: "below floor",
+      skProbe: "probe failed", skExcluded: "excluded", skRecent: "just rotated",
+      rotLogTitle: "Rotation log", rlAt: "When", rlAction: "Action", rlCred: "Credential", rlWhy: "Why",
+      rlEnable: "enable", rlDisable: "disable", rlDry: "dry run",
+      warnRotStuck: "The rotator judged the pool short but no standby qualified, so it changed " +
+        "nothing - whatever is enabled stays enabled. Add a usable account, or check whether " +
+        "every standby is spent or rejected.",
+      warnRotDry: "The rotator is in dry run: it decides and records as usual but never rewrites a " +
+        "credential. Turn dry_run off once the log looks right.",
       mhWindowFull: "{0} window is full", mhLastOK: "last success {0} ago",
       updatedAt: "updated {0}",
       needKey: "Enter the management key first.", keyRejected: "Management key rejected.",
@@ -400,6 +471,7 @@ const panelHTML = `<!doctype html>
   var wrap = el("wrap"), stamp = el("stamp"), foot = el("foot"), head = el("head");
   var chartbox = el("chartbox"), chart = el("chart"), pricebox = el("pricebox"), wtotals = el("wtotals");
   var modelbox = el("modelbox"), modeltable = el("modeltable");
+  var rotbox = el("rotbox"), rottable = el("rottable");
   var last = null, timer = null;
 
   keyBox.value = localStorage.getItem(STORE) || "";
@@ -747,6 +819,8 @@ const panelHTML = `<!doctype html>
         return w.in_seconds === undefined
           ? t("warnModelDownNoEta", w.model, w.credentials)
           : t("warnModelDown", w.model, w.credentials, dur(w.in_seconds));
+      case "rotator_stuck": return t("warnRotStuck");
+      case "rotator_dry_run": return t("warnRotDry");
       case "model_single_point":
         return w.disabled
           ? t("warnModelSingleOff", w.model, w.credential, w.disabled)
@@ -756,7 +830,9 @@ const panelHTML = `<!doctype html>
   }
 
   // A model with nothing left to serve it is an outage, not an advisory.
-  function warnClass(w) { return w.code === "model_unavailable" ? "bad" : "warn"; }
+  function warnClass(w) {
+    return (w.code === "model_unavailable" || w.code === "rotator_stuck") ? "bad" : "warn";
+  }
 
   function modelStateTag(m) {
     var cls = { down: "bad", degraded: "warn", ok: "ok" }[m.state] || "";
@@ -786,6 +862,74 @@ const panelHTML = `<!doctype html>
     tip.push(t("mhTraffic") + ": " + (c.requests || 0) + " / " + (c.failed || 0));
     return "<span class='chip tag " + cls + (c.state === "disabled" ? " off" : "") +
            "' title='" + esc(tip.join("\n")) + "'>" + label + "</span>";
+  }
+
+  var SKIPS = { dead_token: "skDead", exhausted: "skExhausted", below_floor: "skFloor",
+                probe_failed: "skProbe", excluded_by_config: "skExcluded",
+                recently_rotated: "skRecent" };
+
+  function rotVerdict(c) {
+    if (c.skipped) {
+      var cls = c.skipped === "dead_token" ? "bad" : "";
+      return "<span class='tag " + cls + "'>" + t(SKIPS[c.skipped] || c.skipped) + "</span>";
+    }
+    return "<span class='tag ok'>" + t(c.safe ? "rtSafe" : "rtOK") + "</span>";
+  }
+
+  function renderRotator(r) {
+    if (!r) { rotbox.hidden = true; return; }
+    var state = !r.enabled ? "<span class='tag'>" + t("rotOff") + "</span>"
+      : (r.dry_run ? "<span class='tag warn'>" + t("rotDry") + "</span>"
+                   : "<span class='tag ok'>" + t("rotOn") + "</span>");
+    state += " <span class='tag'>" + t("rotPool", r.keep_enabled) + "</span>" +
+             " <span class='tag'>" + t("rotFloor", r.switch_at_percent) + "</span>";
+    if (r.last_sweep_age_seconds !== undefined) {
+      state += " <span class='tag'>" + t("rotSwept", dur(r.last_sweep_age_seconds)) + "</span>";
+    }
+    if (r.max_changes_daily) {
+      state += " <span class='tag'>" + t("rotChanges", r.changes_today || 0, r.max_changes_daily) + "</span>";
+    }
+    el("rot-status").innerHTML = state;
+
+    var rows = r.candidates || [];
+    if (!rows.length) {
+      rottable.innerHTML = "<tbody><tr><td>" + t("mhNone") + "</td></tr></tbody>";
+    } else {
+      var h = "<thead><tr><th>" + t("rtCred") + "</th><th>" + t("rtRole") + "</th><th>" +
+              t("rtHead") + "</th><th>" + t("rtWindow") + "</th><th>" + t("rtReset") +
+              "</th><th>" + t("rtServe") + "</th><th>" + t("rtVerdict") + "</th></tr></thead><tbody>";
+      rows.forEach(function (c) {
+        h += "<tr><td><span class='name'>" + esc(c.credential || c.file) + "</span>" +
+               (c.plan_type ? "<div class='sub2'>" + esc(c.plan_type) + "</div>" : "") + "</td>" +
+             "<td><span class='tag" + (c.enabled ? " ok" : "") + "'>" +
+               t(c.enabled ? "rtActive" : "rtStandby") + "</span></td>" +
+             "<td class='num'>" + pct(c.headroom_percent) + "</td>" +
+             "<td class='num'>" + (c.binding_window_minutes
+               ? wname({ minutes: c.binding_window_minutes }) : "—") + "</td>" +
+             "<td class='num'>" + (c.binding_reset_in_hours
+               ? dur(Math.round(c.binding_reset_in_hours * 3600)) : "—") + "</td>" +
+             "<td class='num'>" + (c.service_hours
+               ? dur(Math.round(c.service_hours * 3600)) : "—") + "</td>" +
+             "<td>" + rotVerdict(c) + "</td></tr>";
+      });
+      rottable.innerHTML = h + "</tbody>";
+    }
+
+    var log = r.log || [];
+    el("rotlogbox").hidden = !log.length;
+    if (log.length) {
+      var lh = "<thead><tr><th>" + t("rlAt") + "</th><th>" + t("rlAction") + "</th><th>" +
+               t("rlCred") + "</th><th>" + t("rlWhy") + "</th></tr></thead><tbody>";
+      log.forEach(function (e) {
+        lh += "<tr><td>" + esc(e.at) + "</td><td><span class='tag " +
+              (e.action === "enable" ? "ok" : "warn") + "'>" +
+              t(e.action === "enable" ? "rlEnable" : "rlDisable") + "</span>" +
+              (e.dry_run ? " <span class='tag'>" + t("rlDry") + "</span>" : "") + "</td>" +
+              "<td>" + esc(e.file) + "</td><td>" + esc(e.reason) + "</td></tr>";
+      });
+      el("rotlog").innerHTML = lh + "</tbody>";
+    }
+    rotbox.hidden = false;
   }
 
   function renderModels(models) {
@@ -824,6 +968,9 @@ const panelHTML = `<!doctype html>
     el("t-lg2").textContent = t("legendLine");
     el("t-prices").textContent = t("pricesTitle");
     el("t-models").textContent = t("modelsTitle");
+    el("t-rot").textContent = t("rotTitle");
+    el("t-rothint").innerHTML = t("rotHint");
+    el("t-rotlog").textContent = t("rotLogTitle");
     el("t-modelhint").innerHTML = t("modelsHint");
     var opts = el("sort").options;
     var names = ["sortQuota", "sortRemain", "sortUsed", "sortPace", "sortName"];
@@ -836,6 +983,7 @@ const panelHTML = `<!doctype html>
     alerts.innerHTML = "";
     (data.warnings || []).forEach(function (w) { note(warnClass(w), warnText(w)); });
     renderModels(data.models);
+    renderRotator(data.rotator);
 
     var accounts = data.accounts || [];
     var stale = accounts.filter(function (a) { return a.stale; });
@@ -971,7 +1119,8 @@ const panelHTML = `<!doctype html>
     localStorage.setItem(STORE, keyBox.value.trim());
     api("data").then(render).catch(function (err) {
       alerts.innerHTML = ""; note("bad", err.message);
-      cards.hidden = wrap.hidden = chartbox.hidden = pricebox.hidden = modelbox.hidden = true;
+      cards.hidden = wrap.hidden = chartbox.hidden = pricebox.hidden = true;
+      modelbox.hidden = rotbox.hidden = true;
       wtotals.innerHTML = "";
     });
   }
@@ -987,7 +1136,8 @@ const panelHTML = `<!doctype html>
   keyBox.addEventListener("keydown", function (e) { if (e.key === "Enter") load(); });
   el("forget").addEventListener("click", function () {
     localStorage.removeItem(STORE); keyBox.value = ""; last = null;
-    cards.hidden = wrap.hidden = chartbox.hidden = pricebox.hidden = modelbox.hidden = true;
+    cards.hidden = wrap.hidden = chartbox.hidden = pricebox.hidden = true;
+    modelbox.hidden = rotbox.hidden = true;
     alerts.innerHTML = ""; stamp.textContent = ""; wtotals.innerHTML = "";
     if (timer) { clearInterval(timer); timer = null; }
   });

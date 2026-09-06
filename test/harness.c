@@ -44,17 +44,76 @@ typedef int (*plugin_init_fn)(cliproxy_host_api*, cliproxy_plugin_api*);
     "b3V0cHV0Ijo5LCJjYWNoZV9yZWFkIjowLjN9fX19fQ=="
 
 #define AUTH_LIST_ENVELOPE "{\"ok\":true,\"result\":{\"files\":%s}}"
+#define RESULT_ENVELOPE    "{\"ok\":true,\"result\":%s}"
+
+// Fixtures are whole result objects held in files, spliced into the envelope
+// without being parsed. Keeping JSON handling out of the harness is deliberate:
+// a fixture loader with its own parser is a second implementation to get wrong,
+// and the point of this file is to be obviously correct.
+//
+//   HARNESS_AUTH_LIST  the files array returned by host.auth.list
+//   HARNESS_AUTH_DIR   host.auth.get reads <dir>/<auth_index>.json
+//   HARNESS_PROBE_DIR  host.http.do reads <dir>/<bearer token>.json
+//   HARNESS_SAVE_LOG   host.auth.save appends each request here, one per line
+static char* slurp(const char* path, size_t* out_len) {
+    FILE* f = fopen(path, "rb");
+    if (!f) return NULL;
+    fseek(f, 0, SEEK_END);
+    long n = ftell(f);
+    fseek(f, 0, SEEK_SET);
+    if (n < 0) { fclose(f); return NULL; }
+    char* buf = (char*)malloc((size_t)n + 1);
+    if (!buf) { fclose(f); return NULL; }
+    size_t got = fread(buf, 1, (size_t)n, f);
+    fclose(f);
+    buf[got] = 0;
+    if (out_len) *out_len = got;
+    return buf;
+}
+
+// field copies the value that follows `needle` up to the next `stop` character.
+// Enough to pull one flat string out of a request without a parser.
+static int field(const char* hay, size_t hay_len, const char* needle, char stop,
+                 char* out, size_t cap) {
+    const char* found = NULL;
+    size_t nlen = strlen(needle);
+    for (size_t i = 0; i + nlen <= hay_len; i++) {
+        if (memcmp(hay + i, needle, nlen) == 0) { found = hay + i + nlen; break; }
+    }
+    if (!found) return 0;
+    size_t i = 0;
+    while (found[i] && found[i] != stop && i + 1 < cap) { out[i] = found[i]; i++; }
+    out[i] = 0;
+    return i > 0;
+}
+
+// fixture builds a reply from <dir>/<key>.json, or returns NULL when the caller
+// should fall back to its default.
+static char* fixture(const char* dir_env, const char* key) {
+    const char* dir = getenv(dir_env);
+    if (!dir || !*dir || !key || !*key) return NULL;
+    char path[1024];
+    snprintf(path, sizeof(path), "%s/%s.json", dir, key);
+    size_t len = 0;
+    char* body = slurp(path, &len);
+    if (!body) return NULL;
+    size_t need = len + sizeof(RESULT_ENVELOPE) + 8;
+    char* out = (char*)malloc(need);
+    snprintf(out, need, RESULT_ENVELOPE, body);
+    free(body);
+    return out;
+}
 
 // host_call answers the callbacks the plugin makes. host.log is echoed so
-// plugin-side warnings are visible; host.http.do serves the canned catalog
-// above; host.auth.list returns whatever HARNESS_AUTH_LIST holds, defaulting to
-// an empty list, which exercises the "no credential metadata" path. The auth
-// list is what tells the plugin which credentials are disabled, so availability
-// scenarios need to be able to set it.
+// plugin-side warnings are visible. Everything else is served from the fixture
+// environment above, falling back to the canned price catalog and an empty auth
+// list so the accounting tests keep working untouched.
 static int host_call(void* ctx, const char* method, const uint8_t* req, size_t req_len, cliproxy_buffer* out) {
     (void)ctx;
     const char* body;
     char* owned = NULL;
+    char key[2048];
+
     if (strcmp(method, "host.log") == 0) {
         fprintf(stderr, "  [host.log] %.*s\n", (int)req_len, (const char*)req);
         body = "{\"ok\":true,\"result\":{}}";
@@ -65,9 +124,27 @@ static int host_call(void* ctx, const char* method, const uint8_t* req, size_t r
         owned = (char*)malloc(need);
         snprintf(owned, need, AUTH_LIST_ENVELOPE, files);
         body = owned;
+    } else if (strcmp(method, "host.auth.get") == 0) {
+        if (field((const char*)req, req_len, "\"auth_index\":\"", '"', key, sizeof(key)))
+            owned = fixture("HARNESS_AUTH_DIR", key);
+        body = owned ? owned : "{\"ok\":false,\"error\":{\"code\":\"not_found\",\"message\":\"no such auth\"}}";
+    } else if (strcmp(method, "host.auth.save") == 0) {
+        // The write itself is the thing under test, so it is recorded verbatim
+        // rather than acted on: no fixture file is ever modified.
+        const char* log = getenv("HARNESS_SAVE_LOG");
+        if (log && *log) {
+            FILE* f = fopen(log, "a");
+            if (f) { fwrite(req, 1, req_len, f); fputc('\n', f); fclose(f); }
+        }
+        body = "{\"ok\":true,\"result\":{\"name\":\"saved\",\"path\":\"/dev/null\"}}";
     } else if (strcmp(method, "host.http.do") == 0) {
-        body = "{\"ok\":true,\"result\":{\"StatusCode\":200,\"Headers\":{},\"Body\":\""
-               HARNESS_CATALOG_B64 "\"}}";
+        // A probe carries a bearer token and is answered per credential; the
+        // price fetch carries none and gets the catalog.
+        if (field((const char*)req, req_len, "Bearer ", '"', key, sizeof(key)))
+            owned = fixture("HARNESS_PROBE_DIR", key);
+        body = owned ? owned
+                     : "{\"ok\":true,\"result\":{\"StatusCode\":200,\"Headers\":{},\"Body\":\""
+                       HARNESS_CATALOG_B64 "\"}}";
     } else {
         body = "{\"ok\":false,\"error\":{\"code\":\"unsupported\",\"message\":\"harness\"}}";
     }
@@ -113,7 +190,7 @@ int main(int argc, char** argv) {
         char* payload = tab + 1;
 
         // Harness-only: let a script wait for plugin background work, such as
-        // the startup price fetch, instead of racing it.
+        // the startup price fetch or a rotator sweep, instead of racing it.
         if (strcmp(method, "sleep") == 0) {
             usleep((useconds_t)atoi(payload) * 1000);
             continue;

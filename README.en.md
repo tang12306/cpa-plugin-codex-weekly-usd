@@ -128,6 +128,85 @@ price_overrides:
     cache_write: 6.25
 ```
 
+## Credential rotation (optional, off by default)
+
+The rotator holds a fixed number of credentials enabled and replaces a member **before** it runs
+out.
+
+Why a pool rather than a single credential: the proxy's fill-first selector retries a refused
+request on the next enabled credential **within the same request**, so a handover is invisible to
+callers as long as the replacement is already in the pool. A pool of one has nothing to hand over
+to. The default is `keep_enabled: 2`.
+
+**This is the only part of the plugin that writes anything outside its own data directory**, so it
+is off by default and ships with a `dry_run` mode that decides and records exactly as usual while
+writing nothing. Running it that way for a while first is time well spent.
+
+### When it switches
+
+Any of:
+
+- **Headroom floor** - the tightest window has `switch_at_percent` left (default 10%).
+- **Lead time** - the measured burn would exhaust it within `lead_time_minutes` (default 15). This
+  is not a refinement: a credential in production went from 84% to 99% in forty-five minutes, and at
+  that rate 10% of headroom is half an hour away.
+- **Rejection** - upstream has stopped accepting the credential (401).
+
+With one rule pointing the other way: if the binding window resets sooner than the projection says
+it will empty, **do not switch**. It recovers on its own, and switching would throw away the tail of
+a credential that was still working.
+
+### How it picks a replacement
+
+1. **Exclusions first**: a rejected token, an exhausted window that will not reset soon, headroom
+   already below the floor (promoting that buys one check of relief), a credential just rotated out,
+   anything named in `never_enable`. Every exclusion is shown on the panel, so the decision can be
+   argued with rather than trusted.
+2. **Rank by how long it will carry the load**, not by remaining percentage. **A percentage point is
+   worth different money on different plans** - a Plus account at 100% can be worth less than a Team
+   account at 40% - so the arithmetic goes through dollars: remaining USD divided by the current
+   spend rate. This plugin is the one that can do that, because valuing the quota is what it does.
+3. **Between candidates that both qualify, spend the allowance that expires soonest.** Sixty percent
+   of a weekly window that resets in nine hours is use-it-or-lose-it; the same headroom on a window
+   that resets in a week is not going anywhere.
+
+### Decisions use a live reading
+
+A disabled credential is **not** frozen: one disabled here was observed with its five-hour window
+consumed to 100% anyway, which means something outside this proxy uses the same accounts. So a
+candidate is probed before it is promoted.
+
+Three measured facts about probing:
+
+- **A minimal request is effectively free** - two back to back report the same percentage.
+- **A rejected request carries no quota headers at all**, so there is no free-probe shortcut: a bad
+  model name returns 400 with nothing useful on it.
+- **A 429 still carries them**, so an exhausted credential is readable rather than a blind spot.
+
+Nothing is probed while the pool is healthy.
+
+### Guard rails
+
+- Off by default; `dry_run` decides without writing.
+- **The replacement is always enabled before the incumbent is disabled.** A moment with an empty
+  pool is a total outage, and a mutation test guards the ordering.
+- If no candidate qualifies it **changes nothing and warns**. It will never disable the last
+  credential because it could not find a better one.
+- `min_switch_gap_minutes` and `max_changes_per_day` are a circuit breaker, and **a manual trigger
+  does not bypass it**: the breaker exists to stop the rotator doing damage quickly, and a human
+  pressing the button is not evidence that this time is different.
+- The budget persists in state.json, so a proxy that bounces cannot spend it twice.
+- `never_enable` / `never_disable` lists.
+- Writes go through `map[string]json.RawMessage`, so fields this plugin does not know about survive
+  untouched, and a document without a `refresh_token` is refused rather than written.
+
+`POST /v0/management/codex-weekly-usd/rotate` evaluates immediately. POST only: the route changes
+state and must not be reachable by following a link.
+
+**A known limit**: the proxy does not refresh the access token of a long-disabled credential, so
+once it expires the probe reads as a rejection. This version warns rather than running the OAuth
+refresh itself.
+
 ## Model availability
 
 CLIProxyAPI cools a credential down per **credential and model**, not as a whole: upstream keeps a

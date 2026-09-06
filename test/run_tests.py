@@ -38,10 +38,18 @@ for _path, _hint in ((SO, "make build"), (HARNESS, "make build/harness")):
         sys.exit("missing %s - run `%s` first" % (_path, _hint))
 
 
-def config(price_url=""):
-    return ("enabled: true\npriority: 100\ndata_dir: %s\n"
+def config(price_url="", rotator=None):
+    text = ("enabled: true\npriority: 100\ndata_dir: %s\n"
             "price_source_url: \"%s\"\nevent_log: true\nflush_seconds: 1\n"
             % (DATA_DIR, price_url))
+    if rotator:
+        text += "rotator:\n"
+        for key in sorted(rotator):
+            value = rotator[key]
+            if isinstance(value, bool):
+                value = "true" if value else "false"
+            text += "  %s: %s\n" % (key, value)
+    return text
 
 
 def usage(windows, model="gpt-5.6-sol", cache_read=0, failed=False, extra_headers=None,
@@ -81,28 +89,32 @@ def weekly(percent, **kw):
     return usage([(WEEK, percent, RESET_W)], **kw)
 
 
-def script(steps, path, tail=True, price_url="", route="data"):
+def script(steps, path, tail=True, price_url="", route="data", rotator=None, method="GET"):
     lines = ["plugin.register\t" + json.dumps(
-        {"config_yaml": base64.b64encode(config(price_url).encode()).decode(), "schema_version": 1},
+        {"config_yaml": base64.b64encode(config(price_url, rotator).encode()).decode(),
+         "schema_version": 1},
         separators=(",", ":"))]
-    for method, payload in steps:
-        lines.append(method + "\t" + json.dumps(payload, separators=(",", ":")))
+    for step_method, payload in steps:
+        lines.append(step_method + "\t" + json.dumps(payload, separators=(",", ":")))
     if tail:
         lines.append("management.handle\t" + json.dumps(
-            {"Method": "GET", "Path": "/v0/management/codex-weekly-usd/" + route},
+            {"Method": method, "Path": "/v0/management/codex-weekly-usd/" + route},
             separators=(",", ":")))
         lines.append("plugin.shutdown\t{}")
     with open(path, "w") as fh:
         fh.write("\n".join(lines) + "\n")
 
 
-def run(steps, path=None, price_url="", route="data", auth_list=None):
+def run(steps, path=None, price_url="", route="data", auth_list=None, rotator=None,
+        method="GET", fixtures=None):
     path = path or os.path.join(BUILD, "script.txt")
-    script(steps, path, price_url=price_url, route=route)
+    script(steps, path, price_url=price_url, route=route, rotator=rotator, method=method)
     env = dict(os.environ)
     # The harness serves this back from host.auth.list, which is the only way
     # the plugin learns that a credential is disabled.
     env["HARNESS_AUTH_LIST"] = json.dumps(auth_list or [])
+    if fixtures:
+        env.update(fixtures)
     out = subprocess.run([HARNESS, SO, path], capture_output=True, text=True, env=env).stdout
     bodies = []
     for blk in out.split("--- "):
@@ -330,6 +342,7 @@ check("ships constant-rate reference", "stroke-dasharray" in html, True)
 check("charts are inline svg only", "<script src" not in html and "http://" not in html, True)
 check("ships a language switcher", 'id="lang"' in html, True)
 check("ships the availability board", 'id="modeltable"' in html, True)
+check("ships the rotation board", 'id="rottable"' in html, True)
 check("availability strings in both languages",
       ("模型可用性" in html) and ("Model availability" in html), True)
 check("carries both dictionaries", ("zh: {" in html) and ("en: {" in html), True)
@@ -365,8 +378,9 @@ def codes(report, code):
     return [w for w in report["warnings"] if w.get("code") == code]
 
 
-def authfile(name, disabled=False):
-    return {"id": name, "name": name, "label": name, "type": "codex", "disabled": disabled}
+def authfile(name, disabled=False, index=None):
+    return {"id": name, "name": name, "label": name, "type": "codex",
+            "auth_index": index or ("idx-" + name), "disabled": disabled}
 
 
 shutil.rmtree(DATA_DIR, ignore_errors=True)
@@ -509,6 +523,231 @@ check("warning counts the disabled ones", single[0]["disabled"], 1)
 # how often the model went out, not how many requests bounced off it.
 b = [c for c in astra["by_credential"] if c["credential"] == "cred-b.json"][0]
 check("repeat 429s are one lockout", b["blocks"], 1)
+
+print()
+print("=" * 74)
+print("T. the rotator keeps a pool topped up without emptying it")
+print("=" * 74)
+# The rotator is the only part of this plugin that writes anything outside its
+# own data directory, so these scenarios are about what it refuses to do at
+# least as much as what it does. The harness answers host.auth.get from a
+# fixture and records every host.auth.save instead of applying it, so nothing
+# here can touch a real credential.
+ROT_DIR = os.path.join(BUILD, "rot")
+SAVE_LOG = os.path.join(ROT_DIR, "saves.jsonl")
+
+
+def rot_fixtures(creds):
+    """creds: name -> dict(disabled, status, windows=[(minutes, percent, reset_in_s)]).
+
+    Writes the host.auth.get and host.http.do fixtures and returns the auth list
+    plus the environment the harness reads them from.
+    """
+    auth_dir = os.path.join(ROT_DIR, "auth")
+    probe_dir = os.path.join(ROT_DIR, "probe")
+    shutil.rmtree(ROT_DIR, ignore_errors=True)
+    os.makedirs(auth_dir)
+    os.makedirs(probe_dir)
+
+    now = int(time.time())
+    auth_list = []
+    for name, spec in creds.items():
+        index = "idx-" + name
+        token = "tok-" + name
+        auth_list.append(authfile(name, disabled=spec.get("disabled", False), index=index))
+        with open(os.path.join(auth_dir, index + ".json"), "w") as fh:
+            json.dump({"auth_index": index, "name": name,
+                       "json": {"access_token": token, "account_id": "acct-" + name,
+                                "refresh_token": "refresh-" + name,
+                                "disabled": spec.get("disabled", False)}}, fh)
+        headers = {}
+        for slot, (minutes, percent, reset_in) in zip(("Primary", "Secondary"),
+                                                      spec.get("windows", [])):
+            headers["X-Codex-%s-Used-Percent" % slot] = [str(percent)]
+            headers["X-Codex-%s-Window-Minutes" % slot] = [str(minutes)]
+            headers["X-Codex-%s-Reset-At" % slot] = [str(now + reset_in)]
+        headers["X-Codex-Plan-Type"] = [spec.get("plan", "team")]
+        with open(os.path.join(probe_dir, token + ".json"), "w") as fh:
+            json.dump({"StatusCode": spec.get("status", 200), "Headers": headers, "Body": ""}, fh)
+    return auth_list, {"HARNESS_AUTH_DIR": auth_dir, "HARNESS_PROBE_DIR": probe_dir,
+                       "HARNESS_SAVE_LOG": SAVE_LOG}
+
+
+def saves():
+    """Every host.auth.save the plugin attempted, in order."""
+    if not os.path.exists(SAVE_LOG):
+        return []
+    out = []
+    for line in open(SAVE_LOG):
+        line = line.strip()
+        if not line:
+            continue
+        req = json.loads(line)
+        out.append((req["name"], req["json"]["disabled"]))
+    return out
+
+
+def rotate(creds, rotator=None, steps=None):
+    settings = {"enabled": True, "keep_enabled": 2, "switch_at_percent": 10,
+                "check_interval_seconds": 3600, "min_switch_gap_minutes": 0,
+                "probe_model": "gpt-5.6-sol"}
+    settings.update(rotator or {})
+    auth_list, fixtures = rot_fixtures(creds)
+    return run(steps or [], auth_list=auth_list, rotator=settings, fixtures=fixtures,
+               route="rotate", method="POST")
+
+
+WEEKF = 10080
+shutil.rmtree(DATA_DIR, ignore_errors=True)
+rep = rotate({
+    "cred-a.json": {"disabled": False, "windows": [(WEEKF, 5, 400000)]},
+    "cred-b.json": {"disabled": False, "windows": [(WEEKF, 8, 400000)]},
+    "cred-c.json": {"disabled": True, "windows": [(WEEKF, 0, 400000)]},
+})
+check("a healthy pool is left alone", len(saves()), 0)
+check("and says so", rep["last_reason"], "pool_healthy")
+
+print()
+print("=" * 74)
+print("U. a draining member is replaced, and the replacement goes in first")
+print("=" * 74)
+shutil.rmtree(DATA_DIR, ignore_errors=True)
+rep = rotate({
+    "cred-a.json": {"disabled": False, "windows": [(WEEKF, 95, 400000)]},   # 5% left
+    "cred-b.json": {"disabled": False, "windows": [(WEEKF, 8, 400000)]},    # healthy
+    "cred-c.json": {"disabled": True, "windows": [(WEEKF, 10, 400000)]},    # fresh standby
+    "cred-d.json": {"disabled": True, "windows": [(WEEKF, 100, 400000)]},   # spent
+})
+log = saves()
+check("two credentials were rewritten", len(log), 2)
+# Enabling first is the whole safety property: a moment with an empty pool is a
+# total outage, and no ordering makes disabling first safer.
+check("the replacement is enabled first", log[0], ("cred-c.json", False))
+check("the drained one is disabled after", log[1], ("cred-a.json", True))
+check("the spent standby was not chosen",
+      any(name == "cred-d.json" for name, _ in log), False)
+skips = {c["file"]: c.get("skipped") for c in rep["candidates"]}
+check("and the panel says why", skips["cred-d.json"], "exhausted")
+
+print()
+print("=" * 74)
+print("V. it never empties the pool just because nothing qualifies")
+print("=" * 74)
+shutil.rmtree(DATA_DIR, ignore_errors=True)
+rep = rotate({
+    "cred-a.json": {"disabled": False, "windows": [(WEEKF, 98, 400000)]},
+    "cred-c.json": {"disabled": True, "windows": [(WEEKF, 100, 400000)]},
+    "cred-d.json": {"disabled": True, "windows": [(WEEKF, 97, 400000)]},
+})
+check("nothing was written", len(saves()), 0)
+check("the incumbent stays enabled", rep["last_reason"], "no_standby_available")
+check("a standby at the floor is not a replacement",
+      [c.get("skipped") for c in rep["candidates"] if c["file"] == "cred-d.json"][0],
+      "below_floor")
+check("and it warns", any(w["code"] == "rotator_stuck" for w in rep.get("warnings", [])), True)
+
+print()
+print("=" * 74)
+print("W. dry run decides everything and writes nothing")
+print("=" * 74)
+shutil.rmtree(DATA_DIR, ignore_errors=True)
+rep = rotate({
+    "cred-a.json": {"disabled": False, "windows": [(WEEKF, 95, 400000)]},
+    "cred-b.json": {"disabled": False, "windows": [(WEEKF, 8, 400000)]},
+    "cred-c.json": {"disabled": True, "windows": [(WEEKF, 10, 400000)]},
+}, rotator={"dry_run": True})
+check("no credential was touched", len(saves()), 0)
+check("but the decision is recorded", len(rep["log"]) >= 2, True)
+check("and marked as a rehearsal", rep["log"][0]["dry_run"], True)
+check("the panel flags dry run",
+      any(w["code"] == "rotator_dry_run" for w in rep.get("warnings", [])), True)
+
+print()
+print("=" * 74)
+print("X. a credential upstream stopped accepting is retired, not promoted")
+print("=" * 74)
+shutil.rmtree(DATA_DIR, ignore_errors=True)
+# A 401 means the refresh token is gone and the account needs a new login. A 429
+# is a working credential with no quota left. Confusing the two would either
+# throw away a good account or keep a broken one in the pool.
+rep = rotate({
+    "cred-a.json": {"disabled": False, "windows": [(WEEKF, 5, 400000)]},
+    "cred-b.json": {"disabled": False, "status": 401, "windows": []},
+    "cred-c.json": {"disabled": True, "windows": [(WEEKF, 12, 400000)]},
+    "cred-e.json": {"disabled": True, "status": 401, "windows": []},
+})
+log = saves()
+check("the replacement is enabled first", log[0], ("cred-c.json", False))
+check("the dead one is disabled", ("cred-b.json", True) in log, True)
+check("a dead standby is never promoted",
+      any(name == "cred-e.json" and not disabled for name, disabled in log), False)
+skips = {c["file"]: c.get("skipped") for c in rep["candidates"]}
+check("and is named as such", skips["cred-e.json"], "dead_token")
+
+print()
+print("=" * 74)
+print("Y. the circuit breaker holds, even when a human pressed the button")
+print("=" * 74)
+shutil.rmtree(DATA_DIR, ignore_errors=True)
+# One rotation spends two changes: a promotion and a retirement. With a budget
+# of two, a second rotation in the same day must do nothing at all.
+creds = {
+    "cred-a.json": {"disabled": False, "windows": [(WEEKF, 95, 400000)]},
+    "cred-b.json": {"disabled": False, "windows": [(WEEKF, 8, 400000)]},
+    "cred-c.json": {"disabled": True, "windows": [(WEEKF, 10, 400000)]},
+    "cred-d.json": {"disabled": True, "windows": [(WEEKF, 12, 400000)]},
+}
+rep = rotate(creds, rotator={"max_changes_per_day": 2})
+first = len(saves())
+check("the first rotation is allowed", first, 2)
+# The plugin keeps its budget in state.json, so a second process picks up where
+# the first left off - a proxy that bounces cannot spend the budget twice.
+auth_list, fixtures = rot_fixtures(creds)
+rep = run([], auth_list=auth_list, route="rotate", method="POST",
+          rotator={"enabled": True, "keep_enabled": 2, "switch_at_percent": 10,
+                   "check_interval_seconds": 3600, "min_switch_gap_minutes": 0,
+                   "max_changes_per_day": 2, "probe_model": "gpt-5.6-sol"},
+          fixtures=fixtures)
+check("the budget survives a restart", rep["changes_today"], 2)
+check("and the second rotation writes nothing", len(saves()), 0)
+
+print()
+print("=" * 74)
+print("Z. the rules that decide which standby wins")
+print("=" * 74)
+shutil.rmtree(DATA_DIR, ignore_errors=True)
+# A window that has already rolled over is full again whatever the stored
+# percentage says, so a credential refused an hour ago can be the right answer
+# now - which is exactly the credential that was switched off by hand today.
+rep = rotate({
+    "cred-a.json": {"disabled": False, "windows": [(WEEKF, 96, 400000)]},
+    "cred-b.json": {"disabled": False, "windows": [(WEEKF, 8, 400000)]},
+    "rolled.json": {"disabled": True, "windows": [(300, 100, -60), (WEEKF, 16, 500000)]},
+}, rotator={"keep_enabled": 2})
+log = saves()
+check("a window past its reset counts as full", log[0], ("rolled.json", False))
+
+shutil.rmtree(DATA_DIR, ignore_errors=True)
+# Use it or lose it: with two candidates that both carry the horizon, the one
+# whose allowance expires first is the one to spend.
+rep = rotate({
+    "cred-a.json": {"disabled": False, "windows": [(WEEKF, 96, 400000)]},
+    "cred-b.json": {"disabled": False, "windows": [(WEEKF, 8, 400000)]},
+    "soon.json": {"disabled": True, "windows": [(WEEKF, 40, 9 * 3600)]},
+    "later.json": {"disabled": True, "windows": [(WEEKF, 40, 160 * 3600)]},
+})
+order = [c["file"] for c in rep["candidates"] if not c.get("skipped") and not c["enabled"]]
+check("the sooner-expiring allowance ranks first", order[0], "soon.json")
+
+shutil.rmtree(DATA_DIR, ignore_errors=True)
+# An empty window minutes from its reset is not a reason to reject a candidate,
+# and not a reason to replace a member either.
+rep = rotate({
+    "cred-a.json": {"disabled": False, "windows": [(300, 100, 120), (WEEKF, 20, 400000)]},
+    "cred-b.json": {"disabled": False, "windows": [(WEEKF, 8, 400000)]},
+    "cred-c.json": {"disabled": True, "windows": [(WEEKF, 10, 400000)]},
+})
+check("a window about to reset is not an outage", len(saves()), 0)
 
 print()
 print("=" * 74)
