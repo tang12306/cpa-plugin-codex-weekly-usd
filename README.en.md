@@ -128,6 +128,47 @@ price_overrides:
     cache_write: 6.25
 ```
 
+## Model availability
+
+CLIProxyAPI cools a credential down per **credential and model**, not as a whole: upstream keeps a
+separate allowance for each model, so a credential can be out of one model while every other model
+it serves keeps working.
+
+**That produces an outage shape that is genuinely hard to diagnose.** When every credential for a
+model is cooling at the same time, what you see from outside is *only this one model is broken*,
+while the credential list reports every file as `active` and the upstream channel looks healthy.
+Finding it means reading three different places in the proxy log.
+
+The availability board at the top of the panel answers it directly:
+
+| Column | Meaning |
+|---|---|
+| State | `healthy` / `partly cooling` / `all cooling`, plus a single-credential flag |
+| Available / credentials | How many credentials can serve the model now. **Disabled credentials are listed but are not capacity.** |
+| First back | Countdown to the first credential leaving cooldown |
+| Per credential | One chip each; hover for the reason, which window filled, the deadline, and how often it has been locked out |
+
+Two structured warnings:
+
+- **`model_unavailable`** - nothing is left to serve this model, with the time the first credential
+  returns. This is the named form of "only this one model is down".
+- **`model_single_point`** - the model runs on one credential. Its next 429 takes the model out
+  entirely, and nothing in the proxy's own status says so beforehand.
+
+How it decides:
+
+- **The deadline is the window reset upstream reported**, the same value the proxy cools down to. It
+  belongs to whichever window is actually **full** (the later one when both are), not to whichever
+  window happens to reset next.
+- **Credit exhaustion can refuse a request with every percentage under the limit.** With no full
+  window to read, the soonest reset is used instead and is **flagged as an estimate**.
+- **A served request clears the lockout immediately**, however much of the recorded deadline is
+  left: upstream hands quota back early often enough that the deadline alone cannot be trusted.
+- **A failure with no quota signal is not a lockout** (a dropped connection, a rejected request); it
+  still counts as a failure.
+- Repeated 429s inside one cooldown count as **one** lockout: the number measures how often the
+  model went out, not how many requests bounced off it.
+
 ## Dashboard
 
 **The panel speaks English and Simplified Chinese**, switchable in the toolbar and
@@ -198,6 +239,11 @@ authenticated route itself. Verified: the panel returns 200 with no credential
 identifiers, and `/data` returns 401 without a valid key.
 
 ## Configuration
+
+`model_health_days` (default 14) is how long a (credential, model) availability record is kept after
+its last request. It also decides how long a credential that has stopped serving a model still
+counts towards that model's capacity, so it wants to be comfortably longer than the longest quota
+window and comfortably shorter than "that credential is retired".
 
 ```yaml
 plugins:

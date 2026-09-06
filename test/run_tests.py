@@ -12,6 +12,7 @@ import os
 import shutil
 import subprocess
 import sys
+import time
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 BUILD = os.path.join(ROOT, "build")
@@ -43,7 +44,8 @@ def config(price_url=""):
             % (DATA_DIR, price_url))
 
 
-def usage(windows, model="gpt-5.6-sol", cache_read=0, failed=False, extra_headers=None):
+def usage(windows, model="gpt-5.6-sol", cache_read=0, failed=False, extra_headers=None,
+          auth="codex-demo-team.json"):
     """windows: list of (minutes, percent, reset_at) in slot order.
 
     The first entry is emitted as "primary" and the second as "secondary".
@@ -62,7 +64,7 @@ def usage(windows, model="gpt-5.6-sol", cache_read=0, failed=False, extra_header
         headers.update(extra_headers)
     return {
         "Provider": "codex", "ExecutorType": "codex", "Model": model, "Alias": "",
-        "AuthID": "codex-demo-team.json", "AuthIndex": "0", "AuthType": "codex",
+        "AuthID": auth, "AuthIndex": "0", "AuthType": "codex",
         "RequestedAt": "2026-08-27T04:00:00Z", "Failed": failed,
         "Detail": {
             "InputTokens": IN_TOKENS, "OutputTokens": OUT_TOKENS,
@@ -94,10 +96,14 @@ def script(steps, path, tail=True, price_url="", route="data"):
         fh.write("\n".join(lines) + "\n")
 
 
-def run(steps, path=None, price_url="", route="data"):
+def run(steps, path=None, price_url="", route="data", auth_list=None):
     path = path or os.path.join(BUILD, "script.txt")
     script(steps, path, price_url=price_url, route=route)
-    out = subprocess.run([HARNESS, SO, path], capture_output=True, text=True).stdout
+    env = dict(os.environ)
+    # The harness serves this back from host.auth.list, which is the only way
+    # the plugin learns that a credential is disabled.
+    env["HARNESS_AUTH_LIST"] = json.dumps(auth_list or [])
+    out = subprocess.run([HARNESS, SO, path], capture_output=True, text=True, env=env).stdout
     bodies = []
     for blk in out.split("--- "):
         if blk.startswith("management.handle"):
@@ -323,12 +329,186 @@ check("ships quota curve", "drawQuotaCurve" in html, True)
 check("ships constant-rate reference", "stroke-dasharray" in html, True)
 check("charts are inline svg only", "<script src" not in html and "http://" not in html, True)
 check("ships a language switcher", 'id="lang"' in html, True)
+check("ships the availability board", 'id="modeltable"' in html, True)
+check("availability strings in both languages",
+      ("模型可用性" in html) and ("Model availability" in html), True)
 check("carries both dictionaries", ("zh: {" in html) and ("en: {" in html), True)
 check("both titles present", ("Codex 额度美元估算" in html) and ("Codex Quota USD" in html), True)
 # Dictionary parity is asserted in test_charts.js, which can evaluate the real
 # object instead of guessing at it with a regex.
 with open(os.path.join(BUILD, "panel.html"), "w", encoding="utf-8") as fh:
     fh.write(html)
+
+print()
+print("=" * 74)
+print("M. per-model availability: a lockout hits one model, not the credential")
+print("=" * 74)
+# Deadlines are compared against wall-clock time, so these have to be real
+# future instants rather than the fixed cycle keys the accounting tests use.
+SOON = int(time.time()) + 3600
+LATER = int(time.time()) + 4 * 86400
+LIMIT = {"X-Codex-Rate-Limit-Reached-Type": ["usage_limit_reached"]}
+
+
+def health(report, model):
+    for m in report.get("models", []):
+        if m["model"] == model:
+            return m
+    return None
+
+
+def cred(model_row, index=0):
+    return model_row["by_credential"][index]
+
+
+def codes(report, code):
+    return [w for w in report["warnings"] if w.get("code") == code]
+
+
+def authfile(name, disabled=False):
+    return {"id": name, "name": name, "label": name, "type": "codex", "disabled": disabled}
+
+
+shutil.rmtree(DATA_DIR, ignore_errors=True)
+# gpt-5.6-sol keeps working while gpt-6-astra exhausts the 5-hour window: one
+# credential, one shared set of quota headers, exactly one model refused.
+rep = run([
+    ("usage.handle", usage([(FIVEH, 10, SOON), (WEEK, 5, LATER)], model="gpt-5.6-sol")),
+    ("usage.handle", usage([(FIVEH, 40, SOON), (WEEK, 8, LATER)], model="gpt-6-astra")),
+    ("usage.handle", usage([(FIVEH, 100, SOON), (WEEK, 12, LATER)], model="gpt-6-astra",
+                           failed=True, extra_headers=LIMIT)),
+    ("usage.handle", usage([(FIVEH, 100, SOON), (WEEK, 13, LATER)], model="gpt-5.6-sol")),
+])
+astra, sol = health(rep, "gpt-6-astra"), health(rep, "gpt-5.6-sol")
+check("astra is down", astra["state"], "down")
+check("astra has no credential left", astra["available"], 0)
+check("astra is cooling on one", astra["cooling"], 1)
+check("sol is unaffected", sol["state"], "ok")
+check("sol still has its credential", sol["available"], 1)
+check("blocked window identified", cred(astra)["blocked_window"], "5h")
+check("deadline is the window reset", cred(astra)["cooldown_until"][:19],
+      time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime(SOON)))
+check("deadline is not a guess", cred(astra)["cooldown_estimated"], False)
+check("reason carried through", cred(astra)["reason"], "usage_limit_reached")
+check("down model warns", len(codes(rep, "model_unavailable")), 1)
+check("warning names the model", codes(rep, "model_unavailable")[0]["model"], "gpt-6-astra")
+check("broken model sorts first", rep["models"][0]["model"], "gpt-6-astra")
+
+print()
+print("=" * 74)
+print("N. a served request ends the lockout, whatever the deadline said")
+print("=" * 74)
+shutil.rmtree(DATA_DIR, ignore_errors=True)
+# Upstream hands quota back early often enough that a recorded deadline must
+# never outrank a request that actually went through.
+rep = run([
+    ("usage.handle", usage([(FIVEH, 100, SOON)], model="gpt-6-astra", failed=True,
+                           extra_headers=LIMIT)),
+    ("usage.handle", usage([(FIVEH, 20, SOON)], model="gpt-6-astra")),
+])
+astra = health(rep, "gpt-6-astra")
+check("credential is back", astra["available"], 1)
+check("model is healthy again", astra["state"], "ok")
+check("no stale countdown", "cooldown_until" in cred(astra), False)
+check("the lockout is still counted", cred(astra)["blocks"], 1)
+check("no warning once it recovers", len(codes(rep, "model_unavailable")), 0)
+
+print()
+print("=" * 74)
+print("O. the deadline belongs to the full window, not the next reset")
+print("=" * 74)
+shutil.rmtree(DATA_DIR, ignore_errors=True)
+# The weekly window is the full one, so the model stays out until the weekly
+# reset four days away, even though the 5-hour window resets within the hour.
+rep = run([
+    ("usage.handle", usage([(FIVEH, 30, SOON), (WEEK, 100, LATER)], model="gpt-6-astra",
+                           failed=True, extra_headers=LIMIT)),
+])
+c = cred(health(rep, "gpt-6-astra"))
+check("waits for the weekly reset", c["blocked_window"], "7d")
+check("countdown is days, not the hour", c["cooldown_in_seconds"] > 3 * 86400, True)
+
+print()
+print("=" * 74)
+print("P. credits can run out with every percentage still looking fine")
+print("=" * 74)
+shutil.rmtree(DATA_DIR, ignore_errors=True)
+# No window is full, so there is no reset to read a deadline off. The soonest
+# reset is the earliest the situation can change, and it is flagged as a guess.
+rep = run([
+    ("usage.handle", usage([(FIVEH, 40, SOON), (WEEK, 50, LATER)], model="gpt-6-astra",
+                           failed=True, extra_headers={
+                               "X-Codex-Credits-Has-Credits": ["False"],
+                               "X-Codex-Rate-Limit-Reached-Type": ["workspace_member_credits_depleted"]})),
+])
+c = cred(health(rep, "gpt-6-astra"))
+check("still recognised as a lockout", c["state"], "cooling")
+check("deadline is the soonest reset", c["blocked_window"], "5h")
+check("deadline is flagged as a guess", c["cooldown_estimated"], True)
+check("reason is the credit one", c["reason"], "workspace_member_credits_depleted")
+
+print()
+print("=" * 74)
+print("Q. an ordinary failure is not a lockout")
+print("=" * 74)
+shutil.rmtree(DATA_DIR, ignore_errors=True)
+# A dropped connection or a rejected request fails with no quota signal at all,
+# and must not take the model out of service.
+rep = run([
+    ("usage.handle", usage([(FIVEH, 40, SOON)], model="gpt-6-astra")),
+    ("usage.handle", usage([(FIVEH, 40, SOON)], model="gpt-6-astra", failed=True)),
+])
+astra = health(rep, "gpt-6-astra")
+check("model still available", astra["state"], "ok")
+check("credential still counted", astra["available"], 1)
+check("failure still recorded", astra["failed"], 1)
+check("no lockout counted", cred(astra)["blocks"], 0)
+check("no false alarm", len(codes(rep, "model_unavailable")), 0)
+
+print()
+print("=" * 74)
+print("R. capacity is counted across credentials, disabled ones excluded")
+print("=" * 74)
+shutil.rmtree(DATA_DIR, ignore_errors=True)
+# Three credentials serve the model: one healthy, one cooling, one switched off.
+# A disabled credential is listed but is not capacity - eight of nine disabled
+# is exactly what turns a single 429 into a dead model.
+rep = run([
+    ("usage.handle", usage([(FIVEH, 10, SOON)], model="gpt-6-astra", auth="cred-a.json")),
+    ("usage.handle", usage([(FIVEH, 100, SOON)], model="gpt-6-astra", auth="cred-b.json",
+                           failed=True, extra_headers=LIMIT)),
+    ("usage.handle", usage([(FIVEH, 10, SOON)], model="gpt-6-astra", auth="cred-c.json")),
+], auth_list=[authfile("cred-a.json"), authfile("cred-b.json"),
+              authfile("cred-c.json", disabled=True)])
+astra = health(rep, "gpt-6-astra")
+check("disabled one is not capacity", astra["credentials"], 2)
+check("one credential is serving", astra["available"], 1)
+check("one credential is cooling", astra["cooling"], 1)
+check("the disabled one is still listed", astra["disabled"], 1)
+check("degraded, not down", astra["state"], "degraded")
+check("all three appear", len(astra["by_credential"]), 3)
+check("the cooling one sorts first", cred(astra)["state"], "cooling")
+check("no outage warning while one serves", len(codes(rep, "model_unavailable")), 0)
+
+print()
+print("=" * 74)
+print("S. one credential for a model is a standing outage warning")
+print("=" * 74)
+shutil.rmtree(DATA_DIR, ignore_errors=True)
+steps = [("usage.handle", usage([(FIVEH, 10, SOON)], model="gpt-6-astra", auth="cred-a.json"))] * 25
+steps += [("usage.handle", usage([(FIVEH, 100, SOON)], model="gpt-6-astra", auth="cred-b.json",
+                                 failed=True, extra_headers=LIMIT))] * 2
+rep = run(steps, auth_list=[authfile("cred-a.json"), authfile("cred-b.json", disabled=True)])
+astra = health(rep, "gpt-6-astra")
+check("single point flagged", astra["single_point"], True)
+single = codes(rep, "model_single_point")
+check("warned once", len(single), 1)
+check("warning names the credential", single[0]["credential"], "cred-a.json")
+check("warning counts the disabled ones", single[0]["disabled"], 1)
+# Repeated refusals inside one cooldown are one lockout, not two: the count is
+# how often the model went out, not how many requests bounced off it.
+b = [c for c in astra["by_credential"] if c["credential"] == "cred-b.json"][0]
+check("repeat 429s are one lockout", b["blocks"], 1)
 
 print()
 print("=" * 74)

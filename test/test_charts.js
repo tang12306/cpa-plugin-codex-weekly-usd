@@ -12,6 +12,28 @@ if (!panelPath || !fs.existsSync(panelPath)) {
 }
 const html = fs.readFileSync(panelPath, "utf8");
 
+// This runs before anything else because everything else eval()s functions
+// lifted out of the page: a syntax error would kill this file with a stack
+// trace rather than a verdict. It is also the only check that covers the parts
+// of the script no test lifts - a broken one of those ships a panel whose
+// script never runs and whose page renders nothing, while every string the HTML
+// is grepped for is still present. new Function compiles without executing,
+// which is what is wanted: the body reaches for document on its first line.
+const script = html.slice(html.indexOf("<script>") + 8, html.lastIndexOf("</script>"));
+if (script.length < 20000) {
+  console.error("panel script looks truncated (" + script.length + " bytes)");
+  process.exit(1);
+}
+try {
+  new Function(script);
+  console.log("  panel script compiles                          none".padEnd(72) + "OK");
+} catch (err) {
+  console.error("  panel script compiles                          " + err.message + "  FAIL");
+  console.error("\nThe panel ships a script that does not parse: the page would render");
+  console.error("nothing at all, however healthy the served HTML looks to a grep.");
+  process.exit(1);
+}
+
 // Lift the chart helpers plus the formatters they depend on out of the page.
 function lift(name) {
   const start = html.indexOf("  function " + name + "(");
@@ -43,6 +65,13 @@ const src = ["usd", "pct", "chartLabels", "buildBuckets", "agoLabel", "drawChart
   .map(lift).join("\n");
 eval(src);
 const I18N = eval("(" + liftVar("I18N") + ")");
+
+// The availability chips are built by the same page, so they are lifted the
+// same way. They read the language through t(), which needs LANG and I18N in
+// scope; everything else about them is a pure string transform.
+let LANG = "en";
+const t = eval("(" + lift("t").replace(/^  function t/, "function t") + ")");
+eval(["esc", "dur", "modelStateTag", "credChip"].map(lift).join("\n"));
 
 let failures = 0;
 function check(name, got, want) {
@@ -128,6 +157,47 @@ const identical = zhKeys.filter(k =>
   /[A-Za-z]{4}/.test(I18N.zh[k]) && k !== "locale");
 check("no untranslated leftovers", identical.join(",") || "none", "none");
 check("every value is a string", zhKeys.every(k => typeof I18N.zh[k] === "string"), true);
+
+console.log();
+console.log("=".repeat(74));
+console.log("I. availability chips");
+console.log("=".repeat(74));
+// The board is what an operator reads during an outage, so the chips have to
+// say which credential, what state, and how long - in the selected language.
+const cooling = credChip({ credential: "cred-a.json", state: "cooling", requests: 40,
+                           failed: 2, blocks: 3, cooldown_in_seconds: 3660,
+                           cooldown_until: "2026-09-06T16:07:00Z", reason: "usage_limit_reached",
+                           blocked_window: "5h", cooldown_estimated: false });
+check("cooling chip is marked bad", cooling.includes("tag bad"), true);
+check("cooling chip names the credential", cooling.includes("cred-a.json"), true);
+check("cooling chip shows the countdown", cooling.includes("1h1m"), true);
+check("cooling chip carries the reason", cooling.includes("usage_limit_reached"), true);
+check("cooling chip carries the deadline", cooling.includes("2026-09-06T16:07:00Z"), true);
+
+const guess = credChip({ credential: "c", state: "cooling", cooldown_in_seconds: 600,
+                         cooldown_estimated: true });
+check("an estimated deadline is marked", guess.includes("10m?"), true);
+
+check("a healthy chip is not alarming",
+  credChip({ credential: "c", state: "ok" }).includes("tag ok"), true);
+check("a disabled chip is greyed",
+  credChip({ credential: "c", state: "disabled" }).includes("off"), true);
+
+// A credential name arrives from the auth file and is not trusted markup.
+check("credential names are escaped",
+  credChip({ credential: "<img src=x>", state: "ok" }).includes("&lt;img"), true);
+
+check("a dead model reads as bad",
+  modelStateTag({ state: "down", single_point: false }).includes("tag bad"), true);
+check("a single credential is flagged",
+  modelStateTag({ state: "ok", single_point: true }).includes("single credential"), true);
+
+LANG = "zh";
+check("chips follow the language",
+  credChip({ credential: "c", state: "cooling", cooldown_in_seconds: 60 }).includes("冷却"), true);
+check("state tags follow the language",
+  modelStateTag({ state: "down", single_point: false }).includes("全部冷却"), true);
+LANG = "en";
 
 console.log();
 console.log("=".repeat(74));

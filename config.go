@@ -46,6 +46,13 @@ type Config struct {
 	// StaleAfterMinutes marks a credential whose last quota reading is older
 	// than this, so a days-old percentage is never shown as if it were current.
 	StaleAfterMinutes int `yaml:"stale_after_minutes"`
+
+	// ModelHealthDays is how long a (credential, model) availability record is
+	// kept after its last request. It also decides how long a model a
+	// credential has stopped serving keeps counting towards that model's
+	// capacity, so it wants to be comfortably longer than the longest quota
+	// window and comfortably shorter than "we retired that credential".
+	ModelHealthDays int `yaml:"model_health_days"`
 }
 
 func defaultConfig() Config {
@@ -59,6 +66,7 @@ func defaultConfig() Config {
 		EventLogKeepDays:      60,
 		FlushSeconds:          15,
 		StaleAfterMinutes:     360,
+		ModelHealthDays:       14,
 	}
 }
 
@@ -89,6 +97,9 @@ func (c *Config) normalize() {
 	} else if c.StaleAfterMinutes == 0 {
 		c.StaleAfterMinutes = def.StaleAfterMinutes
 	}
+	if c.ModelHealthDays <= 0 {
+		c.ModelHealthDays = def.ModelHealthDays
+	}
 }
 
 func (c Config) priceRefresh() time.Duration {
@@ -109,6 +120,7 @@ func configFields() []map[string]any {
 		{"Name": "event_log_keep_days", "Type": "integer", "Description": "Days of event log to retain."},
 		{"Name": "flush_seconds", "Type": "integer", "Description": "Seconds between state snapshots to disk."},
 		{"Name": "stale_after_minutes", "Type": "integer", "Description": "Flag a credential whose newest quota reading is older than this."},
+		{"Name": "model_health_days", "Type": "integer", "Description": "Days a (credential, model) availability record is kept after its last request."},
 	}
 }
 

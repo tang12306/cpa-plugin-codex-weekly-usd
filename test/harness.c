@@ -43,18 +43,28 @@ typedef int (*plugin_init_fn)(cliproxy_host_api*, cliproxy_plugin_api*);
     "eyJvcGVuYWkiOnsibW9kZWxzIjp7Imhhcm5lc3MtbW9kZWwiOnsiY29zdCI6eyJpbnB1dCI6Mywi" \
     "b3V0cHV0Ijo5LCJjYWNoZV9yZWFkIjowLjN9fX19fQ=="
 
+#define AUTH_LIST_ENVELOPE "{\"ok\":true,\"result\":{\"files\":%s}}"
+
 // host_call answers the callbacks the plugin makes. host.log is echoed so
-// plugin-side warnings are visible; host.auth.list returns an empty list, which
-// exercises the "no credential metadata" path; host.http.do serves the canned
-// catalog above.
+// plugin-side warnings are visible; host.http.do serves the canned catalog
+// above; host.auth.list returns whatever HARNESS_AUTH_LIST holds, defaulting to
+// an empty list, which exercises the "no credential metadata" path. The auth
+// list is what tells the plugin which credentials are disabled, so availability
+// scenarios need to be able to set it.
 static int host_call(void* ctx, const char* method, const uint8_t* req, size_t req_len, cliproxy_buffer* out) {
     (void)ctx;
     const char* body;
+    char* owned = NULL;
     if (strcmp(method, "host.log") == 0) {
         fprintf(stderr, "  [host.log] %.*s\n", (int)req_len, (const char*)req);
         body = "{\"ok\":true,\"result\":{}}";
     } else if (strcmp(method, "host.auth.list") == 0) {
-        body = "{\"ok\":true,\"result\":{\"files\":[]}}";
+        const char* files = getenv("HARNESS_AUTH_LIST");
+        if (files == NULL || *files == 0) files = "[]";
+        size_t need = strlen(files) + 64;
+        owned = (char*)malloc(need);
+        snprintf(owned, need, AUTH_LIST_ENVELOPE, files);
+        body = owned;
     } else if (strcmp(method, "host.http.do") == 0) {
         body = "{\"ok\":true,\"result\":{\"StatusCode\":200,\"Headers\":{},\"Body\":\""
                HARNESS_CATALOG_B64 "\"}}";
@@ -65,6 +75,7 @@ static int host_call(void* ctx, const char* method, const uint8_t* req, size_t r
     out->ptr = malloc(n);
     memcpy(out->ptr, body, n);
     out->len = n;
+    free(owned);
     return 0;
 }
 

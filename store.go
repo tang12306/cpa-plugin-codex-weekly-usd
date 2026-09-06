@@ -176,6 +176,11 @@ type Account struct {
 	// because JSON object keys must be strings.
 	Windows map[string]*Window `json:"windows"`
 
+	// Models is this credential's standing on each model it has served. The
+	// proxy cools a credential down per model, so availability cannot be
+	// answered from the windows above: they are shared by every model.
+	Models map[string]*ModelHealth `json:"models,omitempty"`
+
 	Hours map[string]*HourAgg `json:"hours"`
 
 	UnpricedReqs int64    `json:"unpriced_requests"`
@@ -196,8 +201,11 @@ type stateFile struct {
 	Accounts map[string]*Account `json:"accounts"`
 }
 
-// stateVersion 2 introduced per-length windows and bounded calibration.
-const stateVersion = 2
+// stateVersion 2 introduced per-length windows and bounded calibration;
+// 3 added the per-model health ledger, which is purely additive - a version 2
+// file loads unchanged and starts collecting model health from the next
+// request.
+const stateVersion = 3
 
 // App owns all mutable plugin state.
 type App struct {
@@ -411,6 +419,11 @@ func (a *App) HandleUsage(payload []byte) {
 		w.advance(wr, now)
 		w.bill(cost, saved, rec, model, priced)
 	}
+
+	// Availability is tracked per model because the proxy's cooldown is: the
+	// windows above are shared by every model, so they cannot say which model
+	// is currently refused.
+	acct.recordHealth(model, rec, rl, now, cfg.ModelHealthDays)
 
 	acct.TotalUSD += cost
 	acct.TotalReqs++
@@ -747,6 +760,9 @@ func (a *App) loadState() {
 		if v.Hours == nil {
 			v.Hours = map[string]*HourAgg{}
 		}
+		if v.Models == nil {
+			v.Models = map[string]*ModelHealth{}
+		}
 		if len(v.Windows) == 0 && v.LegacyWindowMin > 0 {
 			// Version 1 tracked a single window and summed calibration across
 			// every cycle forever. Those sums mixed percentage steps from two
@@ -886,8 +902,11 @@ func (a *App) authMetadata() []authEntry {
 	return resp.Files
 }
 
-func (a *App) lookupAuth(acct *Account) (authEntry, bool) {
-	for _, entry := range a.authMetadata() {
+// lookupAuth resolves one credential against a metadata list already fetched
+// by the caller. It deliberately does not fetch: callers hold the state lock,
+// and authMetadata takes it.
+func lookupAuth(entries []authEntry, acct *Account) (authEntry, bool) {
+	for _, entry := range entries {
 		switch {
 		case entry.ID != "" && entry.ID == acct.AuthID,
 			entry.AuthIndex != "" && entry.AuthIndex == acct.AuthIndex,
@@ -899,17 +918,27 @@ func (a *App) lookupAuth(acct *Account) (authEntry, bool) {
 }
 
 // Report builds the JSON payload the dashboard renders.
+//
+// It holds the state lock for the whole build. The accounts it walks are the
+// live ones, and the request path inserts into and deletes from their maps -
+// the hourly buckets roll over every hour, a model health record appears the
+// first time a credential serves a model. Iterating a map while another
+// goroutine writes to it is a fatal runtime error, not a recoverable panic, and
+// in a c-shared library that takes the whole proxy down with it. Credential
+// metadata is fetched before the lock is taken because that path locks too.
 func (a *App) Report() map[string]any {
 	now := time.Now()
+	entries := a.authMetadata()
 
 	a.mu.Lock()
+	defer a.mu.Unlock()
+
 	accounts := make([]*Account, 0, len(a.accounts))
 	for _, acct := range a.accounts {
 		accounts = append(accounts, acct)
 	}
 	cfg := a.cfg
 	staleAfter := time.Duration(cfg.StaleAfterMinutes) * time.Minute
-	a.mu.Unlock()
 
 	rows := make([]map[string]any, 0, len(accounts))
 	// Warnings are structured rather than prose: the panel renders them in the
@@ -1001,7 +1030,7 @@ func (a *App) Report() map[string]any {
 			if w.UnexplainedPct > 1 {
 				warnings = append(warnings, map[string]any{
 					"code":       "external_usage",
-					"credential": displayName(acct, a),
+					"credential": displayName(entries, acct),
 					"window":     windowLabel(w.Minutes),
 					"percent":    round2(w.UnexplainedPct),
 				})
@@ -1043,7 +1072,7 @@ func (a *App) Report() map[string]any {
 			row["unpriced_models"] = acct.UnpricedList
 			warnings = append(warnings, map[string]any{
 				"code":       "unpriced_models",
-				"credential": displayName(acct, a),
+				"credential": displayName(entries, acct),
 				"models":     acct.UnpricedList,
 			})
 		}
@@ -1065,7 +1094,7 @@ func (a *App) Report() map[string]any {
 			row["stale"] = staleAfter > 0 && time.Duration(age)*time.Second > staleAfter
 		}
 
-		if entry, ok := a.lookupAuth(acct); ok {
+		if entry, ok := lookupAuth(entries, acct); ok {
 			row["label"] = firstNonEmpty(entry.Label, entry.Email, entry.Name)
 			row["email"] = entry.Email
 			row["disabled"] = entry.Disabled
@@ -1107,6 +1136,11 @@ func (a *App) Report() map[string]any {
 		warnings = append(warnings, map[string]any{"code": "price_refresh_failed", "message": msg})
 	}
 
+	// A dead model is the most urgent thing the panel can say, so its warnings
+	// go in front of the accounting ones.
+	models, modelWarnings := modelHealth(entries, accounts, now)
+	warnings = append(modelWarnings, warnings...)
+
 	return map[string]any{
 		"generated_at":    now.UTC().Format(time.RFC3339),
 		"plugin":          pluginID,
@@ -1117,6 +1151,7 @@ func (a *App) Report() map[string]any {
 		"data_dir":        cfg.DataDir,
 		"accounts":        rows,
 		"warnings":        warnings,
+		"models":          models,
 		"fleet_series":    fleetSeries(accounts, now),
 		"window_totals":   windowTotalRows,
 		"totals": map[string]any{
@@ -1185,8 +1220,8 @@ func toI(v any) int64 {
 	return i
 }
 
-func displayName(acct *Account, a *App) string {
-	if entry, ok := a.lookupAuth(acct); ok {
+func displayName(entries []authEntry, acct *Account) string {
+	if entry, ok := lookupAuth(entries, acct); ok {
 		return firstNonEmpty(entry.Label, entry.Email, entry.Name)
 	}
 	return acct.AuthID

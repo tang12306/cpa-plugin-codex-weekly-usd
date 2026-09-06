@@ -148,6 +148,11 @@ const panelHTML = `<!doctype html>
   .sw.ln.warn{border-top-color:var(--warn)}
   .sw.ln.dash{border-top:2px dashed var(--muted)}
   .chartcap{font-size:12px;color:var(--muted);margin:2px 0 10px}
+  .mwrap{overflow-x:auto}
+  .mwrap table{min-width:0}
+  .mwrap th,.mwrap td{padding:7px 14px 7px 0}
+  .mwrap td:last-child{white-space:normal;min-width:280px}
+  .chip{display:inline-block;margin:2px 5px 2px 0}
 </style>
 </head>
 <body>
@@ -174,6 +179,11 @@ const panelHTML = `<!doctype html>
 </div>
 
 <div id="alerts"></div>
+<div id="modelbox" class="box" hidden>
+  <h2 id="t-models"></h2>
+  <div class="mwrap"><table id="modeltable"></table></div>
+  <div class="chartcap" id="t-modelhint"></div>
+</div>
 <div id="wtotals"></div>
 <div id="cards" class="cards" hidden></div>
 <div id="chartbox" class="box" hidden>
@@ -213,6 +223,16 @@ const panelHTML = `<!doctype html>
       sortPace: "按消耗节奏排序", sortName: "按名称排序",
       chartTitle: "全部凭据 · 用量走势", legendBars: "每小时消耗（左轴）", legendLine: "累计消耗（右轴）",
       pricesTitle: "当前生效价目表（美元 / 百万 token）",
+      modelsTitle: "模型可用性",
+      modelsHint: "CPA 的冷却是按「凭据 × 模型」的：上游对每个模型有独立额度，所以一个凭据完全可以" +
+        "「astra 已耗尽、其它模型照跑」。某个模型的凭据全部冷却时，外部表现就是「只有这一个模型用不了」，" +
+        "而凭据状态和渠道状态都会显示正常。冷却到期时间取自上游返回的 reset，与代理实际使用的是同一个。",
+      mhModel: "模型", mhState: "状态", mhCap: "可用 / 凭据", mhBack: "最快恢复",
+      mhTraffic: "请求 / 失败", mhCreds: "各凭据状态", mhNone: "还没有模型可用性数据。",
+      msDown: "全部冷却", msDegraded: "部分冷却", msOK: "正常", msSingle: "单点凭据",
+      csCooling: "冷却", csRecovering: "待验证", csOK: "正常", csDisabled: "已停用",
+      mhEstimated: "估计", mhBlocks: "累计 {0} 次冷却", mhReason: "原因：{0}",
+      mhWindowFull: "{0} 窗口已打满", mhLastOK: "最后成功于 {0}前",
       updatedAt: "更新于 {0}",
       needKey: "请先填入管理密钥。", keyRejected: "管理密钥被拒绝。", reqFailed: "请求失败：HTTP {0}",
       loadFirst: "请先加载数据。",
@@ -221,6 +241,12 @@ const panelHTML = `<!doctype html>
       warnExternal: "{0} 的 {1} 窗口有 {2} 的额度被消耗但不在本插件账上，可能有其它客户端在共用该凭据",
       warnUnpriced: "{0} 没有公开价目（凭据 {1}），其花费未计入估算",
       warnPrice: "价目刷新失败：{0}",
+      warnModelDown: "模型 {0} 当前没有可用凭据：{1} 个全部在冷却中，最快 {2} 后恢复。" +
+        "这类故障只打这一个模型，凭据状态与渠道状态都会显示正常。",
+      warnModelDownNoEta: "模型 {0} 当前没有可用凭据：{1} 个全部在冷却中。",
+      warnModelSingle: "模型 {0} 只有 1 个可用凭据（{1}），它一旦撞 429，该模型就整体不可用。",
+      warnModelSingleOff: "模型 {0} 只有 1 个可用凭据（{1}），另有 {2} 个已停用。" +
+        "它一旦撞 429，该模型就整体不可用。",
       totalsTitle: "{0} 窗口合计",
       cCreds: "凭据数", cQuota: "额度总值", cSpent: "已用", cRemain: "剩余",
       cPriced: "{0} 个已定价", cAtRisk: "{0} 个逼近上限",
@@ -278,6 +304,18 @@ const panelHTML = `<!doctype html>
       sortPace: "Sort by burn pace", sortName: "Sort by name",
       chartTitle: "All credentials · usage", legendBars: "Hourly spend (left axis)", legendLine: "Cumulative (right axis)",
       pricesTitle: "Active rate card (USD per 1M tokens)",
+      modelsTitle: "Model availability",
+      modelsHint: "The proxy cools a credential down per model: upstream keeps a separate allowance " +
+        "for each one, so a credential can be out of astra while every other model keeps working. " +
+        "When every credential for a model is cooling at once it looks from the outside like just " +
+        "that one model is broken, while the credential and channel status both read as healthy. " +
+        "Deadlines come from the reset upstream reported, the same one the proxy cools down to.",
+      mhModel: "Model", mhState: "State", mhCap: "Available / credentials", mhBack: "First back",
+      mhTraffic: "Requests / failed", mhCreds: "Per credential", mhNone: "No model availability data yet.",
+      msDown: "all cooling", msDegraded: "partly cooling", msOK: "healthy", msSingle: "single credential",
+      csCooling: "cooling", csRecovering: "unverified", csOK: "ok", csDisabled: "disabled",
+      mhEstimated: "estimated", mhBlocks: "{0} lockouts so far", mhReason: "reason: {0}",
+      mhWindowFull: "{0} window is full", mhLastOK: "last success {0} ago",
       updatedAt: "updated {0}",
       needKey: "Enter the management key first.", keyRejected: "Management key rejected.",
       reqFailed: "Request failed: HTTP {0}", loadFirst: "Load the data first.",
@@ -286,6 +324,12 @@ const panelHTML = `<!doctype html>
       warnExternal: "{1} window of {0} shows {2} consumed that this plugin did not bill — another client may be sharing this credential",
       warnUnpriced: "No public price for {0} (credential {1}); its spend is missing from the estimate",
       warnPrice: "Price refresh is failing: {0}",
+      warnModelDown: "Model {0} has no credential left: all {1} are cooling down, the first back in {2}. " +
+        "An outage like this hits only this model, while credential and channel status both look fine.",
+      warnModelDownNoEta: "Model {0} has no credential left: all {1} are cooling down.",
+      warnModelSingle: "Model {0} runs on a single credential ({1}). Its next 429 takes the whole model down.",
+      warnModelSingleOff: "Model {0} runs on a single credential ({1}), with {2} more disabled. " +
+        "Its next 429 takes the whole model down.",
       totalsTitle: "{0} window totals",
       cCreds: "Credentials", cQuota: "Quota value", cSpent: "Spent", cRemain: "Remaining",
       cPriced: "{0} priced", cAtRisk: "{0} near the limit",
@@ -355,6 +399,7 @@ const panelHTML = `<!doctype html>
   var keyBox = el("key"), alerts = el("alerts"), rows = el("rows"), cards = el("cards");
   var wrap = el("wrap"), stamp = el("stamp"), foot = el("foot"), head = el("head");
   var chartbox = el("chartbox"), chart = el("chart"), pricebox = el("pricebox"), wtotals = el("wtotals");
+  var modelbox = el("modelbox"), modeltable = el("modeltable");
   var last = null, timer = null;
 
   keyBox.value = localStorage.getItem(STORE) || "";
@@ -698,8 +743,72 @@ const panelHTML = `<!doctype html>
       case "external_usage": return t("warnExternal", w.credential, w.window, pct(w.percent));
       case "unpriced_models": return t("warnUnpriced", (w.models || []).join(", "), w.credential);
       case "price_refresh_failed": return t("warnPrice", w.message);
+      case "model_unavailable":
+        return w.in_seconds === undefined
+          ? t("warnModelDownNoEta", w.model, w.credentials)
+          : t("warnModelDown", w.model, w.credentials, dur(w.in_seconds));
+      case "model_single_point":
+        return w.disabled
+          ? t("warnModelSingleOff", w.model, w.credential, w.disabled)
+          : t("warnModelSingle", w.model, w.credential);
       default: return w.message || w.code || "";
     }
+  }
+
+  // A model with nothing left to serve it is an outage, not an advisory.
+  function warnClass(w) { return w.code === "model_unavailable" ? "bad" : "warn"; }
+
+  function modelStateTag(m) {
+    var cls = { down: "bad", degraded: "warn", ok: "ok" }[m.state] || "";
+    var word = { down: t("msDown"), degraded: t("msDegraded"), ok: t("msOK") }[m.state] || m.state;
+    var s = "<span class='tag " + cls + "'>" + word + "</span>";
+    if (m.single_point) s += " <span class='tag warn'>" + t("msSingle") + "</span>";
+    return s;
+  }
+
+  // One chip per credential. The title carries the detail an operator would
+  // otherwise have to dig out of the proxy log: why it is out, which window
+  // filled up, and when it comes back.
+  function credChip(c) {
+    var cls = { cooling: "bad", recovering: "warn", ok: "ok", disabled: "" }[c.state] || "";
+    var word = { cooling: t("csCooling"), recovering: t("csRecovering"),
+                 ok: t("csOK"), disabled: t("csDisabled") }[c.state] || c.state;
+    var label = esc(c.credential) + " · " + word;
+    if (c.state === "cooling") {
+      label += " " + dur(c.cooldown_in_seconds) + (c.cooldown_estimated ? "?" : "");
+    }
+    var tip = [];
+    if (c.reason) tip.push(t("mhReason", c.reason));
+    if (c.blocked_window) tip.push(t("mhWindowFull", c.blocked_window));
+    if (c.cooldown_until) tip.push(c.cooldown_until + (c.cooldown_estimated ? " (" + t("mhEstimated") + ")" : ""));
+    if (c.last_ok_age_seconds !== undefined) tip.push(t("mhLastOK", dur(c.last_ok_age_seconds)));
+    if (c.blocks) tip.push(t("mhBlocks", c.blocks));
+    tip.push(t("mhTraffic") + ": " + (c.requests || 0) + " / " + (c.failed || 0));
+    return "<span class='chip tag " + cls + (c.state === "disabled" ? " off" : "") +
+           "' title='" + esc(tip.join("\n")) + "'>" + label + "</span>";
+  }
+
+  function renderModels(models) {
+    if (!models || !models.length) {
+      modeltable.innerHTML = "<tbody><tr><td>" + t("mhNone") + "</td></tr></tbody>";
+      modelbox.hidden = false;
+      return;
+    }
+    var h = "<thead><tr><th>" + t("mhModel") + "</th><th>" + t("mhState") + "</th><th>" +
+            t("mhCap") + "</th><th>" + t("mhBack") + "</th><th>" + t("mhTraffic") + "</th><th>" +
+            t("mhCreds") + "</th></tr></thead><tbody>";
+    models.forEach(function (m) {
+      h += "<tr><td><span class='name'>" + esc(m.model) + "</span></td>" +
+           "<td>" + modelStateTag(m) + "</td>" +
+           "<td class='num'>" + m.available + " / " + m.credentials +
+             (m.disabled ? " <span class='sub2'>+" + m.disabled + " " + t("csDisabled") + "</span>" : "") + "</td>" +
+           "<td class='num'>" + (m.next_recovery_in_seconds === undefined
+             ? "—" : dur(m.next_recovery_in_seconds)) + "</td>" +
+           "<td class='num'>" + (m.requests || 0) + " / " + (m.failed || 0) + "</td>" +
+           "<td>" + (m.by_credential || []).map(credChip).join("") + "</td></tr>";
+    });
+    modeltable.innerHTML = h + "</tbody>";
+    modelbox.hidden = false;
   }
 
   function applyStatic() {
@@ -714,6 +823,8 @@ const panelHTML = `<!doctype html>
     el("t-lg1").textContent = t("legendBars");
     el("t-lg2").textContent = t("legendLine");
     el("t-prices").textContent = t("pricesTitle");
+    el("t-models").textContent = t("modelsTitle");
+    el("t-modelhint").innerHTML = t("modelsHint");
     var opts = el("sort").options;
     var names = ["sortQuota", "sortRemain", "sortUsed", "sortPace", "sortName"];
     for (var i = 0; i < opts.length; i++) opts[i].textContent = t(names[i]);
@@ -723,7 +834,8 @@ const panelHTML = `<!doctype html>
   function render(data) {
     last = data;
     alerts.innerHTML = "";
-    (data.warnings || []).forEach(function (w) { note("warn", warnText(w)); });
+    (data.warnings || []).forEach(function (w) { note(warnClass(w), warnText(w)); });
+    renderModels(data.models);
 
     var accounts = data.accounts || [];
     var stale = accounts.filter(function (a) { return a.stale; });
@@ -859,7 +971,7 @@ const panelHTML = `<!doctype html>
     localStorage.setItem(STORE, keyBox.value.trim());
     api("data").then(render).catch(function (err) {
       alerts.innerHTML = ""; note("bad", err.message);
-      cards.hidden = wrap.hidden = chartbox.hidden = pricebox.hidden = true;
+      cards.hidden = wrap.hidden = chartbox.hidden = pricebox.hidden = modelbox.hidden = true;
       wtotals.innerHTML = "";
     });
   }
@@ -875,7 +987,7 @@ const panelHTML = `<!doctype html>
   keyBox.addEventListener("keydown", function (e) { if (e.key === "Enter") load(); });
   el("forget").addEventListener("click", function () {
     localStorage.removeItem(STORE); keyBox.value = ""; last = null;
-    cards.hidden = wrap.hidden = chartbox.hidden = pricebox.hidden = true;
+    cards.hidden = wrap.hidden = chartbox.hidden = pricebox.hidden = modelbox.hidden = true;
     alerts.innerHTML = ""; stamp.textContent = ""; wtotals.innerHTML = "";
     if (timer) { clearInterval(timer); timer = null; }
   });
