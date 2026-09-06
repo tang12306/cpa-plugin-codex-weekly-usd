@@ -189,8 +189,9 @@ func (r *rotator) tick(force bool) {
 		return
 	}
 
-	results := r.sweep(append(append([]authEntry{}, enabled...), standby...), cfg)
-	candidates := r.rank(results, entries, cfg)
+	pool := append(append([]authEntry{}, enabled...), standby...)
+	results := r.sweep(pool, cfg)
+	candidates := r.rank(results, pool, cfg)
 
 	r.mu.Lock()
 	r.state.LastSweep = now.Unix()
@@ -241,12 +242,14 @@ func (r *rotator) tick(force bool) {
 	}
 
 	r.retireDrained(enabled, cfg, len(promoted))
+	r.note(fmt.Sprintf("rotated: promoted %d", len(promoted)))
 	// Dead members are retired only now that replacements are in place. Doing it
 	// before promotion would shrink the pool on the strength of a single probe,
 	// and a probe that failed for a reason other than the credential - a network
 	// blip - would cost real capacity.
 	if cfg.DisableDeadTokens {
-		r.retireDeadTokens(results, r.app.authMetadata(), cfg)
+		livePool, liveStandby := splitPool(r.app.authMetadata(), cfg)
+		r.retireDeadTokens(results, append(livePool, liveStandby...), cfg)
 	}
 	r.mu.Lock()
 	r.state.LastSwitch = now.Unix()
