@@ -67,12 +67,19 @@ type probeResult struct {
 	Error      string          `json:"error,omitempty"`
 }
 
-// alive reports whether the credential can still authenticate. A 401 means the
-// refresh token has been invalidated and the account needs a new login; a 429
-// is a healthy credential with no quota left, which is a completely different
-// thing and must not be confused with it.
+// alive reports whether this reading shows a credential that can serve. A 429
+// is alive - a working credential with no quota left, which is a completely
+// different thing from a broken one.
 func (p probeResult) alive() bool {
-	return p.Error == "" && p.StatusCode != 401 && p.StatusCode != 403
+	return p.Error == "" && !p.rejected()
+}
+
+// rejected is the narrower question: did upstream actually refuse the
+// credential? Only a 401 or 403 answers yes. alive() is false for a probe that
+// merely failed to complete, and retiring a credential on that would let one
+// network blip cost real capacity - so retirement uses this, not alive().
+func (p probeResult) rejected() bool {
+	return p.StatusCode == 401 || p.StatusCode == 403
 }
 
 // candidate is one credential scored for the pool.
@@ -108,6 +115,11 @@ type RotatorState struct {
 	Log         []switchRecord `json:"log,omitempty"`
 	LastReason  string         `json:"last_reason,omitempty"`
 	LastCandids []candidate    `json:"last_candidates,omitempty"`
+	// HealthyEnabled and RecoversAt describe the last shortfall: how many pool
+	// members could still serve, and when the first passed-over candidate is due
+	// back. They are what separates "degraded" from "down".
+	HealthyEnabled int   `json:"healthy_enabled,omitempty"`
+	RecoversAt     int64 `json:"recovers_at,omitempty"`
 }
 
 type rotator struct {
@@ -198,6 +210,16 @@ func (r *rotator) tick(force bool) {
 	r.state.LastCandids = candidates
 	r.mu.Unlock()
 
+	// A credential upstream has refused contributes nothing, so switching it off
+	// cannot reduce capacity - and it has to happen here rather than after a
+	// promotion, because the "nothing qualifies" path below returns early and
+	// would otherwise leave a refused credential in the pool indefinitely,
+	// costing a wasted attempt on every request.
+	touched := map[string]bool{}
+	if cfg.DisableDeadTokens {
+		touched = r.retireRejected(results, pool, cfg)
+	}
+
 	// Recount with fresh readings: the cached picture that triggered the sweep
 	// may have been stale, and a sweep that finds everything healthy should end
 	// without touching anything.
@@ -221,8 +243,32 @@ func (r *rotator) tick(force bool) {
 	if len(picks) == 0 {
 		// Never empty the pool because there is nothing to replace it with.
 		// Whatever is enabled stays enabled, and the panel says why.
-		r.note("no_standby_available")
-		hostLog("warn", "rotator: pool is short but no standby qualifies; leaving the pool untouched")
+		healthy := cfg.KeepEnabled - short
+		soonest := soonestRecovery(candidates)
+		r.mu.Lock()
+		r.state.HealthyEnabled = healthy
+		r.state.RecoversAt = soonest
+		r.mu.Unlock()
+
+		// Being one short of the target while still serving is not the same
+		// situation as having nothing that can serve, and logging them the same
+		// way trains the operator to ignore both.
+		reason := "no_standby_available"
+		if healthy <= 0 {
+			reason = "pool_has_nothing_serving"
+		}
+		if r.note(reason) {
+			msg := fmt.Sprintf("rotator: pool is %d short of %d and no standby qualifies; leaving it untouched",
+				short, cfg.KeepEnabled)
+			if soonest > 0 {
+				msg += fmt.Sprintf(" (soonest candidate recovers in %s)", time.Until(time.Unix(soonest, 0)).Truncate(time.Minute))
+			}
+			if healthy <= 0 {
+				hostLog("error", msg+" - NOTHING in the pool can serve")
+			} else {
+				hostLog("info", msg+fmt.Sprintf(" - %d member(s) still serving", healthy))
+			}
+		}
 		return
 	}
 
@@ -241,16 +287,8 @@ func (r *rotator) tick(force bool) {
 		return
 	}
 
-	r.retireDrained(enabled, cfg, len(promoted))
+	r.retireDrained(enabled, cfg, len(promoted), touched)
 	r.note(fmt.Sprintf("rotated: promoted %d", len(promoted)))
-	// Dead members are retired only now that replacements are in place. Doing it
-	// before promotion would shrink the pool on the strength of a single probe,
-	// and a probe that failed for a reason other than the credential - a network
-	// blip - would cost real capacity.
-	if cfg.DisableDeadTokens {
-		livePool, liveStandby := splitPool(r.app.authMetadata(), cfg)
-		r.retireDeadTokens(results, append(livePool, liveStandby...), cfg)
-	}
 	r.mu.Lock()
 	r.state.LastSwitch = now.Unix()
 	r.mu.Unlock()
@@ -582,32 +620,45 @@ func (r *rotator) rotatedRecently(file string, windows []windowReading, now time
 	return false
 }
 
-// retireDeadTokens disables credentials whose refresh token upstream has
-// invalidated. Leaving one enabled costs a wasted attempt on every request, and
-// disabling is the safe direction: a mistake here removes capacity that was not
-// working anyway.
-func (r *rotator) retireDeadTokens(results map[string]probeResult, entries []authEntry, cfg RotatorConfig) {
+// retireRejected disables credentials upstream has refused outright. Leaving
+// one enabled costs a wasted attempt on every request, and disabling is the
+// safe direction: it removes capacity that was not working anyway.
+// The returned set is what this tick has already switched off. Re-reading the
+// credential list is not enough to know that: the host applies a write through
+// a file watcher, so for a moment after the write it still reports the old
+// state, and a recount taken in that window would switch the same credential
+// off a second time.
+func (r *rotator) retireRejected(results map[string]probeResult, entries []authEntry, cfg RotatorConfig) map[string]bool {
+	touched := map[string]bool{}
 	for _, e := range entries {
 		if e.Disabled || contains(cfg.NeverDisable, e.Name) {
 			continue
 		}
 		res, ok := results[e.Name]
-		if !ok || res.alive() {
+		if !ok || !res.rejected() {
 			continue
 		}
 		c := candidate{File: e.Name, Index: e.AuthIndex, Label: firstNonEmpty(e.Label, e.Email, e.Name)}
 		if err := r.setDisabled(c, true, fmt.Sprintf("token rejected upstream (HTTP %d)", res.StatusCode), cfg); err != nil {
-			hostLog("warn", "rotator: could not disable dead credential "+e.Name+": "+err.Error())
+			hostLog("warn", "rotator: could not disable rejected credential "+e.Name+": "+err.Error())
+			continue
 		}
+		touched[e.Name] = true
 	}
+	return touched
 }
 
 // retireDrained removes spent members once replacements are in place, never
 // dropping the pool below its target and never removing the last healthy one.
-func (r *rotator) retireDrained(enabled []authEntry, cfg RotatorConfig, promoted int) {
-	live := len(enabled) + promoted
+func (r *rotator) retireDrained(enabled []authEntry, cfg RotatorConfig, promoted int, touched map[string]bool) {
+	live := promoted
 	for _, e := range enabled {
-		if contains(cfg.NeverDisable, e.Name) {
+		if !touched[e.Name] {
+			live++
+		}
+	}
+	for _, e := range enabled {
+		if contains(cfg.NeverDisable, e.Name) || touched[e.Name] {
 			continue
 		}
 		state, headroom := r.memberState(e, cfg)
@@ -677,8 +728,13 @@ func (r *rotator) setDisabled(c candidate, disabled bool, reason string, cfg Rot
 	}
 	name := firstNonEmpty(got.Name, c.File)
 	save, _ := json.Marshal(map[string]any{"name": name, "json": json.RawMessage(body)})
-	_, err = hostCall("host.auth.save", save)
-	return err
+	if _, err = hostCall("host.auth.save", save); err != nil {
+		return err
+	}
+	// The cached credential list is now a minute out of date on the one thing
+	// that just changed, and the recount below depends on it.
+	r.app.invalidateAuthCache()
+	return nil
 }
 
 // record appends to the audit trail.
@@ -736,10 +792,35 @@ func (r *rotator) mayAct(now time.Time, cfg RotatorConfig) bool {
 	return true
 }
 
-func (r *rotator) note(reason string) {
+// note records why the evaluation ended and reports whether that is a change.
+// The rotator runs every couple of minutes; a log line each time would bury the
+// transition, which is the only part worth reading.
+func (r *rotator) note(reason string) bool {
 	r.mu.Lock()
+	defer r.mu.Unlock()
+	changed := r.state.LastReason != reason
 	r.state.LastReason = reason
-	r.mu.Unlock()
+	return changed
+}
+
+// soonestRecovery is when the first passed-over candidate gets its allowance
+// back. Without it "nothing qualifies" is a dead end rather than a wait.
+func soonestRecovery(candidates []candidate) int64 {
+	best := int64(0)
+	now := time.Now()
+	for _, c := range candidates {
+		if c.Skip == "" || c.Skip == skipDeadToken || c.Skip == skipExcluded {
+			continue
+		}
+		if c.ExpiresIn <= 0 {
+			continue
+		}
+		at := now.Add(time.Duration(c.ExpiresIn * float64(time.Hour))).Unix()
+		if best == 0 || at < best {
+			best = at
+		}
+	}
+	return best
 }
 
 // Report renders the rotator for the panel.
@@ -763,8 +844,23 @@ func (r *rotator) Report(cfg RotatorConfig) map[string]any {
 		out["candidates"] = r.state.LastCandids
 	}
 	warnings := make([]map[string]any, 0, 2)
-	if cfg.Enabled && r.state.LastReason == "no_standby_available" {
-		warnings = append(warnings, map[string]any{"code": "rotator_stuck"})
+	if cfg.Enabled && r.state.RecoversAt > 0 {
+		out["recovers_at"] = time.Unix(r.state.RecoversAt, 0).UTC().Format(time.RFC3339)
+		out["recovers_in_seconds"] = int64(math.Max(0, time.Until(time.Unix(r.state.RecoversAt, 0)).Seconds()))
+	}
+	if cfg.Enabled && r.state.LastReason == "pool_has_nothing_serving" {
+		w := map[string]any{"code": "rotator_stuck"}
+		if v, ok := out["recovers_in_seconds"]; ok {
+			w["in_seconds"] = v
+		}
+		warnings = append(warnings, w)
+	} else if cfg.Enabled && r.state.LastReason == "no_standby_available" {
+		w := map[string]any{"code": "rotator_degraded", "serving": r.state.HealthyEnabled,
+			"target": cfg.KeepEnabled}
+		if v, ok := out["recovers_in_seconds"]; ok {
+			w["in_seconds"] = v
+		}
+		warnings = append(warnings, w)
 	}
 	if cfg.Enabled && cfg.DryRun {
 		warnings = append(warnings, map[string]any{"code": "rotator_dry_run"})

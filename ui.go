@@ -274,8 +274,14 @@ const panelHTML = `<!doctype html>
       skProbe: "探测失败", skExcluded: "配置排除", skRecent: "刚轮换过",
       rotLogTitle: "轮换记录", rlAt: "时间", rlAction: "动作", rlCred: "凭据", rlWhy: "原因",
       rlEnable: "启用", rlDisable: "停用", rlDry: "空跑",
-      warnRotStuck: "轮换器判定当前池子人手不足，但没有任何备用凭据合格，因此**没有动任何东西**——" +
-        "现有凭据保持启用。请补充可用账号，或检查是否所有备用号都已耗尽/失效。",
+      warnRotStuck: "轮换器判定**池子里已经没有任何凭据能服务**，且没有备用凭据合格，" +
+        "因此没有动任何东西——现有凭据保持启用。请补充可用账号，或重新登录已失效的号。",
+      warnRotStuckEta: "轮换器判定**池子里已经没有任何凭据能服务**，且暂时没有合格备用。" +
+        "最快 {0} 后会有候选恢复额度。",
+      warnRotDegraded: "轮换器没能把池子补满（{0}/{1} 个仍在服务），暂时没有合格备用凭据。" +
+        "**当前请求不受影响**——代理会在被拒时自动改用池中还能用的那个。",
+      warnRotDegradedEta: "轮换器没能把池子补满（{0}/{1} 个仍在服务），暂时没有合格备用。" +
+        "**当前请求不受影响**；最快 {2} 后会有候选恢复额度。",
       warnRotDry: "轮换器处于空跑模式：它会照常判断并记录，但不会真的改写凭据。确认记录无误后把 dry_run 关掉。",
       mhWindowFull: "{0} 窗口已打满", mhLastOK: "最后成功于 {0}前",
       updatedAt: "更新于 {0}",
@@ -381,9 +387,16 @@ const panelHTML = `<!doctype html>
       skProbe: "probe failed", skExcluded: "excluded", skRecent: "just rotated",
       rotLogTitle: "Rotation log", rlAt: "When", rlAction: "Action", rlCred: "Credential", rlWhy: "Why",
       rlEnable: "enable", rlDisable: "disable", rlDry: "dry run",
-      warnRotStuck: "The rotator judged the pool short but no standby qualified, so it changed " +
-        "nothing - whatever is enabled stays enabled. Add a usable account, or check whether " +
-        "every standby is spent or rejected.",
+      warnRotStuck: "**Nothing in the pool can serve** and no standby qualified, so the rotator " +
+        "changed nothing - whatever is enabled stays enabled. Add a usable account, or log back " +
+        "in to the rejected ones.",
+      warnRotStuckEta: "**Nothing in the pool can serve** and no standby qualifies yet. The " +
+        "soonest candidate gets its allowance back in {0}.",
+      warnRotDegraded: "The rotator could not fill the pool ({0}/{1} still serving) and no standby " +
+        "qualifies. **Requests are unaffected** - the proxy moves to the member that still works " +
+        "when one is refused.",
+      warnRotDegradedEta: "The rotator could not fill the pool ({0}/{1} still serving) and no " +
+        "standby qualifies yet. **Requests are unaffected**; the soonest candidate recovers in {2}.",
       warnRotDry: "The rotator is in dry run: it decides and records as usual but never rewrites a " +
         "credential. Turn dry_run off once the log looks right.",
       mhWindowFull: "{0} window is full", mhLastOK: "last success {0} ago",
@@ -819,7 +832,12 @@ const panelHTML = `<!doctype html>
         return w.in_seconds === undefined
           ? t("warnModelDownNoEta", w.model, w.credentials)
           : t("warnModelDown", w.model, w.credentials, dur(w.in_seconds));
-      case "rotator_stuck": return t("warnRotStuck");
+      case "rotator_stuck":
+        return w.in_seconds === undefined ? t("warnRotStuck") : t("warnRotStuckEta", dur(w.in_seconds));
+      case "rotator_degraded":
+        return w.in_seconds === undefined
+          ? t("warnRotDegraded", w.serving, w.target)
+          : t("warnRotDegradedEta", w.serving, w.target, dur(w.in_seconds));
       case "rotator_dry_run": return t("warnRotDry");
       case "model_single_point":
         return w.disabled

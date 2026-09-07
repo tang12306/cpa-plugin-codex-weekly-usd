@@ -640,11 +640,14 @@ rep = rotate({
     "cred-d.json": {"disabled": True, "windows": [(WEEKF, 97, 400000)]},
 })
 check("nothing was written", len(saves()), 0)
-check("the incumbent stays enabled", rep["last_reason"], "no_standby_available")
+check("the incumbent stays enabled", rep["last_reason"], "pool_has_nothing_serving")
 check("a standby at the floor is not a replacement",
       [c.get("skipped") for c in rep["candidates"] if c["file"] == "cred-d.json"][0],
       "below_floor")
+# Nothing here can serve at all, so this one really is an alarm.
 check("and it warns", any(w["code"] == "rotator_stuck" for w in rep.get("warnings", [])), True)
+check("not downgraded to degraded",
+      any(w["code"] == "rotator_degraded" for w in rep.get("warnings", [])), False)
 
 print()
 print("=" * 74)
@@ -677,8 +680,14 @@ rep = rotate({
     "cred-e.json": {"disabled": True, "status": 401, "windows": []},
 })
 log = saves()
-check("the replacement is enabled first", log[0], ("cred-c.json", False))
-check("the dead one is disabled", ("cred-b.json", True) in log, True)
+# The refused member goes first here, and that is deliberate: it has no capacity
+# to lose, so waiting for a replacement only prolongs the wasted attempt it
+# costs on every request. The enable-before-disable rule protects a *drained*
+# member, which still has quota worth keeping until a replacement is in - that
+# ordering is asserted in U.
+check("the refused one is retired", ("cred-b.json", True) in log, True)
+check("the replacement is promoted", ("cred-c.json", False) in log, True)
+check("both happened, nothing else", len(log), 2)
 check("a dead standby is never promoted",
       any(name == "cred-e.json" and not disabled for name, disabled in log), False)
 skips = {c["file"]: c.get("skipped") for c in rep["candidates"]}
@@ -710,6 +719,42 @@ rep = run([], auth_list=auth_list, route="rotate", method="POST",
           fixtures=fixtures)
 check("the budget survives a restart", rep["changes_today"], 2)
 check("and the second rotation writes nothing", len(saves()), 0)
+
+print()
+print("=" * 74)
+print("Y2. a refused credential is retired even when nothing can replace it")
+print("=" * 74)
+shutil.rmtree(DATA_DIR, ignore_errors=True)
+# The bug this covers: retirement used to run only after a successful
+# promotion, and the "no standby qualifies" path returns before that. A
+# credential upstream had refused therefore stayed in the pool for ever,
+# costing a wasted attempt on every request. It contributes nothing, so
+# switching it off cannot reduce capacity and must not wait for a replacement.
+rep = rotate({
+    "cred-a.json": {"disabled": False, "windows": [(WEEKF, 8, 400000)]},   # healthy
+    "cred-b.json": {"disabled": False, "status": 401, "windows": []},      # refused
+    "cred-d.json": {"disabled": True, "windows": [(WEEKF, 100, 400000)]},  # spent
+})
+log = saves()
+check("the refused member is retired anyway", ("cred-b.json", True) in log, True)
+check("and nothing else was touched", len(log), 1)
+# One member is still serving, so this is degraded, not down - and saying so is
+# the difference between an alarm worth reading and one worth ignoring.
+check("reported as degraded, not down", rep["last_reason"], "no_standby_available")
+check("warned as degraded", any(w["code"] == "rotator_degraded" for w in rep.get("warnings", [])), True)
+check("not raised as stuck", any(w["code"] == "rotator_stuck" for w in rep.get("warnings", [])), False)
+check("says how many are still serving",
+      [w for w in rep["warnings"] if w["code"] == "rotator_degraded"][0]["serving"], 1)
+
+shutil.rmtree(DATA_DIR, ignore_errors=True)
+# A probe that merely failed to complete is not a refusal. Retiring on that
+# would let one network blip cost real capacity.
+rep = rotate({
+    "cred-a.json": {"disabled": False, "windows": [(WEEKF, 8, 400000)]},
+    "cred-b.json": {"disabled": False, "status": 500, "windows": []},
+    "cred-d.json": {"disabled": True, "windows": [(WEEKF, 100, 400000)]},
+})
+check("a failed probe is not a refusal", len(saves()), 0)
 
 print()
 print("=" * 74)

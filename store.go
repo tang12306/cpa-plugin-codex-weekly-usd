@@ -919,6 +919,18 @@ func (a *App) authMetadata() []authEntry {
 // lookupAuth resolves one credential against a metadata list already fetched
 // by the caller. It deliberately does not fetch: callers hold the state lock,
 // and authMetadata takes it.
+// invalidateAuthCache drops the cached credential list. The rotator calls it
+// after changing one: the cache is a minute long, and a recount taken against
+// the stale view sees a credential it just switched off as still enabled, and
+// switches it off again - a duplicate write that also spends a change against
+// the daily budget.
+func (a *App) invalidateAuthCache() {
+	a.mu.Lock()
+	a.authCache = nil
+	a.authFetch = time.Time{}
+	a.mu.Unlock()
+}
+
 func lookupAuth(entries []authEntry, acct *Account) (authEntry, bool) {
 	for _, entry := range entries {
 		switch {
