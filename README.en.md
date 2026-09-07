@@ -150,6 +150,17 @@ Any of:
 - **Lead time** - the measured burn would exhaust it within `lead_time_minutes` (default 15). This
   is not a refinement: a credential in production went from 84% to 99% in forty-five minutes, and at
   that rate 10% of headroom is half an hour away.
+
+  **Bounded by `projectionCeiling` (twice the floor).** Lead time is denominated
+  in minutes, but a minute is worth whatever the current burn says it is: at a
+  measured 270 points an hour, a fifteen-minute lead means "replace anything
+  under 67% headroom" - the floor never applies and every credential is retired
+  with most of its window unspent. However fast it is burning, the projection
+  may not retire a credential with more than `2 x switch_at_percent` headroom.
+  The projection only exists to cover the blind spot between checks, and the
+  pool's second member already makes a handover invisible: crossing the floor
+  costs one 429 the proxy retries elsewhere, not an outage.
+
 - **Rejection** - upstream has stopped accepting the credential (401).
 
 With one rule pointing the other way: if the binding window resets sooner than the projection says
@@ -170,11 +181,29 @@ a credential that was still working.
    of a weekly window that resets in nine hours is use-it-or-lose-it; the same headroom on a window
    that resets in a week is not going anywhere.
 
-### Decisions use a live reading
+### Decisions are derived; probes are spent only on acting
 
-A disabled credential is **not** frozen: one disabled here was observed with its five-hour window
-consumed to 100% anyway, which means something outside this proxy uses the same accounts. So a
-candidate is probed before it is promoted.
+**An idle credential's quota can only do two things**: stay exactly where the last reading left it,
+or drop to zero the moment its window closes. Both are arithmetic, so upstream almost never needs
+asking:
+
+- **A credential that is serving** reports its quota in the headers of every response, which this
+  plugin already records. Its reading is fresh by construction.
+- **A credential that is idle** is derived from its last reading plus its reset time. Past the reset,
+  the allowance is back; before it, nothing can have been spent.
+
+**A whole rotation costs at most two probes**, and both are spent at the moment of acting:
+
+1. **When the estimate says the incumbent is nearly spent**, one probe checks that claim before
+   anything is switched on the strength of it. If the estimate had drifted, that probe just saved a
+   pointless rotation.
+2. **Before a replacement takes real traffic**, one probe confirms it still works. This is the one
+   that pays for itself: a credential revoked while it sat idle looks perfect in the derived picture
+   - precisely because nothing has asked it anything - and promoting it would hand callers a failure.
+
+**The budget is per quota cycle**, kept in state.json so a restart does not respend it, with a hard
+per-credential daily cap (`max_probes_per_day_per_credential`, default 6) behind it. The panel shows
+"N probes today"; on a working system it reads zero for days at a time.
 
 Three measured facts about probing:
 
@@ -183,7 +212,27 @@ Three measured facts about probing:
   model name returns 400 with nothing useful on it.
 - **A 429 still carries them**, so an exhausted credential is readable rather than a blind spot.
 
-Nothing is probed while the pool is healthy.
+### Probes leave by the credential's own egress
+
+**This is a real defect fixed in 2.4.0.** CLIProxyAPI gives each credential its own egress through
+`proxy_url` in its auth document, and both the request path and the token refresh honour it. The
+plugin host callback does not: `host.http.do` is built with `h.newHTTPClient(nil)` - the auth is
+hardcoded nil - so it falls back to the host's own address.
+
+The consequence is worse than probe volume: an account whose traffic normally leaves from Los
+Angeles was seen authenticating from Chicago, which is exactly the shape an abuse detector looks
+for. And `pluginapi.HTTPRequest` carries no proxy field, so a plugin cannot ask for a different
+route.
+
+So from 2.4.0 the plugin **dials for itself**: it reads the credential's `proxy_url` and speaks
+SOCKS5 (username/password included), leaving by the same route that credential's real traffic uses.
+**An unreachable proxy fails the probe rather than falling back to a direct dial** - falling back is
+the defect itself.
+
+**And one absolute rule**: a credential upstream has refused (401/403) is **never probed again**
+until its access token changes, which means someone has logged the account back in. Only a fresh
+login can change the answer; asking repeatedly is the least defensible traffic this plugin can
+generate.
 
 ### Guard rails
 
@@ -206,6 +255,17 @@ state and must not be reachable by following a link.
 **A known limit**: the proxy does not refresh the access token of a long-disabled credential, so
 once it expires the probe reads as a rejection. This version warns rather than running the OAuth
 refresh itself.
+
+The knock-on effect inside CLIProxyAPI is worse. `shouldRefresh()` opens with
+`if hasUnauthorizedAuthFailure(a) { return false }`, and both places that clear that error state are
+guarded by `if !auth.Disabled`. **So a credential that 401s once and is then disabled can never
+clear the error, and CLIProxyAPI will never refresh its token again.** That state is not persisted,
+so restarting CLIProxyAPI clears it.
+
+`disable_dead_tokens` therefore cuts both ways: it saves a wasted attempt on every request, but it
+can also freeze a credential that would otherwise have recovered. The error code tells them apart -
+`token_revoked` on a request may be transient, while `refresh_token_invalidated` ("Your session has
+ended") on a refresh is terminal and needs a fresh login.
 
 ## Model availability
 
@@ -248,6 +308,22 @@ How it decides:
 - Repeated 429s inside one cooldown count as **one** lockout: the number measures how often the
   model went out, not how many requests bounced off it.
 
+### The dashboard describes now, not the last decision
+
+Two things used to mislead:
+
+- **The candidate board was a stored snapshot**, refreshed only when the rotator acted. Refreshing
+  the page by hand changed nothing, because nothing recomputed. It is derived per request now -
+  ranking is arithmetic and touches nothing upstream, so there is no reason to cache it.
+- **A countdown past its reset clamped to zero** and stayed there, so the panel showed a deadline
+  that expired hours ago beside a percentage that stopped being true at the same moment. Measured on
+  the live fleet: three credentials displayed at 80%, 86% and 95% spent were in fact all at 0%,
+  fully reset. The boundary is now rolled forward by whole periods and flagged `reset_inferred`, and
+  the reconciliation replaces the percentage with a real reading - three probes corrected all three.
+
+A credential upstream has refused is never probed, so its window stays marked inferred for good.
+That is honest rather than a gap: nothing short of a fresh login can make it answer.
+
 ## Dashboard
 
 **The panel speaks English and Simplified Chinese**, switchable in the toolbar and
@@ -279,9 +355,19 @@ card, sorting, and JSON export.
 
 All inline SVG, no external library, so the page stays self-contained.
 
-- **Fleet usage** — hourly spend as bars on the left axis with a **cumulative
-  spend line** on its own right axis. Flat stretches are idle hours; a
-  steepening slope is spend accelerating.
+- **Fleet usage** — **the chart covers one week.** Hourly spend as bars on the
+  left axis, with a **trailing seven-day total** on its own right axis.
+
+  The line used to be spend accumulated since the chart began, which could only
+  ever rise: it said nothing beyond "time has passed". A trailing window is
+  stationary - flat while load is steady, rising only when load genuinely
+  grows, falling when it eases. Seven days because that is the window the quota
+  itself is denominated in.
+
+  The left-hand stretch is dashed where fewer than seven days of buckets sit
+  behind those points, so the total is short by an unknown amount rather than
+  genuinely lower. Retention is deliberately twice the chart span, so that every
+  visible point ends up with a complete week behind it.
 - **Quota curve** (per credential) — the used-percentage over time against a
   **dashed constant-rate reference**, which is 100% spread evenly across the
   window. A curve above the dashed line is the visual form of a pace ratio
@@ -338,6 +424,20 @@ plugins:
       flush_seconds: 15
       # long_context_threshold: 272000
       # long_context_multiplier: 2
+      rotator:
+        enabled: false          # off by default: this is the one part that writes outside data_dir
+        dry_run: true           # decide and log everything, change nothing
+        keep_enabled: 2         # a pool of one cannot hand over
+        switch_at_percent: 10
+        lead_time_minutes: 15
+        horizon_hours: 4
+        check_interval_seconds: 60   # costs nothing: the check is arithmetic
+        min_switch_gap_minutes: 10
+        max_changes_per_day: 20
+        probe_model: gpt-5.6-sol     # must be a model these accounts can actually call
+        disable_dead_tokens: true
+        confirm_before_switch: true  # one probe each side before acting; off means pure arithmetic
+        max_probes_per_day_per_credential: 6   # hard per-credential backstop
 ```
 
 ## Files
@@ -374,7 +474,8 @@ make test
 
 `test_charts.js` lifts the SVG builders straight out of the **served** panel and
 replays them over a synthetic multi-hour series, so what is asserted is
-byte-for-byte what a browser receives: bar count, cumulative monotonicity,
+byte-for-byte what a browser receives: bar count, a trailing window that must go flat
+under steady load, the dashed/solid split,
 points per known hour, rollover restart, and the degenerate cases.
 
 Currently 91 checks. The scenario is arithmetic rather than opinion: every request costs exactly
