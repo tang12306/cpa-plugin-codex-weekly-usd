@@ -4,7 +4,10 @@ import (
 	"encoding/json"
 	"fmt"
 	"math"
+	"os"
+	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -122,8 +125,27 @@ type RotatorState struct {
 	RecoversAt     int64 `json:"recovers_at,omitempty"`
 }
 
+// rotatorLease names the one instance allowed to write credentials.
+//
+// A hot reload does not stop the instance it replaces. CLIProxyAPI retires a
+// plugin by moving it to a list; it never calls Shutdown, and a Go c-shared
+// library is not unloaded, so the old library's goroutines keep running - with
+// their own config, their own circuit breaker, and their own idea of what the
+// pool should look like. For a plugin that only counts tokens that is untidy.
+// For one that switches credentials on and off it is two hands on the same
+// wheel, so the newest instance takes a lease and the others stand down.
+type rotatorLease struct {
+	Instance string `json:"instance"`
+	Version  string `json:"version"`
+	At       int64  `json:"at"`
+}
+
 type rotator struct {
 	app *App
+
+	instance  string
+	startedAt int64
+	standDown bool
 
 	mu    sync.Mutex
 	state RotatorState
@@ -133,7 +155,51 @@ type rotator struct {
 }
 
 func newRotator(app *App) *rotator {
-	return &rotator{app: app, probes: map[string]probeResult{}}
+	now := time.Now()
+	return &rotator{
+		app:       app,
+		instance:  strconv.FormatInt(now.UnixNano(), 36),
+		startedAt: now.Unix(),
+		probes:    map[string]probeResult{},
+	}
+}
+
+func (r *rotator) leasePath() string {
+	r.app.mu.Lock()
+	defer r.app.mu.Unlock()
+	return filepath.Join(r.app.cfg.DataDir, "rotator.lease")
+}
+
+// claimLease announces this instance. Written before the first tick so an
+// instance being replaced sees it on its next pass.
+func (r *rotator) claimLease() {
+	body, err := json.Marshal(rotatorLease{Instance: r.instance, Version: pluginVersion, At: r.startedAt})
+	if err != nil {
+		return
+	}
+	if err = writeFileAtomic(r.leasePath(), body); err != nil {
+		hostLog("warn", "rotator: could not write the lease: "+err.Error())
+	}
+}
+
+// holdsLease reports whether this instance is still the newest one. A missing
+// or unreadable lease is treated as ours: failing open here keeps a fresh
+// install working, and the only cost of being wrong is the situation that
+// already exists without a lease at all.
+func (r *rotator) holdsLease() bool {
+	raw, err := os.ReadFile(r.leasePath())
+	if err != nil {
+		return true
+	}
+	var lease rotatorLease
+	if err = json.Unmarshal(raw, &lease); err != nil {
+		return true
+	}
+	if lease.Instance == "" || lease.Instance == r.instance {
+		return true
+	}
+	// Someone else holds it. Only a newer instance outranks this one.
+	return lease.At < r.startedAt
 }
 
 func (r *rotator) loop(stop <-chan struct{}) {
@@ -144,6 +210,7 @@ func (r *rotator) loop(stop <-chan struct{}) {
 	}()
 
 	cfg := r.config()
+	r.claimLease()
 	// One sweep at startup answers "where does the fleet actually stand", which
 	// is otherwise unknowable for a credential no traffic has touched.
 	time.Sleep(20 * time.Second)
@@ -179,6 +246,18 @@ func (r *rotator) tick(force bool) {
 
 	cfg := r.config()
 	if !cfg.Enabled {
+		return
+	}
+	if r.standDown {
+		return
+	}
+	if !r.holdsLease() {
+		// Superseded by a newer instance of this plugin. Stop for good rather
+		// than every tick: two rotators writing credentials is the one failure
+		// this component must not have.
+		r.standDown = true
+		r.note("superseded")
+		hostLog("info", "rotator: a newer instance holds the lease; this one is standing down")
 		return
 	}
 	entries := r.app.authMetadata()
@@ -249,6 +328,7 @@ func (r *rotator) tick(force bool) {
 		r.state.HealthyEnabled = healthy
 		r.state.RecoversAt = soonest
 		r.mu.Unlock()
+		r.app.markDirty()
 
 		// Being one short of the target while still serving is not the same
 		// situation as having nothing that can serve, and logging them the same

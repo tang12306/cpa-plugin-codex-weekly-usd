@@ -758,6 +758,51 @@ check("a failed probe is not a refusal", len(saves()), 0)
 
 print()
 print("=" * 74)
+print("Y3. an instance that has been superseded stands down")
+print("=" * 74)
+shutil.rmtree(DATA_DIR, ignore_errors=True)
+# A hot reload does not stop the instance it replaces: the host retires a plugin
+# by moving it to a list, never calls Shutdown, and a Go c-shared library is not
+# unloaded - so the old library keeps ticking with its own config and its own
+# circuit breaker. Two rotators writing credentials is the one failure this
+# component must not have, so the newest instance takes a lease.
+os.makedirs(DATA_DIR, exist_ok=True)
+with open(os.path.join(DATA_DIR, "rotator.lease"), "w") as fh:
+    json.dump({"instance": "someone-else", "version": "9.9.9", "at": int(time.time()) + 3600}, fh)
+rep = rotate({
+    "cred-a.json": {"disabled": False, "windows": [(WEEKF, 95, 400000)]},
+    "cred-b.json": {"disabled": False, "windows": [(WEEKF, 8, 400000)]},
+    "cred-c.json": {"disabled": True, "windows": [(WEEKF, 10, 400000)]},
+})
+check("a superseded instance writes nothing", len(saves()), 0)
+check("and says why", rep["last_reason"], "superseded")
+
+shutil.rmtree(DATA_DIR, ignore_errors=True)
+os.makedirs(DATA_DIR, exist_ok=True)
+# An older lease does not outrank a running instance, and a corrupt one must not
+# wedge the rotator shut.
+with open(os.path.join(DATA_DIR, "rotator.lease"), "w") as fh:
+    json.dump({"instance": "an-older-one", "version": "0.0.1", "at": 1}, fh)
+rep = rotate({
+    "cred-a.json": {"disabled": False, "windows": [(WEEKF, 95, 400000)]},
+    "cred-b.json": {"disabled": False, "windows": [(WEEKF, 8, 400000)]},
+    "cred-c.json": {"disabled": True, "windows": [(WEEKF, 10, 400000)]},
+})
+check("an older lease is overruled", len(saves()) > 0, True)
+
+shutil.rmtree(DATA_DIR, ignore_errors=True)
+os.makedirs(DATA_DIR, exist_ok=True)
+with open(os.path.join(DATA_DIR, "rotator.lease"), "w") as fh:
+    fh.write("{not json at all")
+rep = rotate({
+    "cred-a.json": {"disabled": False, "windows": [(WEEKF, 95, 400000)]},
+    "cred-b.json": {"disabled": False, "windows": [(WEEKF, 8, 400000)]},
+    "cred-c.json": {"disabled": True, "windows": [(WEEKF, 10, 400000)]},
+})
+check("a corrupt lease fails open", len(saves()) > 0, True)
+
+print()
+print("=" * 74)
 print("Z. the rules that decide which standby wins")
 print("=" * 74)
 shutil.rmtree(DATA_DIR, ignore_errors=True)
