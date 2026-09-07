@@ -89,9 +89,9 @@ const (
 // Stamped at build time so a fork does not have to edit source to identify
 // itself:
 //
-//	go build -ldflags "-X main.pluginVersion=2.3.2 -X main.repository=github.com/owner/repo"
+//	go build -ldflags "-X main.pluginVersion=2.5.5 -X main.repository=github.com/owner/repo"
 var (
-	pluginVersion = "2.3.2"
+	pluginVersion = "2.5.5"
 	pluginAuthor  = "tang12306"
 	repository    = "github.com/tang12306/cpa-plugin-codex-weekly-usd"
 )
@@ -235,6 +235,11 @@ func managementRegistration() json.RawMessage {
 		"routes": []map[string]any{
 			{"Method": "GET", "Path": "/" + pluginID + "/data"},
 			{"Method": "GET", "Path": "/" + pluginID + "/prices"},
+			// POST only: this one changes state, so it must not be reachable by
+			// following a link. It has to be declared here or the host answers
+			// 404 before the plugin is ever consulted - which is what happened
+			// from 2.3.0 until 2.4.2, with the handler present and unreachable.
+			{"Method": "POST", "Path": "/" + pluginID + "/rotate"},
 		},
 		// The resource route is NOT management-authenticated, so it serves only
 		// an inert HTML shell. The shell asks the operator for the management

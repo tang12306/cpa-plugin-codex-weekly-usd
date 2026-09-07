@@ -111,6 +111,46 @@ check("cumulative starts at baseline", pts[0][1] === pts[23][1], true);
 check("cumulative rises after", pts[47][1] < pts[23][1], true);
 check("cumulative is monotonic", pts.every((p, i) => i === 0 || p[1] <= pts[i - 1][1] + 1e-9), true);
 
+console.log();
+console.log("=".repeat(74));
+console.log("H. the line is a trailing window, not a running total");
+console.log("=".repeat(74));
+
+// Fourteen days of perfectly steady load: $1 an hour, never varying. A running
+// total climbs the whole way and says nothing except that time passed. The
+// trailing seven-day total flattens once the window fills - which is what
+// makes a change in it mean something.
+const steady = [];
+for (let ago = 335; ago >= 0; ago--) {
+  const h = 335 - ago;                       // hours since recording began
+  steady.push({ ago, usd: 1, requests: 1,
+                rolling_usd: Math.min(h + 1, 168),
+                rolling_partial: h + 1 < 168 });
+}
+const svgS = drawChart(steady, 1000, 165, true);
+const runs = [...svgS.matchAll(/<polyline[^>]*points='([^']+)'/g)]
+  .map(m => m[1].split(" ").map(p => p.split(",").map(Number)));
+check("a provisional run and a settled one", runs.length, 2);
+const settled = runs[1];
+check("the settled stretch is flat", settled[1][1] === settled[settled.length - 1][1], true);
+check("the provisional stretch is dashed", svgS.includes("stroke-dasharray='4 3'"), true);
+check("the axis tops out at the window, not the total", svgS.includes("$168.00"), true);
+check("and not at the fourteen-day total", svgS.includes("$336.00"), false);
+
+// Load that genuinely doubles must still show as a climb.
+const growing = steady.map((p, i) => ({ ...p,
+  rolling_usd: i < 200 ? Math.min(i + 1, 168) : 168 + (i - 200) }));
+const svgG = drawChart(growing, 1000, 165, true);
+const gRuns = [...svgG.matchAll(/<polyline[^>]*points='([^']+)'/g)]
+  .map(m => m[1].split(" ").map(p => p.split(",").map(Number)));
+const gLast = gRuns[gRuns.length - 1];
+check("real growth still rises", gLast[gLast.length - 1][1] < gLast[1][1], true);
+
+// A payload from an older build carries no rolling figure, and must still draw
+// rather than leaving the panel blank.
+check("falls back when the field is absent",
+  (drawChart(series, 1000, 165, true).match(/<polyline /g) || []).length, 1);
+
 const curve = drawQuotaCurve(series, 10080, 300, 96);
 check("quota curve renders", curve.startsWith("<svg"), true);
 check("curve has reference line", curve.includes("stroke-dasharray"), true);

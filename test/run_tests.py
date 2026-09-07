@@ -14,6 +14,9 @@ import subprocess
 import sys
 import time
 
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from probe_server import start_probe_server, start_socks5  # noqa: E402
+
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 BUILD = os.path.join(ROOT, "build")
 SO = os.path.join(ROOT, "codex-weekly-usd.so")
@@ -53,7 +56,7 @@ def config(price_url="", rotator=None):
 
 
 def usage(windows, model="gpt-5.6-sol", cache_read=0, failed=False, extra_headers=None,
-          auth="codex-demo-team.json"):
+          auth="codex-demo-team.json", index=None, status=0, body=""):
     """windows: list of (minutes, percent, reset_at) in slot order.
 
     The first entry is emitted as "primary" and the second as "secondary".
@@ -72,8 +75,11 @@ def usage(windows, model="gpt-5.6-sol", cache_read=0, failed=False, extra_header
         headers.update(extra_headers)
     return {
         "Provider": "codex", "ExecutorType": "codex", "Model": model, "Alias": "",
-        "AuthID": auth, "AuthIndex": "0", "AuthType": "codex",
+        "AuthID": auth, "AuthIndex": index or "0", "AuthType": "codex",
         "RequestedAt": "2026-08-27T04:00:00Z", "Failed": failed,
+        # The host has always sent this on a failed request; the plugin simply
+        # did not declare the field, so 401 looked like any other error.
+        "Failure": {"StatusCode": status, "Body": body},
         "Detail": {
             "InputTokens": IN_TOKENS, "OutputTokens": OUT_TOKENS,
             "ReasoningTokens": 12_000, "CachedTokens": cache_read,
@@ -533,44 +539,79 @@ print("=" * 74)
 # least as much as what it does. The harness answers host.auth.get from a
 # fixture and records every host.auth.save instead of applying it, so nothing
 # here can touch a real credential.
+# What upstream actually returns for a revoked credential: an explicit code,
+# and no quota headers of any kind.
+REVOKED_BODY = ('{"error":{"message":"Encountered invalidated oauth token for user, '
+                'failing request","code":"token_revoked"},"status":401}')
+
 ROT_DIR = os.path.join(BUILD, "rot")
+# One clock for every rotator fixture. Real reset times are fixed instants, so
+# two decisions inside one quota cycle must see the same ones; deriving them
+# from time.time() at each call would move the cycle boundary under the test.
+ROT_NOW = int(time.time())
 SAVE_LOG = os.path.join(ROT_DIR, "saves.jsonl")
 
 
 def rot_fixtures(creds):
     """creds: name -> dict(disabled, status, windows=[(minutes, percent, reset_in_s)]).
 
-    Writes the host.auth.get and host.http.do fixtures and returns the auth list
-    plus the environment the harness reads them from.
+    Writes the host.auth.get documents and the quota fixtures the local probe
+    server answers from, and returns the auth list, the harness environment, the
+    fixture directory and the absolute reset times so a test can seed the same
+    windows through live traffic instead of through a probe.
     """
     auth_dir = os.path.join(ROT_DIR, "auth")
     probe_dir = os.path.join(ROT_DIR, "probe")
+    live_dir = os.path.join(ROT_DIR, "live")
     shutil.rmtree(ROT_DIR, ignore_errors=True)
     os.makedirs(auth_dir)
     os.makedirs(probe_dir)
+    os.makedirs(live_dir)
 
-    now = int(time.time())
+    now = ROT_NOW
     auth_list = []
+    resets = {}
     for name, spec in creds.items():
         index = "idx-" + name
         token = "tok-" + name
         auth_list.append(authfile(name, disabled=spec.get("disabled", False), index=index))
+        doc = {"access_token": token, "account_id": "acct-" + name,
+               "refresh_token": "refresh-" + name,
+               "disabled": spec.get("disabled", False)}
+        if spec.get("proxy"):
+            doc["proxy_url"] = spec["proxy"]
+        entry = {"auth_index": index, "name": name, "json": doc}
+        if spec.get("with_path"):
+            # host.auth.get reports where the credential lives, and the plugin
+            # writes there directly: host.auth.save cannot turn a credential
+            # off, because the host rebuilds its record from the document
+            # without reading `disabled` and persists that back over the file.
+            live = os.path.join(live_dir, name)
+            with open(live, "w") as fh:
+                json.dump(doc, fh)
+            entry["path"] = live
         with open(os.path.join(auth_dir, index + ".json"), "w") as fh:
-            json.dump({"auth_index": index, "name": name,
-                       "json": {"access_token": token, "account_id": "acct-" + name,
-                                "refresh_token": "refresh-" + name,
-                                "disabled": spec.get("disabled", False)}}, fh)
+            json.dump(entry, fh)
         headers = {}
+        absolute = []
         for slot, (minutes, percent, reset_in) in zip(("Primary", "Secondary"),
                                                       spec.get("windows", [])):
+            absolute.append((minutes, percent, now + reset_in))
+        # probe_windows lets the probe answer with a different cycle from the
+        # one live traffic last saw - which is the real case a resync exists
+        # for: the traffic reading describes a window that has since rolled.
+        for slot, (minutes, percent, reset_in) in zip(("Primary", "Secondary"),
+                                                      spec.get("probe_windows",
+                                                               spec.get("windows", []))):
             headers["X-Codex-%s-Used-Percent" % slot] = [str(percent)]
             headers["X-Codex-%s-Window-Minutes" % slot] = [str(minutes)]
             headers["X-Codex-%s-Reset-At" % slot] = [str(now + reset_in)]
         headers["X-Codex-Plan-Type"] = [spec.get("plan", "team")]
+        resets[name] = absolute
         with open(os.path.join(probe_dir, token + ".json"), "w") as fh:
             json.dump({"StatusCode": spec.get("status", 200), "Headers": headers, "Body": ""}, fh)
-    return auth_list, {"HARNESS_AUTH_DIR": auth_dir, "HARNESS_PROBE_DIR": probe_dir,
-                       "HARNESS_SAVE_LOG": SAVE_LOG}
+    return (auth_list, {"HARNESS_AUTH_DIR": auth_dir, "HARNESS_PROBE_DIR": probe_dir,
+                        "HARNESS_SAVE_LOG": SAVE_LOG}, probe_dir, resets)
 
 
 def saves():
@@ -587,14 +628,50 @@ def saves():
     return out
 
 
-def rotate(creds, rotator=None, steps=None):
+# PROBES records every request the local probe server received during the last
+# rotate(), which is how the "this design barely probes" claims are measured
+# rather than asserted.
+PROBES = []
+SOCKS = [0]
+
+
+def rotate(creds, rotator=None, steps=None, seed=True):
+    """Drive one rotator decision.
+
+    seed=True replays each credential's window state through live traffic
+    first, which is the state production is actually in: the plugin sees every
+    response and records the quota headers off it. A test that skips seeding is
+    describing a credential nothing has ever reported on.
+    """
     settings = {"enabled": True, "keep_enabled": 2, "switch_at_percent": 10,
                 "check_interval_seconds": 3600, "min_switch_gap_minutes": 0,
                 "probe_model": "gpt-5.6-sol"}
+    auth_list, fixtures, probe_dir, resets = rot_fixtures(creds)
+    url, hits, socks_hits, shutdown = start_probe_server(probe_dir)
+    settings["probe_url"] = url
     settings.update(rotator or {})
-    auth_list, fixtures = rot_fixtures(creds)
-    return run(steps or [], auth_list=auth_list, rotator=settings, fixtures=fixtures,
-               route="rotate", method="POST")
+
+    pre = []
+    if seed:
+        for name, spec in creds.items():
+            if not spec.get("seed", True) or not resets.get(name):
+                continue
+            pre.append(("usage.handle", usage(resets[name], auth=name,
+                                              index="idx-" + name)))
+            if spec.get("fail_401"):
+                # What the proxy actually saw: a refused request, carrying a
+                # status code and no quota headers at all.
+                pre.append(("usage.handle", usage([], auth=name, index="idx-" + name,
+                                                  failed=True, status=401,
+                                                  body=REVOKED_BODY)))
+    try:
+        rep = run(pre + (steps or []), auth_list=auth_list, rotator=settings,
+                  fixtures=fixtures, route="rotate", method="POST")
+    finally:
+        shutdown()
+    PROBES[:] = hits
+    SOCKS[0] = socks_hits[0]
+    return rep
 
 
 WEEKF = 10080
@@ -606,6 +683,12 @@ rep = rotate({
 })
 check("a healthy pool is left alone", len(saves()), 0)
 check("and says so", rep["last_reason"], "pool_healthy")
+# The board has to describe the present, not the last rotation: a tick that
+# does nothing still refreshes it, which is affordable because ranking no
+# longer touches the network.
+board = {c["file"]: c["enabled"] for c in rep.get("candidates", [])}
+check("the board is refreshed even when nothing happens", len(board), 3)
+check("and reflects who is actually enabled", board.get("cred-c.json"), False)
 
 print()
 print("=" * 74)
@@ -690,8 +773,13 @@ check("the replacement is promoted", ("cred-c.json", False) in log, True)
 check("both happened, nothing else", len(log), 2)
 check("a dead standby is never promoted",
       any(name == "cred-e.json" and not disabled for name, disabled in log), False)
+# cred-e is refused upstream, and the panel says "never_observed" rather than
+# "dead_token" - which is the honest answer. cred-c filled the gap, so nothing
+# ever asked cred-e anything, and claiming to know it is dead would be claiming
+# knowledge this design deliberately does not buy. It finds out if it ever needs
+# it, and until then the account is not sent a single request.
 skips = {c["file"]: c.get("skipped") for c in rep["candidates"]}
-check("and is named as such", skips["cred-e.json"], "dead_token")
+check("an untried standby is not claimed to be dead", skips["cred-e.json"], "never_observed")
 
 print()
 print("=" * 74)
@@ -711,12 +799,15 @@ first = len(saves())
 check("the first rotation is allowed", first, 2)
 # The plugin keeps its budget in state.json, so a second process picks up where
 # the first left off - a proxy that bounces cannot spend the budget twice.
-auth_list, fixtures = rot_fixtures(creds)
+auth_list, fixtures, probe_dir, _ = rot_fixtures(creds)
+probe_url, _, _, stop_probe = start_probe_server(probe_dir)
 rep = run([], auth_list=auth_list, route="rotate", method="POST",
           rotator={"enabled": True, "keep_enabled": 2, "switch_at_percent": 10,
                    "check_interval_seconds": 3600, "min_switch_gap_minutes": 0,
-                   "max_changes_per_day": 2, "probe_model": "gpt-5.6-sol"},
+                   "max_changes_per_day": 2, "probe_model": "gpt-5.6-sol",
+                   "probe_url": probe_url},
           fixtures=fixtures)
+stop_probe()
 check("the budget survives a restart", rep["changes_today"], 2)
 check("and the second rotation writes nothing", len(saves()), 0)
 
@@ -838,6 +929,500 @@ rep = rotate({
     "cred-c.json": {"disabled": True, "windows": [(WEEKF, 10, 400000)]},
 })
 check("a window about to reset is not an outage", len(saves()), 0)
+
+print()
+print("=" * 74)
+print("AA. what probing actually costs")
+print("=" * 74)
+# The design claim is that upstream is asked almost nothing. These assertions
+# measure it at the socket: PROBES is one entry per request the probe server
+# actually received. The previous design sent roughly 1,100 requests in eight
+# hours, about 123 per credential, by re-asking questions it already had
+# answers to.
+shutil.rmtree(DATA_DIR, ignore_errors=True)
+rotate({
+    "cred-a.json": {"disabled": False, "windows": [(WEEKF, 5, 400000)]},
+    "cred-b.json": {"disabled": False, "windows": [(WEEKF, 8, 400000)]},
+    "cred-c.json": {"disabled": True, "windows": [(WEEKF, 0, 400000)]},
+})
+check("a healthy pool asks upstream nothing at all", len(PROBES), 0)
+
+shutil.rmtree(DATA_DIR, ignore_errors=True)
+# An idle standby cannot have spent quota since it was last seen, and when its
+# window closes the allowance is back. Both are arithmetic, so a standby whose
+# last reading was "spent" is picked without anyone being asked anything.
+rotate({
+    "cred-a.json": {"disabled": False, "windows": [(WEEKF, 96, 400000)]},
+    "cred-b.json": {"disabled": False, "windows": [(WEEKF, 8, 400000)]},
+    # Last seen fully spent, but that window closed a minute ago.
+    "cred-c.json": {"disabled": True, "windows": [(WEEKF, 100, -60)]},
+}, rotator={"confirm_before_switch": False, "resync_after_reset": False})
+log = saves()
+check("a rolled-over standby is promoted", ("cred-c.json", False) in log, True)
+# With both checks switched off the decision runs on arithmetic alone, which is
+# the claim being tested here. Left on, the rollover is verified once against
+# upstream - that is AI's subject, not this one's.
+check("and the decision itself asked upstream nothing", len(PROBES), 0)
+
+shutil.rmtree(DATA_DIR, ignore_errors=True)
+# A whole rotation costs two probes at the very most: one to check the estimate
+# that condemned the incumbent, one to check the replacement before it takes
+# traffic. Never more, and never per-tick.
+rotate({
+    "cred-a.json": {"disabled": False, "windows": [(WEEKF, 96, 400000)]},
+    "cred-b.json": {"disabled": False, "windows": [(WEEKF, 8, 400000)]},
+    "cred-c.json": {"disabled": True, "windows": [(WEEKF, 10, 400000)]},
+})
+check("a whole rotation costs at most two probes", len(PROBES) <= 2, True)
+check("and never asks one credential twice",
+      len(PROBES) == len({h["token"] for h in PROBES}), True)
+
+shutil.rmtree(DATA_DIR, ignore_errors=True)
+# The budget is per quota cycle and lives in state.json, so a second decision in
+# the same cycle - or after a restart - asks nothing further.
+creds = {
+    "cred-a.json": {"disabled": False, "windows": [(WEEKF, 96, 400000)]},
+    "cred-b.json": {"disabled": False, "status": 401, "windows": []},
+    "cred-c.json": {"disabled": True, "windows": [(WEEKF, 10, 400000)]},
+}
+rotate(creds)
+first = len(PROBES)
+check("the first decision spends probes", first > 0, True)
+rotate(creds, steps=[])
+check("a repeat decision in the same cycle spends none", len(PROBES), 0)
+
+shutil.rmtree(DATA_DIR, ignore_errors=True)
+# The rule that matters most: a credential upstream has refused is never asked
+# again. Only a fresh login can change the answer, and re-asking every couple of
+# minutes for hours is the least defensible traffic this plugin can produce.
+creds = {
+    "cred-a.json": {"disabled": False, "windows": [(WEEKF, 96, 400000)]},
+    "cred-b.json": {"disabled": False, "windows": [(WEEKF, 8, 400000)]},
+    "cred-c.json": {"disabled": True, "status": 401, "windows": []},
+    "cred-d.json": {"disabled": True, "status": 401, "windows": []},
+}
+rotate(creds)
+refused = {"tok-cred-c.json", "tok-cred-d.json"}
+check("a refused credential is asked once",
+      refused.issubset({h["token"] for h in PROBES}), True)
+rotate(creds)
+check("and never asked again", [h["token"] for h in PROBES if h["token"] in refused], [])
+
+print()
+print("=" * 74)
+print("AB. a probe leaves by the credential's own egress")
+print("=" * 74)
+# The defect this replaces: host.http.do builds its client with a nil auth, so
+# probes ignored proxy_url and left by the host's address - the account was seen
+# authenticating from somewhere its real traffic never appears.
+shutil.rmtree(DATA_DIR, ignore_errors=True)
+socks_count = [0]
+socks_url, stop_socks = start_socks5(socks_count)
+rotate({
+    "cred-a.json": {"disabled": False, "windows": [(WEEKF, 96, 400000)]},
+    "cred-b.json": {"disabled": False, "windows": [(WEEKF, 8, 400000)]},
+    "cred-c.json": {"disabled": True, "windows": [(WEEKF, 10, 400000)], "proxy": socks_url},
+})
+stop_socks()
+check("the probe went through the credential's proxy", socks_count[0] > 0, True)
+check("and still arrived", ("cred-c.json", False) in saves(), True)
+
+shutil.rmtree(DATA_DIR, ignore_errors=True)
+# The same, with a proxy that demands a password: the dialer speaks the
+# username/password sub-negotiation, not just the no-auth path.
+auth_count = [0]
+auth_url, stop_auth = start_socks5(auth_count, require_auth=("u", "p"))
+scheme, hostport = auth_url.split("://")
+rotate({
+    "cred-a.json": {"disabled": False, "windows": [(WEEKF, 96, 400000)]},
+    "cred-b.json": {"disabled": False, "windows": [(WEEKF, 8, 400000)]},
+    "cred-c.json": {"disabled": True, "windows": [(WEEKF, 10, 400000)],
+                    "proxy": "%s://u:p@%s" % (scheme, hostport)},
+})
+stop_auth()
+check("an authenticated proxy is handled too", auth_count[0] > 0, True)
+check("and the credential was promoted", ("cred-c.json", False) in saves(), True)
+
+shutil.rmtree(DATA_DIR, ignore_errors=True)
+# A proxy that cannot be reached must fail the probe, never fall back to a
+# direct dial: falling back is exactly the leak this design removes.
+rotate({
+    "cred-a.json": {"disabled": False, "windows": [(WEEKF, 96, 400000)]},
+    "cred-b.json": {"disabled": False, "windows": [(WEEKF, 8, 400000)]},
+    "cred-c.json": {"disabled": True, "windows": [(WEEKF, 10, 400000)],
+                    "proxy": "socks5://127.0.0.1:1"},
+})
+check("an unreachable proxy does not leak a direct probe",
+      [h for h in PROBES if h["token"] == "tok-cred-c.json"], [])
+check("and a credential it could not check is not promoted",
+      ("cred-c.json", False) in saves(), False)
+
+print()
+print("=" * 74)
+print("AC. a retirement actually lands on disk")
+print("=" * 74)
+# The defect this covers was measured in production: the rotator logged a
+# retirement, the file was written, and the host reverted it inside the same
+# second. host.auth.save rebuilds the host's own record from the document,
+# never reads `disabled`, and persists that record back. So when the host says
+# where the credential lives, the plugin writes there and lets the file watcher
+# - whose loader does read the field - apply it.
+shutil.rmtree(DATA_DIR, ignore_errors=True)
+rotate({
+    "cred-a.json": {"disabled": False, "windows": [(WEEKF, 96, 400000)], "with_path": True},
+    "cred-b.json": {"disabled": False, "windows": [(WEEKF, 8, 400000)], "with_path": True},
+    "cred-c.json": {"disabled": True, "windows": [(WEEKF, 10, 400000)], "with_path": True},
+})
+live = os.path.join(ROT_DIR, "live")
+on_disk = {n: json.load(open(os.path.join(live, n)))["disabled"]
+           for n in sorted(os.listdir(live))}
+check("the drained member is disabled on disk", on_disk["cred-a.json"], True)
+check("the replacement is enabled on disk", on_disk["cred-c.json"], False)
+check("the healthy member is left alone", on_disk["cred-b.json"], False)
+# And nothing went through the callback that cannot express a disable.
+check("the failing callback was not used", len(saves()), 0)
+
+shutil.rmtree(DATA_DIR, ignore_errors=True)
+# Every other field survives byte for byte: these documents hold refresh tokens
+# and a lossy round trip would quietly drop whatever the plugin does not model.
+rotate({
+    "cred-a.json": {"disabled": False, "windows": [(WEEKF, 96, 400000)], "with_path": True},
+    "cred-b.json": {"disabled": False, "windows": [(WEEKF, 8, 400000)], "with_path": True},
+    "cred-c.json": {"disabled": True, "windows": [(WEEKF, 10, 400000)],
+                    "with_path": True, "proxy": "socks5://127.0.0.1:9"},
+})
+kept = json.load(open(os.path.join(live, "cred-a.json")))
+check("the refresh token survived", kept.get("refresh_token"), "refresh-cred-a.json")
+check("the access token survived", kept.get("access_token"), "tok-cred-a.json")
+check("the account id survived", kept.get("account_id"), "acct-cred-a.json")
+
+print()
+print("=" * 74)
+print("AD. every route the panel uses is actually registered")
+print("=" * 74)
+# The handler for /rotate existed from 2.3.0 and the route was never declared,
+# so the host answered 404 before the plugin was consulted. The suite missed it
+# because it drives management.handle directly, which skips registration
+# entirely - so the registration is now asserted on its own terms.
+script([], os.path.join(BUILD, "reg.txt"), tail=False)
+with open(os.path.join(BUILD, "reg.txt"), "a") as fh:
+    fh.write("management.register\t{}\n")
+raw = subprocess.run([HARNESS, SO, os.path.join(BUILD, "reg.txt")], capture_output=True,
+                     text=True, env=dict(os.environ, HARNESS_AUTH_LIST="[]")).stdout
+declared = set()
+for blk in raw.split("--- "):
+    if blk.startswith("management.register"):
+        body = json.loads(blk.split("\n", 1)[1].strip())
+        for route in (body.get("result") or {}).get("routes", []):
+            declared.add((route["Method"], route["Path"]))
+check("the data route is declared", ("GET", "/codex-weekly-usd/data") in declared, True)
+check("the prices route is declared", ("GET", "/codex-weekly-usd/prices") in declared, True)
+check("the rotate route is declared", ("POST", "/codex-weekly-usd/rotate") in declared, True)
+check("and rotate is POST-only",
+      ("GET", "/codex-weekly-usd/rotate") in declared, False)
+
+print()
+print("=" * 74)
+print("AE. a 401 from live traffic is remembered, and costs no probe")
+print("=" * 74)
+# The gap this closes: a failure carrying no quota signal was treated as an
+# ordinary error and dropped, so `last_fail` was never set. But 401 is exactly
+# the failure no quota reading can describe - a refused request carries no
+# quota headers at all - so the one error that means "this credential is dead"
+# was the one deliberately forgotten. A credential refused at 07:19 was still
+# being reported at its last healthy percentage a day later.
+shutil.rmtree(DATA_DIR, ignore_errors=True)
+rep = run([
+    ("usage.handle", weekly(20, auth="cred-a.json")),
+    ("usage.handle", weekly(0, auth="cred-a.json", failed=True, status=401, body=REVOKED_BODY)),
+], auth_list=[authfile("cred-a.json")])
+row = cred(health(rep, "gpt-5.6-sol"))
+check("the credential reads as rejected", row["state"], "rejected")
+check("and upstream's own word for it is kept", row.get("reason"), "token_revoked")
+check("no cooldown is invented for it", "cooldown_in_seconds" in row, False)
+
+shutil.rmtree(DATA_DIR, ignore_errors=True)
+# 403 counts too, and a body that is not the shape we expect still yields
+# something better than silence.
+rep = run([
+    ("usage.handle", weekly(20, auth="cred-a.json")),
+    ("usage.handle", weekly(0, auth="cred-a.json", failed=True, status=403, body="nope")),
+], auth_list=[authfile("cred-a.json")])
+check("403 is a rejection too", cred(health(rep, "gpt-5.6-sol"))["state"], "rejected")
+check("an unparseable body falls back to the status",
+      cred(health(rep, "gpt-5.6-sol")).get("reason"), "http_403")
+
+shutil.rmtree(DATA_DIR, ignore_errors=True)
+# A success afterwards means someone logged the account back in.
+rep = run([
+    ("usage.handle", weekly(20, auth="cred-a.json")),
+    ("usage.handle", weekly(0, auth="cred-a.json", failed=True, status=401, body=REVOKED_BODY)),
+    ("usage.handle", weekly(22, auth="cred-a.json")),
+], auth_list=[authfile("cred-a.json")])
+check("a later success clears the rejection",
+      cred(health(rep, "gpt-5.6-sol"))["state"], "ok")
+
+shutil.rmtree(DATA_DIR, ignore_errors=True)
+# An ordinary failure is still not a rejection: a 500 or a dropped connection
+# says nothing about whether the credential is accepted.
+rep = run([
+    ("usage.handle", weekly(20, auth="cred-a.json")),
+    ("usage.handle", weekly(0, auth="cred-a.json", failed=True, status=500, body="boom")),
+], auth_list=[authfile("cred-a.json")])
+check("a 500 is not a rejection", cred(health(rep, "gpt-5.6-sol"))["state"], "ok")
+
+shutil.rmtree(DATA_DIR, ignore_errors=True)
+# And the rotator acts on it without asking upstream anything: live traffic
+# already answered the question a probe would have asked.
+rep = rotate({
+    "cred-a.json": {"disabled": False, "windows": [(WEEKF, 96, 400000)]},  # draining
+    "cred-b.json": {"disabled": False, "windows": [(WEEKF, 8, 400000)]},
+    # Plenty of headroom on paper, and refused in practice.
+    "cred-c.json": {"disabled": True, "windows": [(WEEKF, 9, 400000)], "fail_401": True},
+})
+skips = {c["file"]: c.get("skipped") for c in rep["candidates"]}
+check("a credential traffic saw refused is written off", skips["cred-c.json"], "dead_token")
+check("and no probe was spent finding that out",
+      [h for h in PROBES if h["token"] == "tok-cred-c.json"], [])
+
+print()
+print("=" * 74)
+print("AF. a deleted credential stops being listed")
+print("=" * 74)
+# Accounting for a credential whose auth file is gone is real history, but
+# showing it beside live credentials invites reading a deleted account as a
+# working one - and there is nothing left to act on.
+shutil.rmtree(DATA_DIR, ignore_errors=True)
+rep = run([
+    ("usage.handle", weekly(20, auth="cred-a.json")),
+    ("usage.handle", weekly(30, auth="cred-gone.json")),
+], auth_list=[authfile("cred-a.json")])
+listed = [a["auth_id"] for a in rep["accounts"]]
+check("the live credential is listed", "cred-a.json" in listed, True)
+check("the deleted one is not", "cred-gone.json" in listed, False)
+check("but it is accounted for", [r["auth_id"] for r in rep.get("removed", [])],
+      ["cred-gone.json"])
+check("and does not inflate the credential count", rep["totals"]["credentials"], 1)
+
+shutil.rmtree(DATA_DIR, ignore_errors=True)
+# The guard that matters: an auth list that came back empty is a failure to
+# ask, not evidence that every credential was deleted. Hiding everything then
+# would turn one bad reply into a blank panel.
+rep = run([
+    ("usage.handle", weekly(20, auth="cred-a.json")),
+    ("usage.handle", weekly(30, auth="cred-gone.json")),
+], auth_list=[])
+check("an empty auth list hides nothing", len(rep["accounts"]), 2)
+check("and reports nothing as removed", len(rep.get("removed", [])), 0)
+
+print()
+print("=" * 74)
+print("AG. the burn projection cannot retire a credential that still has quota")
+print("=" * 74)
+# Measured on the live fleet: 270 percentage points an hour. At that rate a
+# fifteen-minute lead time means "replace anything under 67% headroom" - the
+# floor never applies, and every credential is retired with a third of its
+# window spent and the rest parked until it resets.
+shutil.rmtree(DATA_DIR, ignore_errors=True)
+# The percentage has to move against priced traffic, or no calibration sample
+# is recorded and the burn rate stays zero - which would make this test pass
+# for the wrong reason.
+FAST = [("usage.handle", usage([(FIVEH, p, ROT_NOW + 9000)], auth="cred-a.json",
+                               index="idx-cred-a.json"))
+        for p in (0, 15, 30, 45)]
+rep = rotate({
+    "cred-a.json": {"disabled": False, "windows": [(FIVEH, 45, 9000)], "seed": False},
+    "cred-b.json": {"disabled": False, "windows": [(FIVEH, 8, 9000)]},
+    "cred-c.json": {"disabled": True, "windows": [(FIVEH, 5, 9000)]},
+}, rotator={"lead_time_minutes": 15, "switch_at_percent": 10}, steps=FAST)
+check("a credential at 55% headroom is left alone", len(saves()), 0)
+check("however fast it is burning", rep["last_reason"], "pool_healthy")
+
+shutil.rmtree(DATA_DIR, ignore_errors=True)
+# Near the floor the projection still does its job: it brings the replacement
+# forward by a check rather than waiting for the credential to hit zero.
+SPENT = [("usage.handle", usage([(FIVEH, p, ROT_NOW + 9000)], auth="cred-a.json",
+                                index="idx-cred-a.json"))
+         for p in (70, 78, 84, 88)]
+rep = rotate({
+    "cred-a.json": {"disabled": False, "windows": [(FIVEH, 88, 9000)], "seed": False},
+    "cred-b.json": {"disabled": False, "windows": [(FIVEH, 8, 9000)]},
+    "cred-c.json": {"disabled": True, "windows": [(FIVEH, 5, 9000)]},
+}, rotator={"lead_time_minutes": 15, "switch_at_percent": 10}, steps=SPENT)
+log = saves()
+check("but 12% headroom and burning is replaced", ("cred-c.json", False) in log, True)
+check("and the spent one steps down", ("cred-a.json", True) in log, True)
+
+print()
+print("=" * 74)
+print("AH. the panel describes now, not the last decision")
+print("=" * 74)
+# A boundary that has gone past used to clamp the countdown to zero and leave
+# it there for as long as the credential stayed idle - so the panel showed a
+# deadline that expired hours ago beside a percentage that stopped being true
+# at the same moment.
+shutil.rmtree(DATA_DIR, ignore_errors=True)
+rep = run([("usage.handle", usage([(FIVEH, 80, int(time.time()) - 600)],
+                                  auth="cred-a.json"))],
+          auth_list=[authfile("cred-a.json")])
+w = win(rep, FIVEH)
+check("the countdown is rolled forward, not clamped", w["reset_in_seconds"] > 0, True)
+check("and lands inside one period",
+      w["reset_in_seconds"] <= FIVEH * 60, True)
+check("the rollover is marked as inferred", w.get("reset_inferred"), True)
+check("and the percentage is flagged as stale", w.get("used_percent_stale"), True)
+check("without inventing a new percentage", w["used_percent"], 80.0)
+
+shutil.rmtree(DATA_DIR, ignore_errors=True)
+# A boundary still ahead is left exactly alone.
+rep = run([("usage.handle", usage([(FIVEH, 80, int(time.time()) + 3600)],
+                                  auth="cred-a.json"))],
+          auth_list=[authfile("cred-a.json")])
+w = win(rep, FIVEH)
+check("a live window is not marked inferred", w.get("reset_inferred"), None)
+check("nor its reading stale", w.get("used_percent_stale"), None)
+
+shutil.rmtree(DATA_DIR, ignore_errors=True)
+# The rotator board is derived per request. Reading it twice with a credential
+# switched off in between must show the change without any tick having run.
+rep = rotate({
+    "cred-a.json": {"disabled": False, "windows": [(WEEKF, 5, 400000)]},
+    "cred-b.json": {"disabled": False, "windows": [(WEEKF, 8, 400000)]},
+    "cred-c.json": {"disabled": True, "windows": [(WEEKF, 0, 400000)]},
+})
+board = {c["file"]: c["enabled"] for c in rep["candidates"]}
+check("the board reports who is enabled right now", board["cred-c.json"], False)
+check("and covers the whole pool", len(board), 3)
+
+print()
+print("=" * 74)
+print("AI. a window is re-read once after the clock says it reset")
+print("=" * 74)
+# Inferring the rollover is right in principle and worth checking against
+# upstream - once per boundary, which for a five-hour window is under five
+# requests a day. Doing it more often would be the old design again.
+shutil.rmtree(DATA_DIR, ignore_errors=True)
+rotate({
+    # Its reading describes a cycle that closed ten minutes ago.
+    "cred-a.json": {"disabled": False, "windows": [(FIVEH, 90, -600)]},
+    "cred-b.json": {"disabled": False, "windows": [(FIVEH, 8, 9000)]},
+    "cred-c.json": {"disabled": True, "windows": [(FIVEH, 5, 9000)]},
+})
+asked = [h["token"] for h in PROBES]
+check("the stale window is re-read", "tok-cred-a.json" in asked, True)
+check("and nothing else is disturbed", sorted(set(asked)), ["tok-cred-a.json"])
+
+shutil.rmtree(DATA_DIR, ignore_errors=True)
+# Turning it off means the inference stands on its own, and no request is made.
+rotate({
+    "cred-a.json": {"disabled": False, "windows": [(FIVEH, 90, -600)]},
+    "cred-b.json": {"disabled": False, "windows": [(FIVEH, 8, 9000)]},
+    "cred-c.json": {"disabled": True, "windows": [(FIVEH, 5, 9000)]},
+}, rotator={"resync_after_reset": False, "confirm_before_switch": False})
+check("with resync off nothing is asked", len(PROBES), 0)
+
+print()
+print("=" * 74)
+print("AJ. a re-read updates the plugin's own data, not just the rotator's view")
+print("=" * 74)
+# A probe that only reaches the rotator leaves the panel showing whatever
+# percentage live traffic last saw. The window stays marked inferred for good,
+# because nothing ever confirms it - which is the one thing the re-read was
+# for. The reading is the same measurement a served request would produce, so
+# it is folded into the accounting state the same way.
+shutil.rmtree(DATA_DIR, ignore_errors=True)
+rotate({
+    # Traffic last saw a cycle that closed ten minutes ago at 90% spent.
+    # Upstream now reports the new cycle: 3% spent, resetting in five hours.
+    "cred-a.json": {"disabled": False, "windows": [(FIVEH, 90, -600)],
+                    "probe_windows": [(FIVEH, 3, 18000)]},
+    "cred-b.json": {"disabled": False, "windows": [(FIVEH, 8, 9000)]},
+    "cred-c.json": {"disabled": True, "windows": [(FIVEH, 5, 9000)]},
+})
+check("the stale window was re-read",
+      "tok-cred-a.json" in [h["token"] for h in PROBES], True)
+# Read the panel back out of the state the run just wrote.
+rep = run([], auth_list=[authfile("cred-a.json")])
+w = win(rep, FIVEH)
+check("the accounting state took the new reading", w["used_percent"], 3.0)
+check("the window is no longer inferred", w.get("reset_inferred"), None)
+check("nor its reading stale", w.get("used_percent_stale"), None)
+check("and the countdown is real", w["reset_in_seconds"] > 3600, True)
+
+print()
+print("=" * 74)
+print("AK. the fleet series carries a trailing total, not a running one")
+print("=" * 74)
+# Spend accumulated since recording began only ever rises, so the line said
+# nothing beyond "time has passed". A trailing seven-day total is stationary:
+# flat under steady load, rising only when load actually grows.
+shutil.rmtree(DATA_DIR, ignore_errors=True)
+rep = run([("usage.handle", weekly(i)) for i in range(4)])
+pts = rep["fleet_series"]
+check("the series is emitted", len(pts) >= 1, True)
+check("every point carries a trailing total",
+      all("rolling_usd" in p for p in pts), True)
+# All four requests land in the current hour, so the trailing total for that
+# hour is simply what was spent in it.
+check("which sums the window ending at that hour", pts[-1]["rolling_usd"], COST * 4)
+# One hour of history cannot describe seven days, and saying so is the point:
+# the panel draws that stretch as provisional rather than as a real climb.
+check("and is flagged while the window is not covered",
+      pts[-1].get("rolling_partial"), True)
+
+print()
+print("=" * 74)
+print("AL. the hourly series is bounded by age, not by how many buckets exist")
+print("=" * 74)
+# Retention was guarded by the size of the map, which bounded nothing: most
+# hours carry no traffic, so the map stayed under the limit while the series
+# stretched far past the ten days it claimed. Measured in production: an
+# eighteen-day chart.
+shutil.rmtree(DATA_DIR, ignore_errors=True)
+os.makedirs(DATA_DIR, exist_ok=True)
+_hour = int(time.time()) // 3600
+json.dump({
+    "version": 3,
+    "accounts": {
+        "codex-demo-team.json": {
+            "auth_id": "codex-demo-team.json", "provider": "codex",
+            "hours": {
+                str(_hour - 400): {"r": 1, "u": 1.0},   # 16 days old
+                str(_hour - 250): {"r": 1, "u": 1.0},   # just past retention
+                str(_hour - 100): {"r": 1, "u": 1.0},   # inside it
+            },
+        }
+    },
+}, open(os.path.join(DATA_DIR, "state.json"), "w"))
+
+rep = run([("usage.handle", weekly(5))])
+ages = sorted(p["ago"] for p in rep["fleet_series"])
+# The chart covers a week; a bucket from sixteen days ago is gone from the
+# state entirely, and one from ten days ago is retained but not charted -
+# it is there to be summed into the trailing totals of the points that are.
+check("the chart covers a week, not everything ever seen", max(ages) < 168, True)
+check("the bucket inside the week is charted", 100 in ages, True)
+check("the one outside it is not", 250 in ages, False)
+check("and the new hour is there", 0 in ages, True)
+
+shutil.rmtree(DATA_DIR, ignore_errors=True)
+os.makedirs(DATA_DIR, exist_ok=True)
+# Loading is enough on its own: a file written by a build that bounded the
+# series by map size must not keep its overlong history until the clock happens
+# to tick into a new hour.
+json.dump({
+    "version": 3,
+    "accounts": {
+        "codex-demo-team.json": {
+            "auth_id": "codex-demo-team.json", "provider": "codex",
+            "hours": {str(_hour - 400): {"r": 1, "u": 1.0},
+                      str(_hour - 10): {"r": 1, "u": 1.0}},
+        }
+    },
+}, open(os.path.join(DATA_DIR, "state.json"), "w"))
+rep = run([], auth_list=[authfile("codex-demo-team.json")])
+ages = sorted(p["ago"] for p in rep.get("fleet_series") or [])
+check("loading alone drops what has aged out", ages, [10])
 
 print()
 print("=" * 74)

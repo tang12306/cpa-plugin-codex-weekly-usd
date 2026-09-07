@@ -3,6 +3,7 @@ package main
 import (
 	"encoding/json"
 	"strings"
+	"time"
 )
 
 type managementRequest struct {
@@ -47,11 +48,16 @@ func (a *App) HandleManagement(payload []byte) json.RawMessage {
 				[]byte(`{"error":"POST required"}`))
 		}
 		cfg := a.rot.config()
+		board := func(c RotatorConfig) []candidate {
+			return a.rot.board(a.authMetadata(), c, time.Now())
+		}
 		if !cfg.Enabled {
-			return marshalResponse(map[string]any{"error": "rotator is disabled", "rotator": a.rot.Report(cfg)})
+			return marshalResponse(map[string]any{
+				"error": "rotator is disabled", "rotator": a.rot.Report(cfg, board(cfg))})
 		}
 		a.rot.tick(true)
-		return marshalResponse(a.rot.Report(a.rot.config()))
+		cfg = a.rot.config()
+		return marshalResponse(a.rot.Report(cfg, board(cfg)))
 	default:
 		return marshalResponse(map[string]any{"error": "unknown route: " + req.Path})
 	}
@@ -246,16 +252,18 @@ const panelHTML = `<!doctype html>
       keyPlaceholder: "管理密钥", load: "加载", forget: "忘记密钥", exportJson: "导出 JSON",
       sortQuota: "按最长窗口额度排序", sortRemain: "按剩余排序", sortUsed: "按已用比例排序",
       sortPace: "按消耗节奏排序", sortName: "按名称排序",
-      chartTitle: "全部凭据 · 用量走势", legendBars: "每小时消耗（左轴）", legendLine: "累计消耗（右轴）",
+      chartTitle: "全部凭据 · 用量走势", legendBars: "每小时消耗（左轴）", legendLine: "近 7 天消耗（右轴）",
       pricesTitle: "当前生效价目表（美元 / 百万 token）",
       modelsTitle: "模型可用性",
       modelsHint: "CPA 的冷却是按「凭据 × 模型」的：上游对每个模型有独立额度，所以一个凭据完全可以" +
         "「astra 已耗尽、其它模型照跑」。某个模型的凭据全部冷却时，外部表现就是「只有这一个模型用不了」，" +
         "而凭据状态和渠道状态都会显示正常。冷却到期时间取自上游返回的 reset，与代理实际使用的是同一个。",
       mhModel: "模型", mhState: "状态", mhCap: "可用 / 凭据", mhBack: "最快恢复",
+      staleCycle: "窗口已重置，读数待确认",
       mhTraffic: "请求 / 失败", mhCreds: "各凭据状态", mhNone: "还没有模型可用性数据。",
       msDown: "全部冷却", msDegraded: "部分冷却", msOK: "正常", msSingle: "单点凭据",
       csCooling: "冷却", csRecovering: "待验证", csOK: "正常", csDisabled: "已停用",
+      csRejected: "凭据失效", rmRemoved: "{0} 个凭据已删除，不再显示：{1}",
       mhEstimated: "估计", mhBlocks: "累计 {0} 次冷却", mhReason: "原因：{0}",
       rotTitle: "凭据轮换",
       rotHint: "轮换器维持固定数量的凭据处于启用状态，在成员快耗尽之前把它换掉。" +
@@ -265,7 +273,8 @@ const panelHTML = `<!doctype html>
         "同时合格时优先用<b>更早作废</b>的额度。",
       rotOff: "未启用", rotDry: "空跑（只决策不写入）", rotOn: "运行中",
       rotPool: "池 {0} 个", rotFloor: "阈值 {0}%", rotSwept: "{0}前评估",
-      rotChanges: "今日 {0}/{1} 次改动",
+      rotChanges: "今日 {0}/{1} 次改动", rotProbes: "今日探测 {0} 次",
+      rotRefused: "{0} 个凭据已被上游拒绝",
       rtCred: "凭据", rtRole: "角色", rtHead: "余量", rtWindow: "绑定窗口",
       rtReset: "重置", rtServe: "可撑", rtVerdict: "判定",
       rtActive: "启用中", rtStandby: "备用",
@@ -326,7 +335,7 @@ const panelHTML = `<!doctype html>
       mtModel: "模型", mtReq: "请求", mtFail: "失败", mtIn: "输入", mtOut: "输出",
       mtCache: "缓存命中", mtPrice: "单价(入/出)", mtAvg: "均价/次", mtUsd: "金额",
       mtNoPrice: "无价目", mtReasoning: "(含推理 {0})",
-      capHourly: "每小时消耗", capCumulative: "累计",
+      capHourly: "每小时消耗", capCumulative: "近 7 天",
       capCurve: "额度百分比（{0}窗口）", capRef: "匀速参考线",
       capCurveHint: "曲线高过虚线 = 照此速度会在重置前用完",
       pModel: "模型", pIn: "输入", pOut: "输出", pCacheR: "缓存读", pCacheW: "缓存写",
@@ -342,7 +351,7 @@ const panelHTML = `<!doctype html>
         "<b>节奏</b>＝额度消耗比例 ÷ 窗口时间流逝比例，大于 1 表示照此速度会在重置前用完。" +
         "缓存读取与推理 token 分别是输入、输出的子集，不重复计费。",
       noData: "暂无数据", thisHour: "本小时", hoursAgo: "小时前", now: "现在",
-      total: "累计", reqs: "次",
+      total: "近 7 天", reqs: "次",
       unitDay: "天", unitHour: "小时", unitMin: "分",
       wDays: "{0} 天", wHours: "{0} 小时", wMins: "{0} 分",
       locale: "zh-CN"
@@ -353,7 +362,7 @@ const panelHTML = `<!doctype html>
       keyPlaceholder: "Management key", load: "Load", forget: "Forget key", exportJson: "Export JSON",
       sortQuota: "Sort by longest-window quota", sortRemain: "Sort by remaining", sortUsed: "Sort by used %",
       sortPace: "Sort by burn pace", sortName: "Sort by name",
-      chartTitle: "All credentials · usage", legendBars: "Hourly spend (left axis)", legendLine: "Cumulative (right axis)",
+      chartTitle: "All credentials · usage", legendBars: "Hourly spend (left axis)", legendLine: "Trailing 7 days (right axis)",
       pricesTitle: "Active rate card (USD per 1M tokens)",
       modelsTitle: "Model availability",
       modelsHint: "The proxy cools a credential down per model: upstream keeps a separate allowance " +
@@ -362,9 +371,11 @@ const panelHTML = `<!doctype html>
         "that one model is broken, while the credential and channel status both read as healthy. " +
         "Deadlines come from the reset upstream reported, the same one the proxy cools down to.",
       mhModel: "Model", mhState: "State", mhCap: "Available / credentials", mhBack: "First back",
+      staleCycle: "window has reset; reading not yet confirmed",
       mhTraffic: "Requests / failed", mhCreds: "Per credential", mhNone: "No model availability data yet.",
       msDown: "all cooling", msDegraded: "partly cooling", msOK: "healthy", msSingle: "single credential",
       csCooling: "cooling", csRecovering: "unverified", csOK: "ok", csDisabled: "disabled",
+      csRejected: "credential rejected", rmRemoved: "{0} deleted credential(s) not shown: {1}",
       mhEstimated: "estimated", mhBlocks: "{0} lockouts so far", mhReason: "reason: {0}",
       rotTitle: "Credential rotation",
       rotHint: "The rotator holds a fixed number of credentials enabled and replaces a member " +
@@ -378,7 +389,8 @@ const panelHTML = `<!doctype html>
         "soonest</b> is spent first.",
       rotOff: "off", rotDry: "dry run (decides, writes nothing)", rotOn: "running",
       rotPool: "pool of {0}", rotFloor: "floor {0}%", rotSwept: "evaluated {0} ago",
-      rotChanges: "{0}/{1} changes today",
+      rotChanges: "{0}/{1} changes today", rotProbes: "{0} probes today",
+      rotRefused: "{0} credential(s) refused upstream",
       rtCred: "Credential", rtRole: "Role", rtHead: "Headroom", rtWindow: "Binding window",
       rtReset: "Resets", rtServe: "Covers", rtVerdict: "Verdict",
       rtActive: "enabled", rtStandby: "standby",
@@ -442,7 +454,7 @@ const panelHTML = `<!doctype html>
       mtModel: "Model", mtReq: "Req", mtFail: "Failed", mtIn: "Input", mtOut: "Output",
       mtCache: "Cache hit", mtPrice: "Rate (in/out)", mtAvg: "Avg/req", mtUsd: "Spend",
       mtNoPrice: "no price", mtReasoning: "(incl. reasoning {0})",
-      capHourly: "hourly spend", capCumulative: "cumulative",
+      capHourly: "hourly spend", capCumulative: "trailing 7d",
       capCurve: "quota % ({0} window)", capRef: "constant-rate reference",
       capCurveHint: "above the dashed line = runs out before reset at this rate",
       pModel: "Model", pIn: "Input", pOut: "Output", pCacheR: "Cache read", pCacheW: "Cache write",
@@ -460,7 +472,7 @@ const panelHTML = `<!doctype html>
         "<b>Pace</b> = quota consumed ÷ clock elapsed; above 1 means it runs out before it resets. " +
         "Cache reads and reasoning tokens are subsets of input and output and are never billed twice.",
       noData: "No data", thisHour: "this hour", hoursAgo: "h ago", now: "now",
-      total: "Total", reqs: "req",
+      total: "Trailing 7d", reqs: "req",
       unitDay: "d", unitHour: "h", unitMin: "m",
       wDays: "{0}-day", wHours: "{0}-hour", wMins: "{0}-min",
       locale: "en-US"
@@ -514,7 +526,7 @@ const panelHTML = `<!doctype html>
   // them straight out of the served page and run them on their own.
   function chartLabels(L) {
     return L || { noData: "No data", thisHour: "this hour", hoursAgo: "h ago",
-                  now: "now", total: "Total", reqs: "req" };
+                  now: "now", total: "Trailing 7d", reqs: "req" };
   }
 
   function tok(v) {
@@ -549,15 +561,22 @@ const panelHTML = `<!doctype html>
     for (i = 0; i < series.length; i++) maxAgo = Math.max(maxAgo, series[i].ago);
     var span = Math.max(maxAgo, 23) + 1;
     var usdB = new Array(span), pctB = new Array(span), reqB = new Array(span);
-    for (i = 0; i < span; i++) { usdB[i] = 0; pctB[i] = null; reqB[i] = 0; }
+    var rollB = new Array(span), partB = new Array(span);
+    for (i = 0; i < span; i++) {
+      usdB[i] = 0; pctB[i] = null; reqB[i] = 0; rollB[i] = null; partB[i] = false;
+    }
     for (i = 0; i < series.length; i++) {
       var idx = span - 1 - series[i].ago;
       if (idx < 0 || idx >= span) continue;
       usdB[idx] += series[i].usd || 0;
       reqB[idx] += series[i].requests || 0;
       if (series[i].percent !== undefined && series[i].percent !== null) pctB[idx] = series[i].percent;
+      if (series[i].rolling_usd !== undefined && series[i].rolling_usd !== null) {
+        rollB[idx] = series[i].rolling_usd;
+        partB[idx] = !!series[i].rolling_partial;
+      }
     }
-    return { span: span, usd: usdB, pct: pctB, req: reqB };
+    return { span: span, usd: usdB, pct: pctB, req: reqB, roll: rollB, partial: partB };
   }
 
   function agoLabel(ago, L) {
@@ -575,9 +594,19 @@ const panelHTML = `<!doctype html>
     var maxU = 0, total = 0;
     for (i = 0; i < span; i++) { maxU = Math.max(maxU, b.usd[i]); total += b.usd[i]; }
     if (maxU <= 0) maxU = 1;
-    var cum = new Array(span), run = 0;
-    for (i = 0; i < span; i++) { run += b.usd[i]; cum[i] = run; }
-    var maxC = total > 0 ? total : 1;
+    // A trailing seven-day total, not a running one. Spend accumulated since
+    // the chart began only ever rises, so the line carried no information
+    // beyond "time passed"; this one is flat while load is steady and moves
+    // only when load does. Older builds sent no rolling figure, so fall back
+    // to the running total rather than drawing nothing.
+    var cum = new Array(span), maxC = 0, run = 0, haveRoll = false;
+    for (i = 0; i < span; i++) { if (b.roll[i] !== null) { haveRoll = true; break; } }
+    for (i = 0; i < span; i++) {
+      run += b.usd[i];
+      cum[i] = haveRoll ? (b.roll[i] === null ? null : b.roll[i]) : run;
+      if (cum[i] !== null) maxC = Math.max(maxC, cum[i]);
+    }
+    if (maxC <= 0) maxC = 1;
 
     var padL = showAxis ? 50 : 4, padR = showAxis ? 54 : 4;
     var padB = showAxis ? 18 : 12, padT = 8;
@@ -606,17 +635,37 @@ const panelHTML = `<!doctype html>
              " · " + usd(b.usd[i]) + " · " + b.req[i] + " " + L.reqs + "</title></rect>";
     }
 
-    // Cumulative spend. Flat stretches are idle hours; a steepening slope is
-    // spend accelerating.
-    var pts = [];
+    // Trailing spend. A flat line is steady load, a rising one is load
+    // genuinely growing. Where the seven days reach back past anything
+    // recorded the figure is short by an unknown amount, so that stretch is
+    // drawn dashed rather than presented as a real climb.
+    var cy = function (k) { return padT + ih - ih * cum[k] / maxC; };
+    var solid = [], dashed = [], lastY = null;
     for (i = 0; i < span; i++) {
-      pts.push(cx(i).toFixed(1) + "," + (padT + ih - ih * cum[i] / maxC).toFixed(1));
+      if (cum[i] === null) continue;
+      var pt = cx(i).toFixed(1) + "," + cy(i).toFixed(1);
+      if (b.partial[i]) {
+        dashed.push(pt);
+      } else {
+        // Join the two runs so the line has no gap where it becomes complete.
+        if (!solid.length && dashed.length) solid.push(dashed[dashed.length - 1]);
+        solid.push(pt);
+      }
+      lastY = cy(i);
     }
-    svg += "<polyline fill='none' stroke='var(--good)' stroke-width='2' " +
-           "stroke-linejoin='round' points='" + pts.join(" ") + "'/>";
-    svg += "<circle cx='" + cx(span - 1).toFixed(1) + "' cy='" +
-           (padT + ih - ih * cum[span - 1] / maxC).toFixed(1) +
-           "' r='3' fill='var(--good)'><title>" + L.total + " " + usd(total) + "</title></circle>";
+    if (dashed.length > 1) {
+      svg += "<polyline fill='none' stroke='var(--good)' stroke-width='2' opacity='.45' " +
+             "stroke-dasharray='4 3' stroke-linejoin='round' points='" + dashed.join(" ") + "'/>";
+    }
+    if (solid.length > 1) {
+      svg += "<polyline fill='none' stroke='var(--good)' stroke-width='2' " +
+             "stroke-linejoin='round' points='" + solid.join(" ") + "'/>";
+    }
+    if (lastY !== null) {
+      var lastV = cum[span - 1] === null ? 0 : cum[span - 1];
+      svg += "<circle cx='" + cx(span - 1).toFixed(1) + "' cy='" + lastY.toFixed(1) +
+             "' r='3' fill='var(--good)'><title>" + L.total + " " + usd(lastV) + "</title></circle>";
+    }
 
     if (showAxis) {
       svg += "<text x='" + padL + "' y='" + (h - 4) + "' font-size='10' fill='var(--muted)'>" +
@@ -705,10 +754,12 @@ const panelHTML = `<!doctype html>
     var e = w.estimate || {};
     var waiting = e.method === "none";
     var p = w.used_percent || 0;
+    var stale = !!w.used_percent_stale;
     var s = "<td><div class='wcell'>";
     s += "<div class='mlabel'><span>" + pct(p) + "</span><span>" +
          (w.time_progress_percent !== undefined ? pct(w.time_progress_percent) : "") + "</span></div>";
-    s += "<div class='meter'><i style='width:" + Math.min(100, p) + "%;background:" + heat(p) + "'></i></div>";
+    s += "<div class='meter'><i style='width:" + Math.min(100, p) + "%;background:" + heat(p) +
+         (stale ? ";opacity:.35" : "") + "'></i></div>";
     if (w.time_progress_percent !== undefined) {
       s += "<div class='meter'><i style='width:" + Math.min(100, w.time_progress_percent) +
            "%;background:var(--muted);opacity:.5'></i></div>";
@@ -716,7 +767,13 @@ const panelHTML = `<!doctype html>
     s += "<div class='sub2'>" + (waiting ? "<span class='tag'>" + t("watching") + "</span>"
          : t("left") + " <b>" + usd(e.remaining_usd) + "</b> / " + usd(e.quota_usd)) + "</div>";
     s += "<div class='sub2'>" + paceTag(w) + " <span class='tag'>" +
-         t("resetsIn", dur(w.reset_in_seconds)) + "</span></div>";
+         t("resetsIn", dur(w.reset_in_seconds)) + "</span>" +
+         // The window rolled over while nothing was watching, so the
+         // percentage above describes the cycle before last. Saying so beats
+         // showing it as current, and the next check replaces it with a real
+         // reading rather than a guess.
+         (w.reset_inferred ? " <span class='tag warn' title='" + esc(t("staleCycle")) +
+                             "'>?</span>" : "") + "</div>";
     return s + "</div></td>";
   }
 
@@ -864,12 +921,19 @@ const panelHTML = `<!doctype html>
   // otherwise have to dig out of the proxy log: why it is out, which window
   // filled up, and when it comes back.
   function credChip(c) {
-    var cls = { cooling: "bad", recovering: "warn", ok: "ok", disabled: "" }[c.state] || "";
+    var cls = { cooling: "bad", recovering: "warn", ok: "ok", disabled: "",
+                rejected: "bad" }[c.state] || "";
     var word = { cooling: t("csCooling"), recovering: t("csRecovering"),
-                 ok: t("csOK"), disabled: t("csDisabled") }[c.state] || c.state;
+                 ok: t("csOK"), disabled: t("csDisabled"),
+                 rejected: t("csRejected") }[c.state] || c.state;
     var label = esc(c.credential) + " · " + word;
     if (c.state === "cooling") {
       label += " " + dur(c.cooldown_in_seconds) + (c.cooldown_estimated ? "?" : "");
+    }
+    // A rejection does not expire, so a countdown would be a lie. What matters
+    // is how long it has been refused and why.
+    if (c.state === "rejected" && c.rejected_age_seconds !== undefined) {
+      label += " " + dur(c.rejected_age_seconds);
     }
     var tip = [];
     if (c.reason) tip.push(t("mhReason", c.reason));
@@ -906,6 +970,16 @@ const panelHTML = `<!doctype html>
     }
     if (r.max_changes_daily) {
       state += " <span class='tag'>" + t("rotChanges", r.changes_today || 0, r.max_changes_daily) + "</span>";
+    }
+    // On a working system this reads zero for days at a time. If it does not,
+    // the estimator has stopped being able to answer from stored readings and
+    // that is worth seeing before upstream sees it.
+    if (r.probes_today !== undefined) {
+      state += " <span class='tag" + (r.probes_today > 20 ? " warn" : "") + "'>" +
+               t("rotProbes", r.probes_today) + "</span>";
+    }
+    if (r.probes_refused_credentials) {
+      state += " <span class='tag bad'>" + t("rotRefused", r.probes_refused_credentials) + "</span>";
     }
     el("rot-status").innerHTML = state;
 
@@ -1010,6 +1084,16 @@ const panelHTML = `<!doctype html>
       return !a.longest || !a.longest.estimate || a.longest.estimate.method === "none";
     });
     if (waiting.length) note("warn", t("warnWaiting", waiting.length, accounts.length));
+
+    // Credentials whose auth file was deleted are no longer listed among the
+    // live ones - a deleted account read as a working one is worse than not
+    // seeing it - but saying so beats them vanishing without explanation.
+    var gone = data.removed || [];
+    if (gone.length) {
+      note("", t("rmRemoved", gone.length, gone.map(function (r) {
+        return String(r.auth_id).replace(/^codex-/, "").replace(/\.json$/, "");
+      }).join(", ")));
+    }
 
     // One summary block per window length: the 5-hour and the weekly limit are
     // separate quotas, and the same spend counts against both.

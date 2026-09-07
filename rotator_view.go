@@ -66,6 +66,65 @@ func (a *App) observedWindows(e authEntry) ([]windowReading, int64) {
 	return out, newest
 }
 
+// trafficRejection reports whether live traffic has seen upstream refuse this
+// credential outright, and has not seen it work since.
+//
+// This is the cheapest evidence there is - it costs nothing, because the
+// requests were being made anyway - and it is the only evidence that a
+// credential is dead which does not require asking. Without it a revoked
+// credential keeps being ranked on its last healthy quota reading, which is
+// exactly what happened: one refused at 07:19 was still being reported at 9%
+// headroom a day later.
+func (a *App) trafficRejection(e authEntry) (bool, string, int64) {
+	acct := a.accountFor(e)
+	if acct == nil {
+		return false, "", 0
+	}
+	a.mu.Lock()
+	defer a.mu.Unlock()
+
+	rejected, reason, at := false, "", int64(0)
+	for _, h := range acct.Models {
+		if h == nil || !h.Rejected {
+			continue
+		}
+		if h.RejectedAt > at {
+			rejected, reason, at = true, h.Reason, h.RejectedAt
+		}
+	}
+	return rejected, reason, at
+}
+
+// observeWindows folds a probe's reading into the accounting state, exactly as
+// a served request's headers would be.
+//
+// Without it a probe only ever reaches the rotator's own view: the panel keeps
+// showing whatever percentage live traffic last saw, and a window the clock
+// said had rolled over stays marked inferred for good, because nothing ever
+// confirms it. That was the whole point of re-reading it.
+//
+// Movement with no spend of ours behind it is recorded as unexplained, which is
+// the truth: from this plugin's side the credential was idle, so anything that
+// moved was spent by something else.
+func (a *App) observeWindows(e authEntry, windows []windowReading, now time.Time) {
+	if len(windows) == 0 {
+		return
+	}
+	acct := a.accountFor(e)
+	if acct == nil {
+		return
+	}
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	for _, r := range windows {
+		if r.Minutes <= 0 {
+			continue
+		}
+		acct.window(r.Minutes).advance(r, now)
+	}
+	a.dirty = true
+}
+
 // burnRates measures percentage points consumed per hour, per window length,
 // from the calibration samples of the last hour.
 //

@@ -48,8 +48,44 @@ type usageRecord struct {
 	AuthType     string              `json:"AuthType"`
 	RequestedAt  time.Time           `json:"RequestedAt"`
 	Failed       bool                `json:"Failed"`
+	Failure      usageFailure        `json:"Failure"`
 	Detail       Tokens              `json:"Detail"`
 	Headers      map[string][]string `json:"ResponseHeaders"`
+}
+
+// usageFailure is the host's account of why a request failed.
+//
+// It has been arriving on every failed request since the ABI gained it and was
+// simply not declared here, so the status code was discarded. That mattered:
+// 401 and 403 are the one failure a quota reading can never describe, because a
+// refused request carries no quota headers at all.
+type usageFailure struct {
+	StatusCode int    `json:"StatusCode"`
+	Body       string `json:"Body"`
+}
+
+// rejected reports an authentication failure - upstream has stopped accepting
+// this credential outright, as opposed to refusing this one request.
+func (f usageFailure) rejected() bool {
+	return f.StatusCode == 401 || f.StatusCode == 403
+}
+
+// reason extracts upstream's own name for the refusal, so the panel can say
+// "token_revoked" rather than just "401". The body is small and JSON; anything
+// unexpected falls back to the status code.
+func (f usageFailure) reason() string {
+	var parsed struct {
+		Error struct {
+			Code    string `json:"code"`
+			Message string `json:"message"`
+		} `json:"error"`
+	}
+	if json.Unmarshal([]byte(f.Body), &parsed) == nil {
+		if code := strings.TrimSpace(parsed.Error.Code); code != "" {
+			return code
+		}
+	}
+	return fmt.Sprintf("http_%d", f.StatusCode)
 }
 
 // windowReading is one quota window as reported on a single upstream response.
@@ -106,9 +142,18 @@ type HourAgg struct {
 	CacheRead int64   `json:"c"`
 }
 
-// hourRetention bounds the series at ten days, comfortably more than the
-// longest quota window.
-const hourRetention = 240
+// rollingHours is both the span the fleet chart covers and the trailing window
+// its line sums: seven days, matching the window the weekly quota is
+// denominated in.
+const rollingHours = 168
+
+// hourRetention is deliberately twice the chart span. A point can only carry a
+// complete trailing total if a full week of buckets sits behind it, so keeping
+// only as much history as the chart shows would leave the whole chart
+// provisional - retaining a second week is what makes every visible point a
+// real figure. Buckets are seven numbers each, so the extra week costs
+// nothing worth counting.
+const hourRetention = rollingHours * 2
 
 // Sample is one calibration observation: a percentage step and the spend that
 // produced it.
@@ -577,6 +622,9 @@ func (acct *Account) recordHour(now time.Time, cost float64, rec usageRecord, rl
 	if bucket == nil {
 		bucket = &HourAgg{}
 		acct.Hours[key] = bucket
+		// A new hour is the cheapest moment to drop what has aged out, and it
+		// happens once an hour rather than once a request.
+		acct.pruneHours(hour)
 	}
 	bucket.Requests++
 	bucket.USD += cost
@@ -592,12 +640,19 @@ func (acct *Account) recordHour(now time.Time, cost float64, rec usageRecord, rl
 		bucket.Percent = w.Percent
 	}
 
-	if len(acct.Hours) > hourRetention+24 {
-		cutoff := hour - hourRetention
-		for k := range acct.Hours {
-			if h, err := strconv.ParseInt(k, 10, 64); err == nil && h < cutoff {
-				delete(acct.Hours, k)
-			}
+}
+
+// pruneHours drops buckets older than the retention window.
+//
+// This used to be guarded by the size of the map, which did not bound age at
+// all: most hours carry no traffic, so the map stayed well under the limit
+// while the series stretched far past the retention it claimed to enforce -
+// eighteen days of chart against a ten-day bound, measured in production.
+func (acct *Account) pruneHours(hour int64) {
+	cutoff := hour - hourRetention
+	for k := range acct.Hours {
+		if h, err := strconv.ParseInt(k, 10, 64); err == nil && h < cutoff {
+			delete(acct.Hours, k)
 		}
 	}
 }
@@ -765,6 +820,11 @@ func (a *App) loadState() {
 		if v.Hours == nil {
 			v.Hours = map[string]*HourAgg{}
 		}
+		// Prune on load as well as on the hour. Otherwise a file written by a
+		// build that bounded the series by map size keeps its overlong history
+		// until the clock happens to tick into a new hour, and the chart goes
+		// on covering weeks in the meantime.
+		v.pruneHours(time.Now().Unix() / 3600)
 		if v.Models == nil {
 			v.Models = map[string]*ModelHealth{}
 		}
@@ -952,9 +1012,23 @@ func lookupAuth(entries []authEntry, acct *Account) (authEntry, bool) {
 // goroutine writes to it is a fatal runtime error, not a recoverable panic, and
 // in a c-shared library that takes the whole proxy down with it. Credential
 // metadata is fetched before the lock is taken because that path locks too.
+// config returns a copy of the live configuration without holding the state
+// lock for longer than the read.
+func (a *App) config() Config {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return a.cfg
+}
+
 func (a *App) Report() map[string]any {
 	now := time.Now()
 	entries := a.authMetadata()
+
+	// Worked out before the state lock, because deriving it reads the same
+	// accounting state this function is about to hold: taking that lock twice
+	// deadlocks. It is derived per request rather than served from the last
+	// decision so that refreshing the panel actually refreshes something.
+	rotatorBoard := a.rot.board(entries, a.config().Rotator, now)
 
 	a.mu.Lock()
 	defer a.mu.Unlock()
@@ -967,6 +1041,9 @@ func (a *App) Report() map[string]any {
 	staleAfter := time.Duration(cfg.StaleAfterMinutes) * time.Minute
 
 	rows := make([]map[string]any, 0, len(accounts))
+	// Accounts whose credential the host no longer lists. Kept apart rather
+	// than dropped so the panel can still account for what they spent.
+	removed := make([]map[string]any, 0)
 	// Warnings are structured rather than prose: the panel renders them in the
 	// language the operator picked, so the text cannot live here.
 	warnings := make([]map[string]any, 0)
@@ -990,23 +1067,38 @@ func (a *App) Report() map[string]any {
 			w := acct.Windows[strconv.Itoa(m)]
 			est := w.Estimate()
 			entry := map[string]any{
-				"minutes":              w.Minutes,
-				"label":                windowLabel(w.Minutes),
-				"used_percent":         round2(w.Percent),
-				"usd_observed":         round4(w.USD),
-				"requests":             w.Requests,
-				"failed":               w.Failed,
-				"saved_usd":            round4(w.SavedUSD),
-				"tokens":               w.Tokens,
-				"full_coverage":        w.FullCoverage,
-				"cycles":               w.Cycles,
-				"granted_resets":       w.GrantedResets,
-				"unexplained_percent":  round2(w.UnexplainedPct),
-				"estimate":             est,
-				"by_model":             modelRows(a, w),
+				"minutes":             w.Minutes,
+				"label":               windowLabel(w.Minutes),
+				"used_percent":        round2(w.Percent),
+				"usd_observed":        round4(w.USD),
+				"requests":            w.Requests,
+				"failed":              w.Failed,
+				"saved_usd":           round4(w.SavedUSD),
+				"tokens":              w.Tokens,
+				"full_coverage":       w.FullCoverage,
+				"cycles":              w.Cycles,
+				"granted_resets":      w.GrantedResets,
+				"unexplained_percent": round2(w.UnexplainedPct),
+				"estimate":            est,
+				"by_model":            modelRows(a, w),
 			}
 			if w.ResetAt > 0 {
+				// Roll a boundary that has already gone past forward by whole
+				// periods. Without this the countdown clamps to zero and stays
+				// there for as long as the credential is idle, so the panel
+				// shows a deadline that expired hours ago next to a percentage
+				// that stopped being true at the same moment. The percentage is
+				// left exactly as upstream last reported it - inventing a reset
+				// value would be worse than admitting the reading is old - and
+				// flagged, so the panel can say it is believed rather than seen.
 				reset := time.Unix(w.ResetAt, 0)
+				if w.Minutes > 0 && !reset.After(now) {
+					period := int64(w.Minutes) * 60
+					elapsed := now.Unix() - w.ResetAt
+					reset = time.Unix(w.ResetAt+(elapsed/period+1)*period, 0)
+					entry["reset_inferred"] = true
+					entry["used_percent_stale"] = true
+				}
 				entry["reset_at"] = reset.UTC().Format(time.RFC3339)
 				entry["reset_in_seconds"] = int64(math.Max(0, time.Until(reset).Seconds()))
 			}
@@ -1080,17 +1172,17 @@ func (a *App) Report() map[string]any {
 		}
 
 		row := map[string]any{
-			"auth_id":        acct.AuthID,
-			"provider":       acct.Provider,
-			"plan_type":      acct.PlanType,
-			"active_limit":   acct.ActiveLimit,
-			"credits":        acct.Credits,
-			"has_quota_data": len(windows) > 0,
-			"windows":        windows,
-			"binding":        binding,
-			"longest":        longest,
-			"total_usd":      round4(acct.TotalUSD),
-			"total_requests": acct.TotalReqs,
+			"auth_id":           acct.AuthID,
+			"provider":          acct.Provider,
+			"plan_type":         acct.PlanType,
+			"active_limit":      acct.ActiveLimit,
+			"credits":           acct.Credits,
+			"has_quota_data":    len(windows) > 0,
+			"windows":           windows,
+			"binding":           binding,
+			"longest":           longest,
+			"total_usd":         round4(acct.TotalUSD),
+			"total_requests":    acct.TotalReqs,
 			"unpriced_requests": acct.UnpricedReqs,
 			"series":            seriesOf(acct, now),
 		}
@@ -1126,6 +1218,21 @@ func (a *App) Report() map[string]any {
 			row["disabled"] = entry.Disabled
 			row["status"] = entry.Status
 			row["unavailable"] = entry.Unavailable
+		} else if len(entries) > 0 {
+			// The host no longer lists this credential: the auth file was
+			// deleted. Its accounting is real history and stays in state.json,
+			// but showing it beside live credentials invites reading a deleted
+			// account as a working one - and it cannot be acted on, since there
+			// is nothing left to enable. The guard on len(entries) matters: an
+			// auth list that came back empty is a failure to ask, not evidence
+			// that every credential was deleted.
+			removed = append(removed, map[string]any{
+				"auth_id":        acct.AuthID,
+				"total_usd":      round4(acct.TotalUSD),
+				"total_requests": acct.TotalReqs,
+				"last_seen":      row["observed_at"],
+			})
+			continue
 		} else {
 			row["label"] = acct.AuthID
 		}
@@ -1157,6 +1264,10 @@ func (a *App) Report() map[string]any {
 		})
 	}
 
+	sort.Slice(removed, func(i, j int) bool {
+		return fmt.Sprint(removed[i]["auth_id"]) < fmt.Sprint(removed[j]["auth_id"])
+	})
+
 	priceSnapshot := a.prices.Snapshot()
 	if msg, _ := priceSnapshot["last_error"].(string); msg != "" {
 		warnings = append(warnings, map[string]any{"code": "price_refresh_failed", "message": msg})
@@ -1166,7 +1277,7 @@ func (a *App) Report() map[string]any {
 	// go in front of the accounting ones.
 	models, modelWarnings := modelHealth(entries, accounts, now)
 	warnings = append(modelWarnings, warnings...)
-	rotatorReport := a.rot.Report(cfg.Rotator)
+	rotatorReport := a.rot.Report(cfg.Rotator, rotatorBoard)
 	if extra, _ := rotatorReport["warnings"].([]map[string]any); len(extra) > 0 {
 		warnings = append(extra, warnings...)
 	}
@@ -1180,6 +1291,7 @@ func (a *App) Report() map[string]any {
 		"price_fetched":   priceSnapshot["fetched_at"],
 		"data_dir":        cfg.DataDir,
 		"accounts":        rows,
+		"removed":         removed,
 		"warnings":        warnings,
 		"models":          models,
 		"rotator":         rotatorReport,
@@ -1196,9 +1308,9 @@ func (a *App) Report() map[string]any {
 }
 
 type windowTotals struct {
-	Minutes                            int
-	Credentials, Estimated, AtRisk     int
-	QuotaUSD, SpentUSD, RemainingUSD   float64
+	Minutes                          int
+	Credentials, Estimated, AtRisk   int
+	QuotaUSD, SpentUSD, RemainingUSD float64
 }
 
 func modelRows(a *App, w *Window) []map[string]any {
@@ -1338,15 +1450,43 @@ func fleetSeries(accounts []*Account, now time.Time) []map[string]any {
 	sort.Slice(hours, func(i, j int) bool { return hours[i] < hours[j] })
 
 	nowHour := now.Unix() / 3600
+	oldest := hours[0]
 	out := make([]map[string]any, 0, len(hours))
 	for _, h := range hours {
+		// The chart covers a week. Older buckets are still retained, because
+		// the trailing totals of the points that are shown are summed out of
+		// them.
+		if nowHour-h >= rollingHours {
+			continue
+		}
 		bucket := merged[h]
-		out = append(out, map[string]any{
-			"ago":      nowHour - h,
-			"usd":      round6(bucket.USD),
-			"requests": bucket.Requests,
-			"failed":   bucket.Failed,
-		})
+		// A trailing seven-day total rather than a running one. Spend
+		// accumulated since the chart began only ever rises, so the line says
+		// nothing except that time has passed; a rolling window is stationary,
+		// so it is flat while load is steady, climbs when load actually grows,
+		// and falls when it eases. Seven days because that is the window the
+		// quota itself is denominated in.
+		var rolling float64
+		for x := h - rollingHours + 1; x <= h; x++ {
+			if b := merged[x]; b != nil {
+				rolling += b.USD
+			}
+		}
+		point := map[string]any{
+			"ago":         nowHour - h,
+			"usd":         round6(bucket.USD),
+			"requests":    bucket.Requests,
+			"failed":      bucket.Failed,
+			"rolling_usd": round6(rolling),
+		}
+		// Before this point the seven days reach back past anything retained,
+		// so the total is short by an unknown amount rather than genuinely
+		// lower. Saying so lets the panel draw it as provisional instead of
+		// presenting a ramp that is an artefact of when recording started.
+		if h-rollingHours+1 < oldest {
+			point["rolling_partial"] = true
+		}
+		out = append(out, point)
 	}
 	return out
 }

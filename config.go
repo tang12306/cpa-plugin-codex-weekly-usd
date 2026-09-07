@@ -33,11 +33,11 @@ type Config struct {
 
 	// LongContextThreshold enables the OpenAI long-context surcharge above the
 	// given prompt size. Zero disables it.
-	LongContextThreshold int64   `yaml:"long_context_threshold"`
+	LongContextThreshold  int64   `yaml:"long_context_threshold"`
 	LongContextMultiplier float64 `yaml:"long_context_multiplier"`
 
 	// EventLog writes one JSON line per request for auditing the estimate.
-	EventLog        bool `yaml:"event_log"`
+	EventLog         bool `yaml:"event_log"`
 	EventLogKeepDays int  `yaml:"event_log_keep_days"`
 
 	// FlushSeconds debounces state writes so the hot path stays in memory.
@@ -98,10 +98,32 @@ type RotatorConfig struct {
 	// ProbeModel is the model named in the probe request. It must be one the
 	// account can actually call, or every probe reads as a failure.
 	ProbeModel string `yaml:"probe_model"`
+	// ProbeURL is the endpoint a probe is sent to. It exists as a setting so
+	// the probe path can be exercised end to end against a local server -
+	// dialer, headers and quota parsing included - rather than against a stub
+	// of itself. Leaving it unset uses the real Codex endpoint.
+	ProbeURL string `yaml:"probe_url"`
 	// DisableDeadTokens switches off a credential upstream has stopped
 	// accepting. Disabling is the safe direction: it removes capacity that was
 	// not working anyway.
 	DisableDeadTokens bool `yaml:"disable_dead_tokens"`
+	// ConfirmBeforeSwitch spends one probe to check an estimate before acting
+	// on it: once on the incumbent the estimate says is nearly spent, once on
+	// the replacement about to take over. With this off the rotator switches on
+	// the estimate alone and makes no upstream request at all.
+	ConfirmBeforeSwitch bool `yaml:"confirm_before_switch"`
+	// ResyncAfterReset spends one probe on a window the clock says has reset,
+	// once per boundary. effectiveWindows infers the rollover rather than
+	// reading it, which is right in principle and worth checking: for a
+	// five-hour window that is under five requests a day, for a weekly one
+	// about one, and it is the only thing that would notice the inference being
+	// wrong or the panel showing a percentage that stopped being true hours
+	// ago.
+	ResyncAfterReset bool `yaml:"resync_after_reset"`
+	// MaxProbesPerDayPerCredential is the backstop. The per-cycle rule below
+	// should already hold probing to a handful a day; this bounds the damage if
+	// some reading never settles and the per-cycle rule keeps renewing.
+	MaxProbesPerDayPerCredential int `yaml:"max_probes_per_day_per_credential"`
 	// NeverEnable and NeverDisable are the manual override, by file name.
 	NeverEnable  []string `yaml:"never_enable"`
 	NeverDisable []string `yaml:"never_disable"`
@@ -130,7 +152,12 @@ func defaultConfig() Config {
 			MinSwitchGapMinutes:  10,
 			MaxChangesPerDay:     20,
 			ProbeModel:           "gpt-5.6-sol",
+			ProbeURL:             probeURL,
 			DisableDeadTokens:    true,
+			ConfirmBeforeSwitch:  true,
+			ResyncAfterReset:     true,
+
+			MaxProbesPerDayPerCredential: 6,
 		},
 	}
 }
@@ -196,8 +223,14 @@ func (rc *RotatorConfig) normalize(def RotatorConfig) {
 	if strings.TrimSpace(rc.ProbeModel) == "" {
 		rc.ProbeModel = def.ProbeModel
 	}
+	if strings.TrimSpace(rc.ProbeURL) == "" {
+		rc.ProbeURL = def.ProbeURL
+	}
 	if strings.TrimSpace(rc.Provider) == "" {
 		rc.Provider = def.Provider
+	}
+	if rc.MaxProbesPerDayPerCredential <= 0 {
+		rc.MaxProbesPerDayPerCredential = def.MaxProbesPerDayPerCredential
 	}
 }
 

@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"math"
+	"net/http"
 	"os"
 	"path/filepath"
 	"sort"
@@ -45,6 +46,21 @@ const (
 	// a five-hour window that resets in two minutes is not a reason to reject a
 	// candidate.
 	probeMinRelief = 5 * time.Minute
+	// projectionCeiling bounds what the burn-rate projection may retire, as a
+	// multiple of the headroom floor.
+	//
+	// Lead time is denominated in minutes, but a minute is worth whatever the
+	// current burn says it is. Measured on this fleet: 270 percentage points an
+	// hour, at which a fifteen-minute lead means "replace anything under 67%
+	// headroom" - it spends a third of a window and parks the rest until the
+	// window resets. The floor never gets a chance to apply.
+	//
+	// The projection is only meant to cover the blind spot between two checks,
+	// and the pool's second member already makes a handover invisible: crossing
+	// the floor between checks costs one 429 that the proxy retries on the next
+	// credential, not an outage. So the projection may bring a replacement
+	// forward, but never while the incumbent still has real headroom left.
+	projectionCeiling = 2.0
 )
 
 // Reasons a candidate was passed over, reported on the panel so a decision can
@@ -56,6 +72,8 @@ const (
 	skipProbeFailed = "probe_failed"
 	skipExcluded    = "excluded_by_config"
 	skipRecent      = "recently_rotated"
+	skipUnknown     = "never_observed"
+	skipProbeBudget = "probe_budget_spent"
 )
 
 // probeResult is one credential's standing, read straight from upstream.
@@ -68,6 +86,14 @@ type probeResult struct {
 	PlanType   string          `json:"plan_type,omitempty"`
 	Credits    creditInfo      `json:"credits"`
 	Error      string          `json:"error,omitempty"`
+	// Derived marks a standing worked out from stored readings rather than
+	// asked of upstream. Unknown marks one where nothing is stored at all, so
+	// the credential can neither be trusted nor written off without asking.
+	Derived bool `json:"-"`
+	Unknown bool `json:"-"`
+	// Rolled marks a standing whose window was only believed to have reset,
+	// worked out from the clock rather than read from upstream.
+	Rolled bool `json:"-"`
 }
 
 // alive reports whether this reading shows a credential that can serve. A 429
@@ -101,6 +127,25 @@ type candidate struct {
 	Plan      string  `json:"plan_type,omitempty"`
 }
 
+// probeMemo is what one probe taught us, kept so the same question is not asked
+// again inside the same quota cycle - and, for a refusal, so it is not asked
+// again at all until someone logs the account back in.
+type probeMemo struct {
+	At    int64 `json:"at"`
+	Epoch int64 `json:"epoch,omitempty"`
+	// DayKey and DayCount are the backstop budget, per credential per day.
+	DayKey     string `json:"day_key,omitempty"`
+	DayCount   int    `json:"day_count,omitempty"`
+	StatusCode int    `json:"status_code,omitempty"`
+	Rejected   bool   `json:"rejected,omitempty"`
+	// Fingerprint identifies the access token a refusal describes. When it
+	// changes the account has been logged back in and the refusal is stale, so
+	// the credential becomes probeable again without anyone clearing state by
+	// hand. It is a hash: the token itself must not reach state.json.
+	Fingerprint string `json:"fingerprint,omitempty"`
+	Reason      string `json:"reason,omitempty"`
+}
+
 type switchRecord struct {
 	At     int64  `json:"at"`
 	Action string `json:"action"`
@@ -111,18 +156,21 @@ type switchRecord struct {
 
 // RotatorState is the part of the rotator that outlives a restart.
 type RotatorState struct {
-	LastSweep   int64          `json:"last_sweep,omitempty"`
-	LastSwitch  int64          `json:"last_switch,omitempty"`
-	DayKey      string         `json:"day_key,omitempty"`
-	DayCount    int            `json:"day_count,omitempty"`
-	Log         []switchRecord `json:"log,omitempty"`
-	LastReason  string         `json:"last_reason,omitempty"`
-	LastCandids []candidate    `json:"last_candidates,omitempty"`
+	LastSweep  int64          `json:"last_sweep,omitempty"`
+	LastSwitch int64          `json:"last_switch,omitempty"`
+	DayKey     string         `json:"day_key,omitempty"`
+	DayCount   int            `json:"day_count,omitempty"`
+	Log        []switchRecord `json:"log,omitempty"`
+	LastReason string         `json:"last_reason,omitempty"`
 	// HealthyEnabled and RecoversAt describe the last shortfall: how many pool
 	// members could still serve, and when the first passed-over candidate is due
 	// back. They are what separates "degraded" from "down".
 	HealthyEnabled int   `json:"healthy_enabled,omitempty"`
 	RecoversAt     int64 `json:"recovers_at,omitempty"`
+	// Probes is the probe ledger, by credential file name. It has to outlive a
+	// restart: without it every restart would re-probe every credential,
+	// including ones already known to be refused.
+	Probes map[string]probeMemo `json:"probes,omitempty"`
 }
 
 // rotatorLease names the one instance allowed to write credentials.
@@ -172,7 +220,19 @@ func (r *rotator) leasePath() string {
 
 // claimLease announces this instance. Written before the first tick so an
 // instance being replaced sees it on its next pass.
+//
+// It will not take the lease from a newer instance. Writing unconditionally
+// would let an older library - which a hot reload leaves running, because the
+// host never unloads one - claim the wheel back merely by starting up, which is
+// precisely the collision the lease exists to prevent.
 func (r *rotator) claimLease() {
+	if raw, errRead := os.ReadFile(r.leasePath()); errRead == nil {
+		var held rotatorLease
+		if json.Unmarshal(raw, &held) == nil &&
+			held.Instance != "" && held.Instance != r.instance && held.At > r.startedAt {
+			return
+		}
+	}
 	body, err := json.Marshal(rotatorLease{Instance: r.instance, Version: pluginVersion, At: r.startedAt})
 	if err != nil {
 		return
@@ -211,8 +271,9 @@ func (r *rotator) loop(stop <-chan struct{}) {
 
 	cfg := r.config()
 	r.claimLease()
-	// One sweep at startup answers "where does the fleet actually stand", which
-	// is otherwise unknowable for a credential no traffic has touched.
+	// One pass at startup, once the host has settled. It reaches upstream only
+	// if the pool is genuinely short and the derived picture cannot say why -
+	// on a running system with traffic history it makes no request at all.
 	time.Sleep(20 * time.Second)
 	r.tick(true)
 
@@ -265,8 +326,43 @@ func (r *rotator) tick(force bool) {
 		return
 	}
 
+	now := time.Now()
 	enabled, standby := splitPool(entries, cfg)
-	short, why := r.poolShortfall(enabled, cfg)
+	pool := append(append([]authEntry{}, enabled...), standby...)
+
+	// Judge the whole pool from what is already known. Live traffic keeps a
+	// reading fresh for anything that is serving, and an idle credential's
+	// quota is arithmetic rather than a question - so this step reaches
+	// upstream not at all, which is what the overwhelming majority of ticks
+	// now cost.
+	results := r.derive(pool, now)
+
+	// Publish the picture on every tick, including the ones that do nothing.
+	// Ranking is arithmetic now, so this costs nothing - and a board that only
+	// refreshes when the rotator acts shows the state as of the last rotation
+	// while presenting it as the present.
+	r.publish(now)
+
+	// A window the clock says has reset is a belief, not a reading. This is the
+	// one place worth checking it against upstream, and the budget makes it at
+	// most once per boundary: under five requests a day for a five-hour window,
+	// about one for a weekly one. It runs whether or not the pool is short,
+	// because its job is to keep what the panel reports something observed
+	// rather than something inferred hours ago.
+	if cfg.ResyncAfterReset {
+		for _, e := range pool {
+			res := results[e.Name]
+			if !res.Rolled {
+				continue
+			}
+			if allowed, _ := r.probeAllowed(e, res, cfg, now); !allowed {
+				continue
+			}
+			results[e.Name] = r.ask(e, res, cfg, now, "re-reading a window the clock says has reset")
+		}
+	}
+
+	short, why := r.poolShortfall(enabled, results, cfg)
 	if !force && short <= 0 {
 		r.note(why)
 		return
@@ -275,19 +371,85 @@ func (r *rotator) tick(force bool) {
 	// The circuit breaker is honoured even when a human pressed the button: it
 	// exists to stop the rotator doing damage quickly, and a manual trigger is
 	// not evidence that this time is different.
-	now := time.Now()
 	if !r.mayAct(now, cfg) {
 		return
 	}
 
-	pool := append(append([]authEntry{}, enabled...), standby...)
-	results := r.sweep(pool, cfg)
+	// The estimate says the pool is short. That claim is worth one probe before
+	// anything is switched on the strength of it: an estimate that has drifted
+	// would otherwise retire a credential that was still perfectly able to
+	// serve. This is the first of the two probes a rotation can cost.
+	if cfg.ConfirmBeforeSwitch {
+		for _, e := range enabled {
+			res := results[e.Name]
+			if state, _ := r.memberState(e, res, cfg); state == "healthy" {
+				continue
+			}
+			if allowed, _ := r.probeAllowed(e, res, cfg, now); !allowed {
+				continue
+			}
+			results[e.Name] = r.ask(e, res, cfg, now, "confirming an incumbent the estimate calls spent")
+		}
+		short, why = r.poolShortfall(enabled, results, cfg)
+		if short <= 0 {
+			// The estimate had drifted and the incumbent is fine. One probe was
+			// a great deal cheaper than the rotation it just prevented.
+			r.note(why)
+			return
+		}
+	}
+
 	candidates := r.rank(results, pool, cfg)
 
-	r.mu.Lock()
-	r.state.LastSweep = now.Unix()
-	r.state.LastCandids = candidates
-	r.mu.Unlock()
+	// Only when the credentials we do have readings for cannot fill the gap is
+	// it worth asking about one nothing has ever reported on. That happens at
+	// most once per credential ever: afterwards there is a reading to derive
+	// from.
+	if r.countPicks(candidates, short) < short {
+		asked := false
+		for _, c := range candidates {
+			if c.Skip != skipUnknown {
+				continue
+			}
+			e, found := entryFor(pool, c.File)
+			if !found {
+				continue
+			}
+			if allowed, _ := r.probeAllowed(e, results[c.File], cfg, now); !allowed {
+				continue
+			}
+			results[c.File] = r.ask(e, results[c.File], cfg, now, "no reading has ever covered this credential")
+			asked = true
+		}
+		if asked {
+			candidates = r.rank(results, pool, cfg)
+		}
+	}
+
+	// Confirm each replacement before it takes real traffic. This is the second
+	// of the two probes, and the one that pays for itself: a standby whose
+	// token was revoked while it sat idle looks perfect in the derived picture,
+	// because by construction nothing has asked it anything since. Promoting it
+	// would hand callers a failure instead of the handover they were promised.
+	if cfg.ConfirmBeforeSwitch {
+		asked := false
+		for _, c := range r.picksFrom(candidates, short) {
+			e, found := entryFor(pool, c.File)
+			if !found {
+				continue
+			}
+			if allowed, _ := r.probeAllowed(e, results[c.File], cfg, now); !allowed {
+				continue
+			}
+			results[c.File] = r.ask(e, results[c.File], cfg, now, "confirming a replacement before it takes traffic")
+			asked = true
+		}
+		if asked {
+			candidates = r.rank(results, pool, cfg)
+		}
+	}
+
+	r.publish(now)
 
 	// A credential upstream has refused contributes nothing, so switching it off
 	// cannot reduce capacity - and it has to happen here rather than after a
@@ -303,22 +465,13 @@ func (r *rotator) tick(force bool) {
 	// may have been stale, and a sweep that finds everything healthy should end
 	// without touching anything.
 	enabled, standby = splitPool(r.app.authMetadata(), cfg)
-	short, why = r.poolShortfall(enabled, cfg)
+	short, why = r.poolShortfall(enabled, r.derive(enabled, now), cfg)
 	if short <= 0 {
 		r.note(why)
 		return
 	}
 
-	picks := make([]candidate, 0, short)
-	for _, c := range candidates {
-		if len(picks) >= short {
-			break
-		}
-		if c.Enabled || c.Skip != "" {
-			continue
-		}
-		picks = append(picks, c)
-	}
+	picks := r.picksFrom(candidates, short)
 	if len(picks) == 0 {
 		// Never empty the pool because there is nothing to replace it with.
 		// Whatever is enabled stays enabled, and the panel says why.
@@ -367,18 +520,72 @@ func (r *rotator) tick(force bool) {
 		return
 	}
 
-	r.retireDrained(enabled, cfg, len(promoted), touched)
+	r.retireDrained(enabled, results, cfg, len(promoted), touched)
 	r.note(fmt.Sprintf("rotated: promoted %d", len(promoted)))
 	r.mu.Lock()
 	r.state.LastSwitch = now.Unix()
 	r.mu.Unlock()
 }
 
+// board is the rotator's current picture, worked out when it is asked for
+// rather than served from the last decision.
+//
+// Serving a stored copy meant the panel showed the state as of the last
+// rotation and called it the present - refreshing by hand changed nothing,
+// because nothing recomputed. Deriving costs no upstream request and is
+// arithmetic over a handful of credentials, so there is no reason to cache it.
+func (r *rotator) board(entries []authEntry, cfg RotatorConfig, now time.Time) []candidate {
+	enabled, standby := splitPool(entries, cfg)
+	pool := append(append([]authEntry{}, enabled...), standby...)
+	if len(pool) == 0 {
+		return nil
+	}
+	return r.rank(r.derive(pool, now), pool, cfg)
+}
+
+// publish records when the rotator last evaluated the pool.
+func (r *rotator) publish(now time.Time) {
+	r.mu.Lock()
+	r.state.LastSweep = now.Unix()
+	r.mu.Unlock()
+	r.app.markDirty()
+}
+
+// picksFrom takes the best promotable candidates, up to the number needed.
+func (r *rotator) picksFrom(candidates []candidate, short int) []candidate {
+	picks := make([]candidate, 0, short)
+	for _, c := range candidates {
+		if len(picks) >= short {
+			break
+		}
+		if c.Enabled || c.Skip != "" {
+			continue
+		}
+		picks = append(picks, c)
+	}
+	return picks
+}
+
+// countPicks reports how many of the gap the known-good candidates can fill.
+func (r *rotator) countPicks(candidates []candidate, short int) int {
+	return len(r.picksFrom(candidates, short))
+}
+
+// entryFor finds the auth entry a candidate was scored from.
+func entryFor(entries []authEntry, file string) (authEntry, bool) {
+	for _, e := range entries {
+		if e.Name == file {
+			return e, true
+		}
+	}
+	return authEntry{}, false
+}
+
 // poolShortfall counts how many healthy members the pool is missing.
-func (r *rotator) poolShortfall(enabled []authEntry, cfg RotatorConfig) (int, string) {
+func (r *rotator) poolShortfall(enabled []authEntry, results map[string]probeResult, cfg RotatorConfig) (int, string) {
 	healthy := 0
 	for _, e := range enabled {
-		if state, _ := r.memberState(e, cfg); state == "healthy" {
+		if state, _ := r.memberState(e, results[e.Name], cfg); state == "healthy" {
 			healthy++
 		}
 	}
@@ -403,9 +610,8 @@ type windowView struct {
 	Burn      float64 // percentage points per hour
 }
 
-func (r *rotator) viewOf(e authEntry) []windowView {
+func (r *rotator) viewOf(e authEntry, windows []windowReading) []windowView {
 	rates := r.app.burnRates(e)
-	windows := r.windowsOf(e)
 	out := make([]windowView, 0, len(windows))
 	for _, w := range windows {
 		v := windowView{Minutes: w.Minutes, Headroom: 100 - w.Percent, ReliefMin: -1, Burn: rates[w.Minutes]}
@@ -426,22 +632,26 @@ func (r *rotator) viewOf(e authEntry) []windowView {
 
 // memberState judges one enabled credential from whatever reading is newest -
 // live traffic if it has been serving, otherwise the last probe.
-func (r *rotator) memberState(e authEntry, cfg RotatorConfig) (string, float64) {
+func (r *rotator) memberState(e authEntry, res probeResult, cfg RotatorConfig) (string, float64) {
 	// A credential upstream has stopped accepting contributes nothing, and it
 	// has no windows to judge, so without this it would read as healthy and the
 	// pool would never look short enough to replace it.
-	r.mu.Lock()
-	probe, probed := r.probes[e.Name]
-	r.mu.Unlock()
-	if probed && !probe.alive() {
+	if !res.alive() {
 		return "dead", 0
 	}
 
-	views := r.viewOf(e)
+	views := r.viewOf(e, res.Windows)
+	if len(views) == 0 && res.Unknown {
+		// A pool member nothing has ever reported on is not healthy and not
+		// broken - it is unmeasured, which is the one state worth spending a
+		// probe to leave. Reporting it as healthy would mean a credential
+		// revoked while it sat idle keeps its place in the pool and fails every
+		// request routed to it.
+		return "unknown", 100
+	}
 	if len(views) == 0 {
-		// Never observed and never probed. Treated as healthy so an idle
-		// standby does not trigger a sweep on its own; a real shortfall shows
-		// up as soon as it starts serving.
+		// A reading exists but describes no window: nothing to judge, and
+		// nothing a probe would add.
 		return "healthy", 100
 	}
 
@@ -463,6 +673,12 @@ func (r *rotator) memberState(e authEntry, cfg RotatorConfig) (string, float64) 
 			continue
 		}
 		if v.Burn <= 0 {
+			continue
+		}
+		// However fast it is burning, a credential with real headroom left is
+		// not spent. Without this the projection swallows the floor whole under
+		// heavy load and retires credentials at half a window.
+		if v.Headroom > projectionCeiling*cfg.SwitchAtPercent {
 			continue
 		}
 		// Project the current burn forward. Without this a five-minute check
@@ -487,31 +703,190 @@ func (r *rotator) memberState(e authEntry, cfg RotatorConfig) (string, float64) 
 	return "healthy", worst
 }
 
-// windowsOf prefers a fresh probe and falls back to what live traffic recorded.
-func (r *rotator) windowsOf(e authEntry) []windowReading {
-	r.mu.Lock()
-	probe, ok := r.probes[e.Name]
-	r.mu.Unlock()
-
-	fromTraffic, trafficAt := r.app.observedWindows(e)
-	if ok && len(probe.Windows) > 0 && (trafficAt == 0 || probe.At >= trafficAt) {
-		return probe.Windows
+// effectiveWindows applies the one thing that can be known about an idle
+// credential without asking upstream: a window whose reset time has passed is
+// empty again.
+//
+// This is what makes routine probing unnecessary. A credential that is not
+// serving cannot be spending quota, so its usage can only do one of two things:
+// stay exactly where the last reading left it, or - the moment the window
+// closes - drop to zero. Both are arithmetic. Upstream is only worth asking
+// about a credential nothing has ever reported on.
+//
+// The reset is rolled forward by whole periods rather than set to a single
+// cycle, so a reading left over from several cycles ago still lands on the
+// right boundary instead of one in the past.
+func effectiveWindows(windows []windowReading, now time.Time) ([]windowReading, bool) {
+	out := make([]windowReading, 0, len(windows))
+	rolled := false
+	for _, w := range windows {
+		if w.ResetAt > 0 && now.Unix() >= w.ResetAt && w.Minutes > 0 {
+			period := int64(w.Minutes) * 60
+			elapsed := now.Unix() - w.ResetAt
+			w.ResetAt += (elapsed/period + 1) * period
+			w.Percent = 0
+			rolled = true
+		}
+		out = append(out, w)
 	}
-	return fromTraffic
+	return out, rolled
 }
 
-// sweep probes every credential once. Errors are recorded rather than raised:
-// one unreachable account must not stop the rotation.
-func (r *rotator) sweep(entries []authEntry, cfg RotatorConfig) map[string]probeResult {
+// derive works out every credential's standing from what is already known, and
+// makes no upstream request at all. Live traffic supplies a fresh reading for
+// anything that is serving; effectiveWindows supplies one for anything that is
+// not.
+func (r *rotator) derive(entries []authEntry, now time.Time) map[string]probeResult {
 	out := make(map[string]probeResult, len(entries))
 	for _, e := range entries {
-		res := r.probe(e, cfg)
-		out[e.Name] = res
+		res := probeResult{File: e.Name, Index: e.AuthIndex, Derived: true, At: now.Unix()}
+
+		// A refusal outranks any stored reading: a credential upstream will not
+		// accept has no headroom worth ranking, however full its last reading
+		// looked. Live traffic is checked first because it is free and because
+		// it covers credentials no probe has ever touched.
+		if rejected, reason, at := r.app.trafficRejection(e); rejected {
+			res.StatusCode = http.StatusUnauthorized
+			res.At = at
+			res.Error = reason
+			out[e.Name] = res
+			continue
+		}
+		if memo, ok := r.memo(e.Name); ok && memo.Rejected {
+			res.StatusCode = memo.StatusCode
+			res.At = memo.At
+			out[e.Name] = res
+			continue
+		}
+
 		r.mu.Lock()
-		r.probes[e.Name] = res
+		probe, hasProbe := r.probes[e.Name]
 		r.mu.Unlock()
+		traffic, trafficAt := r.app.observedWindows(e)
+
+		switch {
+		case hasProbe && len(probe.Windows) > 0 && (trafficAt == 0 || probe.At >= trafficAt):
+			res.Windows, res.Rolled = effectiveWindows(probe.Windows, now)
+			res.PlanType, res.Credits = probe.PlanType, probe.Credits
+		case len(traffic) > 0:
+			res.Windows, res.Rolled = effectiveWindows(traffic, now)
+		default:
+			res.Unknown = true
+		}
+		out[e.Name] = res
 	}
 	return out
+}
+
+// memo reads one credential's probe ledger entry.
+func (r *rotator) memo(file string) (probeMemo, bool) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	m, ok := r.state.Probes[file]
+	return m, ok
+}
+
+// probeEpoch labels the quota cycle a reading belongs to. Two probes inside one
+// cycle answer the same question, so the second is waste. The soonest reset
+// governs: that is the window whose state actually changes.
+func probeEpoch(windows []windowReading, now time.Time) int64 {
+	best := int64(0)
+	for _, w := range windows {
+		if w.ResetAt <= 0 {
+			continue
+		}
+		if best == 0 || w.ResetAt < best {
+			best = w.ResetAt
+		}
+	}
+	if best > 0 {
+		return best
+	}
+	// Nothing to key on. An hour is short enough to make progress on a
+	// credential no reading covers, and long enough to be invisible.
+	return now.Truncate(time.Hour).Unix()
+}
+
+// probeAllowed decides whether upstream may be asked about this credential now.
+// Every clause here exists because its absence produced real probing volume:
+// the previous design sent roughly 1,100 requests in eight hours by re-asking
+// questions it already had answers to, including of credentials it had already
+// been told were revoked.
+func (r *rotator) probeAllowed(e authEntry, res probeResult, cfg RotatorConfig, now time.Time) (bool, string) {
+	if contains(cfg.NeverEnable, e.Name) {
+		return false, skipExcluded
+	}
+	memo, ok := r.memo(e.Name)
+	if !ok {
+		return true, ""
+	}
+	// A credential upstream has refused stays refused until its token changes.
+	// Re-asking cannot make it work - only a fresh login can - and asking
+	// repeatedly is the least defensible traffic this plugin can generate.
+	if memo.Rejected {
+		token, _, _, errCred := r.credential(e)
+		if errCred != nil || tokenFingerprint(token) == memo.Fingerprint {
+			return false, skipDeadToken
+		}
+		return true, ""
+	}
+	if memo.DayKey == now.UTC().Format("2006-01-02") && memo.DayCount >= cfg.MaxProbesPerDayPerCredential {
+		return false, skipProbeBudget
+	}
+	if memo.Epoch > 0 && memo.Epoch == probeEpoch(res.Windows, now) {
+		return false, skipProbeBudget
+	}
+	return true, ""
+}
+
+// ask probes one credential, once, and books it against the budget. It is the
+// only path in this file that reaches upstream.
+func (r *rotator) ask(e authEntry, res probeResult, cfg RotatorConfig, now time.Time, why string) probeResult {
+	fresh := r.probe(e, cfg)
+	// Roll before anything reads the reading. derive() applies the same
+	// arithmetic, and if the budget were keyed to the raw boundary while the
+	// derived picture used the rolled one, the two would never agree and the
+	// resync would repeat on every tick until the daily cap stopped it.
+	if len(fresh.Windows) > 0 {
+		fresh.Windows, _ = effectiveWindows(fresh.Windows, now)
+	}
+
+	memo := probeMemo{At: now.Unix(), StatusCode: fresh.StatusCode, Reason: why}
+	if prev, ok := r.memo(e.Name); ok && prev.DayKey == now.UTC().Format("2006-01-02") {
+		memo.DayCount = prev.DayCount
+	}
+	memo.DayKey = now.UTC().Format("2006-01-02")
+	memo.DayCount++
+	// Key the budget to the reading we just got when there is one, so it renews
+	// when the window does; otherwise to the reading we were working from.
+	if len(fresh.Windows) > 0 {
+		memo.Epoch = probeEpoch(fresh.Windows, now)
+	} else {
+		memo.Epoch = probeEpoch(res.Windows, now)
+	}
+	if fresh.rejected() {
+		memo.Rejected = true
+		if token, _, _, errCred := r.credential(e); errCred == nil {
+			memo.Fingerprint = tokenFingerprint(token)
+		}
+	}
+
+	r.mu.Lock()
+	if r.state.Probes == nil {
+		r.state.Probes = map[string]probeMemo{}
+	}
+	r.state.Probes[e.Name] = memo
+	if len(fresh.Windows) > 0 || fresh.rejected() {
+		r.probes[e.Name] = fresh
+	}
+	r.mu.Unlock()
+
+	// The reading is worth as much to the accounting side as to this one: it is
+	// the same measurement a served request would have produced.
+	r.app.observeWindows(e, fresh.Windows, now)
+	r.app.markDirty()
+
+	return fresh
 }
 
 // probe asks upstream for one credential's quota. The request is the smallest
@@ -520,7 +895,7 @@ func (r *rotator) sweep(entries []authEntry, cfg RotatorConfig) map[string]probe
 func (r *rotator) probe(e authEntry, cfg RotatorConfig) probeResult {
 	res := probeResult{File: e.Name, Index: e.AuthIndex, At: time.Now().Unix()}
 
-	token, account, err := r.credential(e)
+	token, account, proxyURL, err := r.credential(e)
 	if err != nil {
 		res.Error = err.Error()
 		return res
@@ -536,14 +911,14 @@ func (r *rotator) probe(e authEntry, cfg RotatorConfig) probeResult {
 		}},
 	})
 	headers := map[string][]string{
-		"authorization":       {"Bearer " + token},
-		"chatgpt-account-id":  {account},
-		"openai-beta":         {"responses=experimental"},
-		"originator":          {"codex_cli_rs"},
-		"user-agent":          {probeUserAgent},
-		"content-type":        {"application/json"},
+		"authorization":      {"Bearer " + token},
+		"chatgpt-account-id": {account},
+		"openai-beta":        {"responses=experimental"},
+		"originator":         {"codex_cli_rs"},
+		"user-agent":         {probeUserAgent},
+		"content-type":       {"application/json"},
 	}
-	status, respHeaders, err := hostHTTPDo("POST", probeURL, headers, body)
+	status, respHeaders, err := probeDo(proxyURL, "POST", firstNonEmpty(cfg.ProbeURL, probeURL), headers, body)
 	if err != nil {
 		res.Error = err.Error()
 		return res
@@ -562,33 +937,41 @@ func (r *rotator) probe(e authEntry, cfg RotatorConfig) probeResult {
 	return res
 }
 
-// credential pulls the access token out of the auth file through the host.
-func (r *rotator) credential(e authEntry) (token, account string, err error) {
+// credential pulls the access token out of the auth file through the host, and
+// with it the egress that credential's real traffic uses.
+//
+// The proxy matters as much as the token. CLIProxyAPI routes each credential's
+// requests and token refreshes through its own proxy_url; a probe that ignores
+// it authenticates the account from an address it otherwise never uses. Both
+// spellings are accepted because the field has gone by both names.
+func (r *rotator) credential(e authEntry) (token, account, proxyURL string, err error) {
 	if strings.TrimSpace(e.AuthIndex) == "" {
-		return "", "", fmt.Errorf("no auth index for %s", e.Name)
+		return "", "", "", fmt.Errorf("no auth index for %s", e.Name)
 	}
 	payload, _ := json.Marshal(map[string]any{"auth_index": e.AuthIndex})
 	result, errCall := hostCall("host.auth.get", payload)
 	if errCall != nil {
-		return "", "", errCall
+		return "", "", "", errCall
 	}
 	var resp struct {
 		JSON json.RawMessage `json:"json"`
 	}
 	if errUnmarshal := json.Unmarshal(result, &resp); errUnmarshal != nil {
-		return "", "", errUnmarshal
+		return "", "", "", errUnmarshal
 	}
 	var doc struct {
 		AccessToken string `json:"access_token"`
 		AccountID   string `json:"account_id"`
+		ProxyURL    string `json:"proxy_url"`
+		Proxy       string `json:"proxy"`
 	}
 	if errUnmarshal := json.Unmarshal(resp.JSON, &doc); errUnmarshal != nil {
-		return "", "", errUnmarshal
+		return "", "", "", errUnmarshal
 	}
 	if doc.AccessToken == "" {
-		return "", "", fmt.Errorf("no access token in %s", e.Name)
+		return "", "", "", fmt.Errorf("no access token in %s", e.Name)
 	}
-	return doc.AccessToken, doc.AccountID, nil
+	return doc.AccessToken, doc.AccountID, firstNonEmpty(doc.ProxyURL, doc.Proxy), nil
 }
 
 // rank scores every credential and explains every rejection.
@@ -618,6 +1001,11 @@ func (r *rotator) rank(results map[string]probeResult, entries []authEntry, cfg 
 			c.Skip = skipDeadToken
 		case res.Error != "":
 			c.Skip = skipProbeFailed
+		case res.Unknown:
+			// Nothing has ever reported on this credential, so it is neither a
+			// candidate nor a write-off. It becomes one or the other the first
+			// time the rotator actually needs it, and asks.
+			c.Skip = skipUnknown
 		}
 
 		if len(res.Windows) > 0 {
@@ -730,7 +1118,7 @@ func (r *rotator) retireRejected(results map[string]probeResult, entries []authE
 
 // retireDrained removes spent members once replacements are in place, never
 // dropping the pool below its target and never removing the last healthy one.
-func (r *rotator) retireDrained(enabled []authEntry, cfg RotatorConfig, promoted int, touched map[string]bool) {
+func (r *rotator) retireDrained(enabled []authEntry, results map[string]probeResult, cfg RotatorConfig, promoted int, touched map[string]bool) {
 	live := promoted
 	for _, e := range enabled {
 		if !touched[e.Name] {
@@ -741,8 +1129,12 @@ func (r *rotator) retireDrained(enabled []authEntry, cfg RotatorConfig, promoted
 		if contains(cfg.NeverDisable, e.Name) || touched[e.Name] {
 			continue
 		}
-		state, headroom := r.memberState(e, cfg)
-		if state == "healthy" {
+		state, headroom := r.memberState(e, results[e.Name], cfg)
+		// Only spend, refused or emptying members are retired. "unknown" is
+		// none of those: it means the probe budget ran out before the question
+		// could be answered, and disabling on that would turn a gap in the
+		// evidence into a loss of capacity.
+		if state != "dead" && state != "exhausted" && state != "draining" {
 			continue
 		}
 		if live <= cfg.KeepEnabled {
@@ -783,6 +1175,7 @@ func (r *rotator) setDisabled(c candidate, disabled bool, reason string, cfg Rot
 	}
 	var got struct {
 		Name string          `json:"name"`
+		Path string          `json:"path"`
 		JSON json.RawMessage `json:"json"`
 	}
 	if err = json.Unmarshal(result, &got); err != nil {
@@ -806,6 +1199,28 @@ func (r *rotator) setDisabled(c candidate, disabled bool, reason string, cfg Rot
 	if err != nil {
 		return err
 	}
+	// host.auth.save cannot turn a credential off.
+	//
+	// It writes the document and then rebuilds the host's own record from it -
+	// and that rebuild (internal/pluginhost/auth_callbacks.go,
+	// buildAuthFromFileData) never reads `disabled`, hardcoding
+	// Status: StatusActive instead. Upserting that record persists
+	// `disabled: false` straight back over the file, inside the same second.
+	// Enabling therefore works and disabling silently does not, which was
+	// measured in production: a retirement written at 03:55:51 was reverted at
+	// 03:55:51.
+	//
+	// The file watcher's loader does read the field, so writing the file and
+	// letting the watcher apply it produces the state that was asked for. The
+	// callback stays as the fallback for a host that reports no path.
+	if path := strings.TrimSpace(got.Path); path != "" {
+		if err = writeCredentialAtomic(path, body); err != nil {
+			return fmt.Errorf("write %s: %w", path, err)
+		}
+		r.app.invalidateAuthCache()
+		return nil
+	}
+
 	name := firstNonEmpty(got.Name, c.File)
 	save, _ := json.Marshal(map[string]any{"name": name, "json": json.RawMessage(body)})
 	if _, err = hostCall("host.auth.save", save); err != nil {
@@ -814,6 +1229,23 @@ func (r *rotator) setDisabled(c candidate, disabled bool, reason string, cfg Rot
 	// The cached credential list is now a minute out of date on the one thing
 	// that just changed, and the recount below depends on it.
 	r.app.invalidateAuthCache()
+	return nil
+}
+
+// writeCredentialAtomic replaces one auth file in place.
+//
+// Mode 0600, not the 0640 the plugin's own state files use: these documents
+// hold refresh tokens. The temporary name deliberately does not end in .json,
+// so the host's auth watcher ignores it and only ever sees the finished file.
+func writeCredentialAtomic(path string, body []byte) error {
+	tmp := path + ".tmp"
+	if err := os.WriteFile(tmp, body, 0o600); err != nil {
+		return err
+	}
+	if err := os.Rename(tmp, path); err != nil {
+		_ = os.Remove(tmp)
+		return err
+	}
 	return nil
 }
 
@@ -846,7 +1278,6 @@ func (r *rotator) snapshot() RotatorState {
 	defer r.mu.Unlock()
 	out := r.state
 	out.Log = append([]switchRecord(nil), r.state.Log...)
-	out.LastCandids = append([]candidate(nil), r.state.LastCandids...)
 	return out
 }
 
@@ -904,7 +1335,7 @@ func soonestRecovery(candidates []candidate) int64 {
 }
 
 // Report renders the rotator for the panel.
-func (r *rotator) Report(cfg RotatorConfig) map[string]any {
+func (r *rotator) Report(cfg RotatorConfig, board []candidate) map[string]any {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	out := map[string]any{
@@ -920,8 +1351,8 @@ func (r *rotator) Report(cfg RotatorConfig) map[string]any {
 		out["last_sweep"] = time.Unix(r.state.LastSweep, 0).UTC().Format(time.RFC3339)
 		out["last_sweep_age_seconds"] = ageSeconds(r.state.LastSweep, time.Now())
 	}
-	if len(r.state.LastCandids) > 0 {
-		out["candidates"] = r.state.LastCandids
+	if len(board) > 0 {
+		out["candidates"] = board
 	}
 	warnings := make([]map[string]any, 0, 2)
 	if cfg.Enabled && r.state.RecoversAt > 0 {
@@ -947,6 +1378,23 @@ func (r *rotator) Report(cfg RotatorConfig) map[string]any {
 	}
 	if len(warnings) > 0 {
 		out["warnings"] = warnings
+	}
+
+	// What probing actually cost. This is on the panel because the number is
+	// the whole point of the design: if it is not small, something regressed.
+	if len(r.state.Probes) > 0 {
+		today := time.Now().UTC().Format("2006-01-02")
+		spent, refused := 0, 0
+		for _, m := range r.state.Probes {
+			if m.DayKey == today {
+				spent += m.DayCount
+			}
+			if m.Rejected {
+				refused++
+			}
+		}
+		out["probes_today"] = spent
+		out["probes_refused_credentials"] = refused
 	}
 
 	if len(r.state.Log) > 0 {
@@ -1053,28 +1501,12 @@ func splitPool(entries []authEntry, cfg RotatorConfig) (enabled, standby []authE
 	return enabled, standby
 }
 
-// hostHTTPDo issues one request through the proxy's HTTP stack and hands back
-// the response headers, which is where the quota lives.
-func hostHTTPDo(method, url string, headers map[string][]string, body []byte) (int, map[string][]string, error) {
-	payload, err := json.Marshal(map[string]any{
-		"Method":  method,
-		"URL":     url,
-		"Headers": headers,
-		"Body":    body,
-	})
-	if err != nil {
-		return 0, nil, err
-	}
-	result, err := hostCall("host.http.do", payload)
-	if err != nil {
-		return 0, nil, err
-	}
-	var resp struct {
-		StatusCode int                 `json:"StatusCode"`
-		Headers    map[string][]string `json:"Headers"`
-	}
-	if err = json.Unmarshal(result, &resp); err != nil {
-		return 0, nil, fmt.Errorf("decode host http response: %w", err)
-	}
-	return resp.StatusCode, resp.Headers, nil
-}
+// There is deliberately no host.http.do helper here any more.
+//
+// It looked like the right way to reach upstream and was not: the host builds
+// that client with a nil auth, so the request ignores the credential's proxy
+// and leaves by the host's own address. For an authenticated probe that means
+// the account is seen signing in from somewhere it never otherwise appears.
+// Probes go through probeDo in probe_transport.go, which dials the credential's
+// own egress. host.http.do remains fine for unauthenticated fetches - the price
+// catalog in pricing.go still uses it through its own helper.

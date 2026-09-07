@@ -32,8 +32,11 @@ const (
 	stateCooling    = "cooling"
 	stateRecovering = "recovering"
 	stateDisabled   = "disabled"
-	stateDegraded   = "degraded"
-	stateDown       = "down"
+	// stateRejected is upstream refusing the credential itself. It is not a
+	// cooldown and does not end on its own: only a fresh login clears it.
+	stateRejected = "rejected"
+	stateDegraded = "degraded"
+	stateDown     = "down"
 )
 
 // ModelHealth is one credential's standing on one model.
@@ -55,12 +58,26 @@ type ModelHealth struct {
 	// refuse the request while every percentage still looks fine.
 	Estimated bool  `json:"cooldown_estimated,omitempty"`
 	Blocks    int64 `json:"blocks,omitempty"`
+
+	// Rejected records that upstream refused the credential itself - 401 or
+	// 403 - rather than refusing one request. It is kept apart from the quota
+	// fields because it means something completely different: a cooldown ends
+	// on its own, a rejection only ends when someone logs the account back in.
+	Rejected   bool  `json:"rejected,omitempty"`
+	RejectedAt int64 `json:"rejected_at,omitempty"`
 }
 
 // state is derived rather than stored, so a deadline that has quietly passed
 // stops reading as a live lockout.
 func (h *ModelHealth) state(now time.Time) string {
 	switch {
+	case h.Rejected:
+		// Cleared by the success branch of recordHealth, not by comparing
+		// timestamps: at one-second resolution a success and a rejection in the
+		// same second are indistinguishable, and the comparison then reads the
+		// rejection as already answered. A credential upstream will not accept
+		// has no availability to describe, whatever its last quota reading said.
+		return stateRejected
 	case h.CooldownUntil > now.Unix():
 		return stateCooling
 	case h.CooldownUntil > 0 && h.LastFail > h.LastOK:
@@ -97,14 +114,31 @@ func (acct *Account) recordHealth(model string, rec usageRecord, rl rateLimit, n
 		// trusting the deadline alone would leave a working credential shown as
 		// cooling for hours.
 		h.CooldownUntil, h.Reason, h.BlockedWindow, h.Estimated = 0, "", 0, false
+		h.Rejected, h.RejectedAt = false, 0
 		return
 	}
 
 	h.Failed++
+
+	// An authentication failure is not an ordinary error and must not be
+	// forgotten. 401 and 403 mean upstream has stopped accepting the credential
+	// itself, which is exactly the failure no quota reading can describe - a
+	// refused request carries no quota headers, so the branch below would drop
+	// it. That is how a revoked credential went on being reported at its last
+	// healthy percentage for a day.
+	if rec.Failure.rejected() {
+		h.LastFail = now.Unix()
+		h.Rejected, h.RejectedAt = true, now.Unix()
+		h.Reason = rec.Failure.reason()
+		h.CooldownUntil, h.BlockedWindow, h.Estimated = 0, 0, false
+		return
+	}
+
 	deadline, minutes, estimated, ok := cooldownFrom(rl)
 	if !ok {
-		// A failure carrying no quota signal is an ordinary error - a bad
-		// request, a dropped connection - and says nothing about availability.
+		// Any other failure carrying no quota signal is an ordinary error - a
+		// bad request, a dropped connection - and says nothing about
+		// availability.
 		return
 	}
 	if h.CooldownUntil <= now.Unix() {
@@ -181,6 +215,11 @@ func modelHealth(entries []authEntry, accounts []*Account, now time.Time) ([]map
 
 	for _, acct := range accounts {
 		entry, known := lookupAuth(entries, acct)
+		if !known && len(entries) > 0 {
+			// The credential was deleted. Its availability history describes
+			// something that no longer exists and cannot be acted on.
+			continue
+		}
 		disabled := known && entry.Disabled
 		name := displayName(entries, acct)
 
@@ -211,6 +250,12 @@ func modelHealth(entries []authEntry, accounts []*Account, now time.Time) ([]map
 			}
 			if h.LastOK > 0 {
 				row["last_ok_age_seconds"] = ageSeconds(h.LastOK, now)
+			}
+			if state == stateRejected {
+				row["reason"] = firstNonEmpty(h.Reason, "unauthorized")
+				if h.RejectedAt > 0 {
+					row["rejected_age_seconds"] = ageSeconds(h.RejectedAt, now)
+				}
 			}
 			if h.CooldownUntil > 0 && state != stateOK && state != stateDisabled {
 				until := time.Unix(h.CooldownUntil, 0)
