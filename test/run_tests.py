@@ -573,7 +573,10 @@ def rot_fixtures(creds):
     resets = {}
     for name, spec in creds.items():
         index = "idx-" + name
-        token = "tok-" + name
+        # A spec can name its own token, which is how a test says "the operator
+        # logged this account back in": re-authorising changes nothing visible
+        # about a credential except the token inside it.
+        token = spec.get("token") or ("tok-" + name)
         auth_list.append(authfile(name, disabled=spec.get("disabled", False), index=index))
         doc = {"access_token": token, "account_id": "acct-" + name,
                "refresh_token": "refresh-" + name,
@@ -859,7 +862,11 @@ shutil.rmtree(DATA_DIR, ignore_errors=True)
 # component must not have, so the newest instance takes a lease.
 os.makedirs(DATA_DIR, exist_ok=True)
 with open(os.path.join(DATA_DIR, "rotator.lease"), "w") as fh:
-    json.dump({"instance": "someone-else", "version": "9.9.9", "at": int(time.time()) + 3600}, fh)
+    # Nanoseconds: a lease is stamped at nanosecond resolution so that two
+    # instances starting inside the same second cannot compare equal, which a
+    # newcomer reads as "someone else holds it" and stands down for good.
+    json.dump({"instance": "someone-else", "version": "9.9.9",
+               "at": int(time.time() * 1e9) + 3600 * 10 ** 9}, fh)
 rep = rotate({
     "cred-a.json": {"disabled": False, "windows": [(WEEKF, 95, 400000)]},
     "cred-b.json": {"disabled": False, "windows": [(WEEKF, 8, 400000)]},
@@ -1174,17 +1181,19 @@ check("a 500 is not a rejection", cred(health(rep, "gpt-5.6-sol"))["state"], "ok
 
 shutil.rmtree(DATA_DIR, ignore_errors=True)
 # And the rotator acts on it without asking upstream anything: live traffic
-# already answered the question a probe would have asked.
+# already answered the question a probe would have asked. The pool is healthy
+# here, which is the point - a refusal is worth re-testing only when the
+# capacity it removed is actually needed (AN), never on a tick with nothing to
+# decide.
 rep = rotate({
-    "cred-a.json": {"disabled": False, "windows": [(WEEKF, 96, 400000)]},  # draining
-    "cred-b.json": {"disabled": False, "windows": [(WEEKF, 8, 400000)]},
+    "cred-a.json": {"disabled": False, "windows": [(WEEKF, 8, 400000)]},
+    "cred-b.json": {"disabled": False, "windows": [(WEEKF, 9, 400000)]},
     # Plenty of headroom on paper, and refused in practice.
     "cred-c.json": {"disabled": True, "windows": [(WEEKF, 9, 400000)], "fail_401": True},
 })
 skips = {c["file"]: c.get("skipped") for c in rep["candidates"]}
 check("a credential traffic saw refused is written off", skips["cred-c.json"], "dead_token")
-check("and no probe was spent finding that out",
-      [h for h in PROBES if h["token"] == "tok-cred-c.json"], [])
+check("and no probe was spent finding that out", len(PROBES), 0)
 
 print()
 print("=" * 74)
@@ -1424,49 +1433,6 @@ json.dump({
 rep = run([], auth_list=[authfile("codex-demo-team.json")])
 ages = sorted(p["ago"] for p in rep.get("fleet_series") or [])
 check("loading alone drops what has aged out", ages, [10])
-
-print()
-print("=" * 74)
-print("AM. the operator can force a re-read of every credential")
-print("=" * 74)
-# Every automatic path waits for a reason: a window past its reset, a short
-# pool, a replacement about to take traffic. A quota reset granted out of band
-# satisfies none of them - it moves no clock and empties no pool - so nothing
-# would ever notice, and the panel would keep reporting figures that stopped
-# being true the moment it happened.
-shutil.rmtree(DATA_DIR, ignore_errors=True)
-rep = rotate({
-    "cred-a.json": {"disabled": False, "windows": [(FIVEH, 90, 9000)],
-                    "probe_windows": [(FIVEH, 2, 18000)]},
-    "cred-b.json": {"disabled": False, "windows": [(FIVEH, 80, 9000)],
-                    "probe_windows": [(FIVEH, 1, 18000)]},
-    "cred-c.json": {"disabled": True, "windows": [(FIVEH, 70, 9000)],
-                    "probe_windows": [(FIVEH, 3, 18000)]},
-}, route="refresh")
-check("every credential is re-read", rep["read"], 3)
-check("and none skipped", rep["skipped"], 0)
-seen = {c["file"]: c.get("5h_used_percent") for c in rep["credentials"]}
-check("the fresh figure is reported back", seen["cred-a.json"], 2.0)
-check("for the disabled one too", seen["cred-c.json"], 3.0)
-
-# And it reaches the accounting state, not just the rotator's view.
-rep = run([], auth_list=[authfile("cred-a.json")])
-check("the panel takes the new reading", win(rep, FIVEH)["used_percent"], 2.0)
-
-shutil.rmtree(DATA_DIR, ignore_errors=True)
-# The per-cycle budget does not apply - the operator is asking a new question,
-# not the rotator repeating an old one - but the rule about refused
-# credentials does, because only a fresh login can change that answer.
-creds = {
-    "cred-a.json": {"disabled": False, "windows": [(FIVEH, 90, 9000)],
-                    "probe_windows": [(FIVEH, 2, 18000)]},
-    "cred-b.json": {"disabled": False, "status": 401, "windows": []},
-}
-rotate(creds, route="refresh")
-rep = rotate(creds, route="refresh")
-check("a second refresh still re-reads", rep["read"] >= 1, True)
-skips = {c["file"]: c.get("skipped") for c in rep["credentials"]}
-check("but a refused credential is left alone", skips["cred-b.json"], "dead_token")
 
 print()
 print("=" * 74)

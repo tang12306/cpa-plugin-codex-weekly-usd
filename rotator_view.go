@@ -259,3 +259,40 @@ func (a *App) quotaUSDFor(e authEntry, minutes int) float64 {
 	}
 	return best
 }
+
+// clearRejection retires a recorded refusal because a later probe was served.
+// recordHealth clears one the same way when a request succeeds: upstream
+// accepting the credential is the proof, and it makes no difference whether
+// the request carrying that proof came from a caller or from this plugin.
+//
+// Without this the two halves deadlock. A 401 is recorded against the account,
+// retireRejected disables the credential on the strength of it, and derive goes
+// on reporting the refusal - so rank writes the credential off as a dead token,
+// the rotator never promotes it, and no request ever reaches it. The only event
+// that could clear the flag is the traffic the flag itself is preventing, so a
+// re-authorised credential stays dead on the panel forever. One did, for a day,
+// while its own probes were coming back 200 the whole time.
+func (a *App) clearRejection(e authEntry, now time.Time) bool {
+	acct := a.accountFor(e)
+	if acct == nil {
+		return false
+	}
+	a.mu.Lock()
+	defer a.mu.Unlock()
+
+	cleared := false
+	for _, h := range acct.Models {
+		if h == nil || !h.Rejected {
+			continue
+		}
+		// Only the refusal is lifted. LastOK stays where it was because no
+		// model call has succeeded - a probe reads quota, it does not serve -
+		// and overwriting it would claim service this credential has not given.
+		h.Rejected, h.RejectedAt, h.Reason = false, 0, ""
+		cleared = true
+	}
+	if cleared {
+		a.dirty = true
+	}
+	return cleared
+}

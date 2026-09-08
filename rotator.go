@@ -205,9 +205,14 @@ type rotator struct {
 func newRotator(app *App) *rotator {
 	now := time.Now()
 	return &rotator{
-		app:       app,
-		instance:  strconv.FormatInt(now.UnixNano(), 36),
-		startedAt: now.Unix(),
+		app:      app,
+		instance: strconv.FormatInt(now.UnixNano(), 36),
+		// Nanoseconds, not seconds. Two instances that start inside the same
+		// second compare equal at second resolution, and a tie is read as
+		// "someone else already holds it" - so the new instance stands down
+		// for good and the rotator silently stops. That is exactly what a
+		// hot reload looks like.
+		startedAt: now.UnixNano(),
 		probes:    map[string]probeResult{},
 	}
 }
@@ -330,6 +335,11 @@ func (r *rotator) tick(force bool) {
 	enabled, standby := splitPool(entries, cfg)
 	pool := append(append([]authEntry{}, enabled...), standby...)
 
+	// Retire refusals that have stopped describing anything before judging
+	// anything on the strength of them. This reaches upstream not at all: it
+	// compares a stored fingerprint against the token on disk.
+	r.reconcileRejections(pool, now)
+
 	// Judge the whole pool from what is already known. Live traffic keeps a
 	// reading fresh for anything that is serving, and an idle credential's
 	// quota is arithmetic rather than a question - so this step reaches
@@ -402,13 +412,22 @@ func (r *rotator) tick(force bool) {
 	candidates := r.rank(results, pool, cfg)
 
 	// Only when the credentials we do have readings for cannot fill the gap is
-	// it worth asking about one nothing has ever reported on. That happens at
-	// most once per credential ever: afterwards there is a reading to derive
-	// from.
+	// it worth asking about one nothing has ever reported on, or one we believe
+	// is dead. Both are cheap for the same reason: the answer is remembered, so
+	// each costs at most one probe per credential per token.
+	//
+	// Asking about a token we have already been told is dead sounds like the
+	// waste this design exists to remove, but the belief has to be falsifiable
+	// somewhere or a re-authorised credential can never come back: the refusal
+	// disables it, and a disabled credential gets no traffic, so the successful
+	// request that would clear the refusal can never happen. probeAllowed is
+	// what keeps this honest - once a probe confirms the refusal it pins the
+	// token's fingerprint, and nothing asks again until a fresh login changes
+	// it.
 	if r.countPicks(candidates, short) < short {
 		asked := false
 		for _, c := range candidates {
-			if c.Skip != skipUnknown {
+			if c.Skip != skipUnknown && c.Skip != skipDeadToken {
 				continue
 			}
 			e, found := entryFor(pool, c.File)
@@ -418,7 +437,11 @@ func (r *rotator) tick(force bool) {
 			if allowed, _ := r.probeAllowed(e, results[c.File], cfg, now, false); !allowed {
 				continue
 			}
-			results[c.File] = r.ask(e, results[c.File], cfg, now, "no reading has ever covered this credential")
+			why := "no reading has ever covered this credential"
+			if c.Skip == skipDeadToken {
+				why = "checking whether a credential believed dead has been re-authorised"
+			}
+			results[c.File] = r.ask(e, results[c.File], cfg, now, why)
 			asked = true
 		}
 		if asked {
@@ -458,7 +481,7 @@ func (r *rotator) tick(force bool) {
 	// costing a wasted attempt on every request.
 	touched := map[string]bool{}
 	if cfg.DisableDeadTokens {
-		touched = r.retireRejected(results, pool, cfg)
+		touched = r.retireRejected(results, pool, cfg, now)
 	}
 
 	// Recount with fresh readings: the cached picture that triggered the sweep
@@ -745,14 +768,22 @@ func (r *rotator) derive(entries []authEntry, now time.Time) map[string]probeRes
 		// accept has no headroom worth ranking, however full its last reading
 		// looked. Live traffic is checked first because it is free and because
 		// it covers credentials no probe has ever touched.
+		//
+		// What a refusal does not outrank is a probe taken after it that
+		// upstream served. Both talk to the same endpoint, so the later answer
+		// is the true one; without that ordering the first 401 ever recorded
+		// outranks every reading taken afterwards, for good.
 		if rejected, reason, at := r.app.trafficRejection(e); rejected {
-			res.StatusCode = http.StatusUnauthorized
-			res.At = at
-			res.Error = reason
-			out[e.Name] = res
-			continue
+			memo, ok := r.memo(e.Name)
+			if !ok || memo.Rejected || memo.At <= at {
+				res.StatusCode = http.StatusUnauthorized
+				res.At = at
+				res.Error = reason
+				out[e.Name] = res
+				continue
+			}
 		}
-		if memo, ok := r.memo(e.Name); ok && memo.Rejected {
+		if memo, ok := r.memo(e.Name); ok && r.rejectionStands(e, memo) {
 			res.StatusCode = memo.StatusCode
 			res.At = memo.At
 			out[e.Name] = res
@@ -828,8 +859,7 @@ func (r *rotator) probeAllowed(e authEntry, res probeResult, cfg RotatorConfig, 
 	// Re-asking cannot make it work - only a fresh login can - and asking
 	// repeatedly is the least defensible traffic this plugin can generate.
 	if memo.Rejected {
-		token, _, _, errCred := r.credential(e)
-		if errCred != nil || tokenFingerprint(token) == memo.Fingerprint {
+		if r.rejectionStands(e, memo) {
 			return false, skipDeadToken
 		}
 		return true, ""
@@ -939,6 +969,18 @@ func (r *rotator) ask(e authEntry, res probeResult, cfg RotatorConfig, now time.
 	// The reading is worth as much to the accounting side as to this one: it is
 	// the same measurement a served request would have produced.
 	r.app.observeWindows(e, fresh.Windows, now)
+	// And a served probe is proof the credential works, which is the only
+	// thing that can lift a refusal recorded against it. Nothing else can:
+	// a refused credential is disabled, so the successful request that would
+	// otherwise clear the flag can never arrive.
+	// A 2xx and nothing less. alive() is too loose here - it only means "not
+	// refused", so a 500 or a dial failure would pass it, and neither is
+	// evidence that upstream accepts this credential.
+	if fresh.Error == "" && fresh.StatusCode >= 200 && fresh.StatusCode < 300 {
+		if r.app.clearRejection(e, now) {
+			hostLog("info", "rotator: "+e.Name+" answered a probe; clearing the refusal recorded against it")
+		}
+	}
 	r.app.markDirty()
 
 	return fresh
@@ -1151,7 +1193,7 @@ func (r *rotator) rotatedRecently(file string, windows []windowReading, now time
 // a file watcher, so for a moment after the write it still reports the old
 // state, and a recount taken in that window would switch the same credential
 // off a second time.
-func (r *rotator) retireRejected(results map[string]probeResult, entries []authEntry, cfg RotatorConfig) map[string]bool {
+func (r *rotator) retireRejected(results map[string]probeResult, entries []authEntry, cfg RotatorConfig, now time.Time) map[string]bool {
 	touched := map[string]bool{}
 	for _, e := range entries {
 		if e.Disabled || contains(cfg.NeverDisable, e.Name) {
@@ -1166,6 +1208,13 @@ func (r *rotator) retireRejected(results map[string]probeResult, entries []authE
 			hostLog("warn", "rotator: could not disable rejected credential "+e.Name+": "+err.Error())
 			continue
 		}
+		// Write down which token was refused. A refusal that does not say what
+		// it is about can never expire, and this one has to: the credential is
+		// being disabled, so the only thing that can revive it is the operator
+		// logging the account back in - and the only visible trace of that is
+		// the token changing. Probes already record this when upstream refuses
+		// one; a refusal seen in live traffic deserves the same note.
+		r.pinRejection(e, res, now)
 		touched[e.Name] = true
 	}
 	return touched
@@ -1565,3 +1614,91 @@ func splitPool(entries []authEntry, cfg RotatorConfig) (enabled, standby []authE
 // Probes go through probeDo in probe_transport.go, which dials the credential's
 // own egress. host.http.do remains fine for unauthenticated fetches - the price
 // catalog in pricing.go still uses it through its own helper.
+
+// pinRejection records which token a refusal was about, so the refusal can
+// later be recognised as out of date. Only the fingerprint is kept: the token
+// itself must never reach the state file.
+func (r *rotator) pinRejection(e authEntry, res probeResult, now time.Time) {
+	token, _, _, err := r.credential(e)
+	if err != nil {
+		return
+	}
+	memo := probeMemo{At: now.Unix(), DayKey: now.UTC().Format("2006-01-02")}
+	if prev, ok := r.memo(e.Name); ok {
+		memo = prev
+	}
+	memo.Rejected = true
+	memo.Fingerprint = tokenFingerprint(token)
+	if res.StatusCode != 0 {
+		memo.StatusCode = res.StatusCode
+	}
+	memo.Reason = "refused in live traffic"
+
+	r.mu.Lock()
+	if r.state.Probes == nil {
+		r.state.Probes = map[string]probeMemo{}
+	}
+	r.state.Probes[e.Name] = memo
+	r.mu.Unlock()
+	r.app.markDirty()
+}
+
+// reconcileRejections expires refusals that have stopped describing anything.
+//
+// A refusal is about one token. Two things end it: the operator replaces the
+// token, or a later request upstream served. Neither generates traffic, and
+// without this pass neither is ever noticed - because the only other thing
+// that clears a refusal is a successful request, and the refusal is precisely
+// why no request can happen. That is a closed loop, and a re-authorised
+// credential sat inside it for a day, reported dead on the panel while its own
+// probes came back 200.
+func (r *rotator) reconcileRejections(entries []authEntry, now time.Time) {
+	for _, e := range entries {
+		rejected, _, at := r.app.trafficRejection(e)
+		if !rejected {
+			continue
+		}
+		memo, ok := r.memo(e.Name)
+		why := ""
+		switch {
+		case ok && memo.Rejected:
+			if r.rejectionStands(e, memo) {
+				continue
+			}
+			why = "the token has been replaced since"
+		case ok && memo.At > at:
+			// No fingerprint - a refusal recorded before this plugin started
+			// noting them - but a probe taken afterwards was served, which
+			// answers the same question.
+			why = "a later probe was served"
+		default:
+			continue
+		}
+		if r.app.clearRejection(e, now) {
+			hostLog("info", "rotator: clearing the refusal recorded against "+e.Name+" - "+why)
+		}
+	}
+}
+
+// rejectionStands answers the only question a recorded refusal raises: does it
+// still describe the credential on disk? A refusal is about one token. Once the
+// operator logs the account back in, the token it named is gone and so is
+// everything the refusal asserted - continuing to honour it writes off a
+// working credential permanently, because nothing else will ever revisit it.
+//
+// A refusal with no fingerprint is one recorded before this plugin noted them.
+// It has to stand: guessing that the current token is a different one would
+// resurrect genuinely dead credentials on every tick.
+func (r *rotator) rejectionStands(e authEntry, memo probeMemo) bool {
+	if !memo.Rejected {
+		return false
+	}
+	if memo.Fingerprint == "" {
+		return true
+	}
+	token, _, _, err := r.credential(e)
+	if err != nil {
+		return true
+	}
+	return tokenFingerprint(token) == memo.Fingerprint
+}
