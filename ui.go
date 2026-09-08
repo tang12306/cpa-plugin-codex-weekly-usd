@@ -58,6 +58,23 @@ func (a *App) HandleManagement(payload []byte) json.RawMessage {
 		a.rot.tick(true)
 		cfg = a.rot.config()
 		return marshalResponse(a.rot.Report(cfg, board(cfg)))
+
+	case strings.HasSuffix(path, "/refresh"):
+		// Re-read every credential now. Nothing automatic does this, and
+		// nothing should: the rotator asks only when it has a reason to, and a
+		// quota reset granted out of band gives it none. This is the operator
+		// saying the stored numbers are wrong. POST, because it makes upstream
+		// requests and rewrites what the plugin believes.
+		if !strings.EqualFold(req.Method, "POST") {
+			return jsonResponse(405, "application/json; charset=utf-8",
+				[]byte(`{"error":"POST required"}`))
+		}
+		now := time.Now()
+		entries := a.authMetadata()
+		cfg := a.rot.config()
+		out := a.rot.refreshAll(entries, cfg, now)
+		out["rotator"] = a.rot.Report(cfg, a.rot.board(entries, cfg, now))
+		return marshalResponse(out)
 	default:
 		return marshalResponse(map[string]any{"error": "unknown route: " + req.Path})
 	}

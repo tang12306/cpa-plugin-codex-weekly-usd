@@ -635,7 +635,7 @@ PROBES = []
 SOCKS = [0]
 
 
-def rotate(creds, rotator=None, steps=None, seed=True):
+def rotate(creds, rotator=None, steps=None, seed=True, route="rotate"):
     """Drive one rotator decision.
 
     seed=True replays each credential's window state through live traffic
@@ -666,7 +666,7 @@ def rotate(creds, rotator=None, steps=None, seed=True):
                                                   body=REVOKED_BODY)))
     try:
         rep = run(pre + (steps or []), auth_list=auth_list, rotator=settings,
-                  fixtures=fixtures, route="rotate", method="POST")
+                  fixtures=fixtures, route=route, method="POST")
     finally:
         shutdown()
     PROBES[:] = hits
@@ -1118,6 +1118,7 @@ for blk in raw.split("--- "):
 check("the data route is declared", ("GET", "/codex-weekly-usd/data") in declared, True)
 check("the prices route is declared", ("GET", "/codex-weekly-usd/prices") in declared, True)
 check("the rotate route is declared", ("POST", "/codex-weekly-usd/rotate") in declared, True)
+check("the refresh route is declared", ("POST", "/codex-weekly-usd/refresh") in declared, True)
 check("and rotate is POST-only",
       ("GET", "/codex-weekly-usd/rotate") in declared, False)
 
@@ -1423,6 +1424,49 @@ json.dump({
 rep = run([], auth_list=[authfile("codex-demo-team.json")])
 ages = sorted(p["ago"] for p in rep.get("fleet_series") or [])
 check("loading alone drops what has aged out", ages, [10])
+
+print()
+print("=" * 74)
+print("AM. the operator can force a re-read of every credential")
+print("=" * 74)
+# Every automatic path waits for a reason: a window past its reset, a short
+# pool, a replacement about to take traffic. A quota reset granted out of band
+# satisfies none of them - it moves no clock and empties no pool - so nothing
+# would ever notice, and the panel would keep reporting figures that stopped
+# being true the moment it happened.
+shutil.rmtree(DATA_DIR, ignore_errors=True)
+rep = rotate({
+    "cred-a.json": {"disabled": False, "windows": [(FIVEH, 90, 9000)],
+                    "probe_windows": [(FIVEH, 2, 18000)]},
+    "cred-b.json": {"disabled": False, "windows": [(FIVEH, 80, 9000)],
+                    "probe_windows": [(FIVEH, 1, 18000)]},
+    "cred-c.json": {"disabled": True, "windows": [(FIVEH, 70, 9000)],
+                    "probe_windows": [(FIVEH, 3, 18000)]},
+}, route="refresh")
+check("every credential is re-read", rep["read"], 3)
+check("and none skipped", rep["skipped"], 0)
+seen = {c["file"]: c.get("5h_used_percent") for c in rep["credentials"]}
+check("the fresh figure is reported back", seen["cred-a.json"], 2.0)
+check("for the disabled one too", seen["cred-c.json"], 3.0)
+
+# And it reaches the accounting state, not just the rotator's view.
+rep = run([], auth_list=[authfile("cred-a.json")])
+check("the panel takes the new reading", win(rep, FIVEH)["used_percent"], 2.0)
+
+shutil.rmtree(DATA_DIR, ignore_errors=True)
+# The per-cycle budget does not apply - the operator is asking a new question,
+# not the rotator repeating an old one - but the rule about refused
+# credentials does, because only a fresh login can change that answer.
+creds = {
+    "cred-a.json": {"disabled": False, "windows": [(FIVEH, 90, 9000)],
+                    "probe_windows": [(FIVEH, 2, 18000)]},
+    "cred-b.json": {"disabled": False, "status": 401, "windows": []},
+}
+rotate(creds, route="refresh")
+rep = rotate(creds, route="refresh")
+check("a second refresh still re-reads", rep["read"] >= 1, True)
+skips = {c["file"]: c.get("skipped") for c in rep["credentials"]}
+check("but a refused credential is left alone", skips["cred-b.json"], "dead_token")
 
 print()
 print("=" * 74)

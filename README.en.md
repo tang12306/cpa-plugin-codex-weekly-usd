@@ -252,6 +252,16 @@ generate.
 `POST /v0/management/codex-weekly-usd/rotate` evaluates immediately. POST only: the route changes
 state and must not be reachable by following a link.
 
+`POST /v0/management/codex-weekly-usd/refresh` **re-reads every credential now.**
+Every automatic path waits for a reason - a window past its reset, a short pool, a replacement about
+to take traffic. A quota reset granted out of band satisfies none of them: it moves no clock and
+empties no pool, so nothing would ever notice, and the panel would keep reporting figures that
+stopped being true the moment it happened. This is the operator saying the stored numbers are wrong.
+
+It bypasses the per-cycle probe budget - a person asking a new question is not the rotator repeating
+an old one - but not the daily cap, and not the rule that a credential upstream has refused is never
+asked again. Only a fresh login can change that answer.
+
 **A known limit**: the proxy does not refresh the access token of a long-disabled credential, so
 once it expires the probe reads as a rejection. This version warns rather than running the OAuth
 refresh itself.

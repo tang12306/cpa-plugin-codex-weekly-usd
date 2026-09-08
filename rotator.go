@@ -355,7 +355,7 @@ func (r *rotator) tick(force bool) {
 			if !res.Rolled {
 				continue
 			}
-			if allowed, _ := r.probeAllowed(e, res, cfg, now); !allowed {
+			if allowed, _ := r.probeAllowed(e, res, cfg, now, false); !allowed {
 				continue
 			}
 			results[e.Name] = r.ask(e, res, cfg, now, "re-reading a window the clock says has reset")
@@ -385,7 +385,7 @@ func (r *rotator) tick(force bool) {
 			if state, _ := r.memberState(e, res, cfg); state == "healthy" {
 				continue
 			}
-			if allowed, _ := r.probeAllowed(e, res, cfg, now); !allowed {
+			if allowed, _ := r.probeAllowed(e, res, cfg, now, false); !allowed {
 				continue
 			}
 			results[e.Name] = r.ask(e, res, cfg, now, "confirming an incumbent the estimate calls spent")
@@ -415,7 +415,7 @@ func (r *rotator) tick(force bool) {
 			if !found {
 				continue
 			}
-			if allowed, _ := r.probeAllowed(e, results[c.File], cfg, now); !allowed {
+			if allowed, _ := r.probeAllowed(e, results[c.File], cfg, now, false); !allowed {
 				continue
 			}
 			results[c.File] = r.ask(e, results[c.File], cfg, now, "no reading has ever covered this credential")
@@ -438,7 +438,7 @@ func (r *rotator) tick(force bool) {
 			if !found {
 				continue
 			}
-			if allowed, _ := r.probeAllowed(e, results[c.File], cfg, now); !allowed {
+			if allowed, _ := r.probeAllowed(e, results[c.File], cfg, now, false); !allowed {
 				continue
 			}
 			results[c.File] = r.ask(e, results[c.File], cfg, now, "confirming a replacement before it takes traffic")
@@ -812,7 +812,11 @@ func probeEpoch(windows []windowReading, now time.Time) int64 {
 // the previous design sent roughly 1,100 requests in eight hours by re-asking
 // questions it already had answers to, including of credentials it had already
 // been told were revoked.
-func (r *rotator) probeAllowed(e authEntry, res probeResult, cfg RotatorConfig, now time.Time) (bool, string) {
+// manual marks a request the operator made, which is allowed past the
+// per-cycle budget: they are saying the stored numbers are wrong, and the
+// budget exists to stop the rotator asking the same question twice, not to stop
+// a person asking a new one.
+func (r *rotator) probeAllowed(e authEntry, res probeResult, cfg RotatorConfig, now time.Time, manual bool) (bool, string) {
 	if contains(cfg.NeverEnable, e.Name) {
 		return false, skipExcluded
 	}
@@ -833,10 +837,61 @@ func (r *rotator) probeAllowed(e authEntry, res probeResult, cfg RotatorConfig, 
 	if memo.DayKey == now.UTC().Format("2006-01-02") && memo.DayCount >= cfg.MaxProbesPerDayPerCredential {
 		return false, skipProbeBudget
 	}
-	if memo.Epoch > 0 && memo.Epoch == probeEpoch(res.Windows, now) {
+	if !manual && memo.Epoch > 0 && memo.Epoch == probeEpoch(res.Windows, now) {
 		return false, skipProbeBudget
 	}
 	return true, ""
+}
+
+// refreshAll re-reads every credential the plugin is allowed to ask about.
+//
+// Every automatic path deliberately waits for a reason: a window whose reset
+// time has passed, a pool that is short, a replacement about to take traffic.
+// A quota reset granted out of band satisfies none of them - it moves no clock
+// and empties no pool - so nothing would ever notice it, and the panel would
+// go on reporting percentages that stopped being true the moment it happened.
+//
+// This is the operator saying the stored numbers are wrong. It therefore
+// bypasses the per-cycle budget, but not the daily cap and not the rule about
+// credentials upstream has refused: asking those again cannot change the
+// answer, and only a fresh login can.
+func (r *rotator) refreshAll(entries []authEntry, cfg RotatorConfig, now time.Time) map[string]any {
+	pool := make([]authEntry, 0, len(entries))
+	for _, e := range entries {
+		if cfg.Provider == "" || strings.EqualFold(e.Type, cfg.Provider) {
+			pool = append(pool, e)
+		}
+	}
+	results := r.derive(pool, now)
+
+	rows := make([]map[string]any, 0, len(pool))
+	read, skipped := 0, 0
+	for _, e := range pool {
+		row := map[string]any{"file": e.Name, "credential": firstNonEmpty(e.Label, e.Email, e.Name)}
+		allowed, why := r.probeAllowed(e, results[e.Name], cfg, now, true)
+		if !allowed {
+			row["skipped"] = why
+			skipped++
+			rows = append(rows, row)
+			continue
+		}
+		fresh := r.ask(e, results[e.Name], cfg, now, "operator asked for a re-read")
+		row["status_code"] = fresh.StatusCode
+		if fresh.Error != "" {
+			row["error"] = fresh.Error
+		}
+		for _, w := range fresh.Windows {
+			row[windowLabel(w.Minutes)+"_used_percent"] = round2(w.Percent)
+		}
+		read++
+		rows = append(rows, row)
+	}
+
+	return map[string]any{
+		"read":        read,
+		"skipped":     skipped,
+		"credentials": rows,
+	}
 }
 
 // ask probes one credential, once, and books it against the budget. It is the
