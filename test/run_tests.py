@@ -200,7 +200,12 @@ rep = run(steps)
 w = win(rep, WEEK)
 check("requests reset", w["requests"], 3)
 check("cycles counted", w["cycles"], 2)
-check("calibration survived rollover", w["estimate"]["samples"], 7)
+# The new cycle has produced 2 points of movement, which is too little to
+# divide by, so the estimate reaches back into the previous cycle - newest
+# first, and only far enough to clear the bar. Not all 7: evidence from a cycle
+# that has ended prices a quota that may no longer be the one being spent.
+check("calibration reaches back only as far as it needs",
+      w["estimate"]["samples"], 5)
 check("quota still ~$200", round(w["estimate"]["quota_usd"], 2), 200.00)
 check("new cycle full coverage", w["full_coverage"], True)
 
@@ -1433,6 +1438,175 @@ json.dump({
 rep = run([], auth_list=[authfile("codex-demo-team.json")])
 ages = sorted(p["ago"] for p in rep.get("fleet_series") or [])
 check("loading alone drops what has aged out", ages, [10])
+
+print()
+print("=" * 74)
+print("AM. the operator can force a re-read of every credential")
+print("=" * 74)
+# Every automatic path waits for a reason: a window past its reset, a short
+# pool, a replacement about to take traffic. A quota reset granted out of band
+# satisfies none of them - it moves no clock and empties no pool - so nothing
+# would ever notice, and the panel would keep reporting figures that stopped
+# being true the moment it happened.
+shutil.rmtree(DATA_DIR, ignore_errors=True)
+rep = rotate({
+    "cred-a.json": {"disabled": False, "windows": [(FIVEH, 90, 9000)],
+                    "probe_windows": [(FIVEH, 2, 18000)]},
+    "cred-b.json": {"disabled": False, "windows": [(FIVEH, 80, 9000)],
+                    "probe_windows": [(FIVEH, 1, 18000)]},
+    "cred-c.json": {"disabled": True, "windows": [(FIVEH, 70, 9000)],
+                    "probe_windows": [(FIVEH, 3, 18000)]},
+}, route="refresh")
+check("every credential is re-read", rep["read"], 3)
+check("and none skipped", rep["skipped"], 0)
+seen = {c["file"]: c.get("5h_used_percent") for c in rep["credentials"]}
+check("the fresh figure is reported back", seen["cred-a.json"], 2.0)
+check("for the disabled one too", seen["cred-c.json"], 3.0)
+
+# And it reaches the accounting state, not just the rotator's view.
+rep = run([], auth_list=[authfile("cred-a.json")])
+check("the panel takes the new reading", win(rep, FIVEH)["used_percent"], 2.0)
+
+shutil.rmtree(DATA_DIR, ignore_errors=True)
+# The per-cycle budget does not apply - the operator is asking a new question,
+# not the rotator repeating an old one - but the rule about refused
+# credentials does, because only a fresh login can change that answer.
+creds = {
+    "cred-a.json": {"disabled": False, "windows": [(FIVEH, 90, 9000)],
+                    "probe_windows": [(FIVEH, 2, 18000)]},
+    "cred-b.json": {"disabled": False, "status": 401, "windows": []},
+}
+rotate(creds, route="refresh")
+rep = rotate(creds, route="refresh")
+check("a second refresh still re-reads", rep["read"] >= 1, True)
+skips = {c["file"]: c.get("skipped") for c in rep["credentials"]}
+check("but a refused credential is left alone", skips["cred-b.json"], "dead_token")
+
+print()
+print("==========================================================================")
+print("AN. a re-authorised credential comes back; a still-dead one is asked once")
+print("==========================================================================")
+# The deadlock this closes, seen in production: live traffic gets a 401, the
+# refusal is recorded against the account, the credential is disabled on the
+# strength of it - and from then on nothing can clear the refusal, because the
+# only event that clears it is a successful request and a disabled credential
+# never gets one. The operator re-authorises, the token works, and the panel
+# goes on reporting a dead credential indefinitely.
+shutil.rmtree(DATA_DIR, ignore_errors=True)
+rep = rotate({
+    # Refused by live traffic and already retired, but the probe now answers
+    # 200: this is what a re-authorised credential looks like from here.
+    "cred-a.json": {"disabled": True, "fail_401": True,
+                    "windows": [(WEEKF, 4, 400000)]},
+    # Refused and still refused. It must cost exactly one probe to establish.
+    "cred-b.json": {"disabled": True, "fail_401": True, "status": 401,
+                    "windows": [(WEEKF, 4, 400000)]},
+    "cred-c.json": {"disabled": False, "windows": [(WEEKF, 99, 400000)]},
+}, rotator={"keep_enabled": 2})
+board = {c["file"]: c for c in rep["candidates"]}
+check("the re-authorised credential is no longer written off",
+      board["cred-a.json"].get("skipped"), None)
+check("and is promoted back into the pool",
+      ("cred-a.json", False) in saves(), True)
+check("the genuinely dead one stays written off",
+      board["cred-b.json"].get("skipped"), "dead_token")
+check("having cost one probe to find out",
+      len([h for h in PROBES if h["token"] == "tok-cred-b.json"]), 1)
+
+# Now the second half: having pinned the dead token's fingerprint, the rotator
+# must stop asking. A refusal that is re-probed every tick is the traffic this
+# whole design exists to remove.
+before = len(PROBES)
+rep = rotate({
+    "cred-a.json": {"disabled": False, "windows": [(WEEKF, 4, 400000)]},
+    "cred-b.json": {"disabled": True, "fail_401": True, "status": 401,
+                    "windows": [(WEEKF, 4, 400000)]},
+    "cred-c.json": {"disabled": False, "windows": [(WEEKF, 99, 400000)]},
+}, rotator={"keep_enabled": 2})
+skips = {c["file"]: c.get("skipped") for c in rep["candidates"]}
+check("the dead token is still refused", skips["cred-b.json"], "dead_token")
+check("and is not asked a second time",
+      len([h for h in PROBES if h["token"] == "tok-cred-b.json"]), 0)
+
+print()
+print("==========================================================================")
+print("AO. re-authorising revives a credential without any probe at all")
+print("==========================================================================")
+# AN covers the pool being short enough to spend a probe. This is the case that
+# actually bit: the pool is fine, so nothing is ever short, so no probe is ever
+# spent - and the refusal has to expire on its own or the panel reports a
+# working credential as dead forever. It can, because a refusal is about one
+# token, and re-authorising replaces it.
+shutil.rmtree(DATA_DIR, ignore_errors=True)
+rotate({
+    # Refused in traffic and refused again when asked: genuinely dead, which is
+    # what gets a credential retired and its token fingerprint written down.
+    "cred-a.json": {"disabled": False, "fail_401": True, "status": 401,
+                    "windows": [(WEEKF, 4, 400000)]},
+    "cred-b.json": {"disabled": False, "windows": [(WEEKF, 5, 400000)]},
+    "cred-c.json": {"disabled": True, "windows": [(WEEKF, 6, 400000)]},
+}, rotator={"keep_enabled": 2})
+check("the refused credential is retired", ("cred-a.json", True) in saves(), True)
+
+# Same state, no traffic replayed for cred-a - it is disabled, so in production
+# it would get none - and a new token in the file. The pool is healthy, so
+# nothing here has any reason to probe.
+rep = rotate({
+    "cred-a.json": {"disabled": True, "seed": False, "token": "tok-cred-a-relogin",
+                    "windows": [(WEEKF, 4, 400000)]},
+    "cred-b.json": {"disabled": False, "windows": [(WEEKF, 5, 400000)]},
+    "cred-c.json": {"disabled": False, "windows": [(WEEKF, 6, 400000)]},
+}, rotator={"keep_enabled": 2})
+check("the pool had no reason to act", rep["last_reason"], "pool_healthy")
+check("so nothing was asked upstream", len(PROBES), 0)
+skips = {c["file"]: c.get("skipped") for c in rep["candidates"]}
+# Whatever else the board says about it - it was just rotated, so it is held
+# back for a cooling-off period - it is no longer written off as dead.
+check("and the refusal expired with the token it described",
+      skips["cred-a.json"] == "dead_token", False)
+
+# The panel has to agree. Reporting a re-authorised credential as expired is
+# the symptom the whole fix exists for.
+rep = run([], auth_list=[authfile("cred-a.json"), authfile("cred-b.json"),
+                         authfile("cred-c.json")])
+row = health(rep, "gpt-5.6-sol")
+states = {c["credential"]: c["state"] for c in (row or {}).get("by_credential", [])}
+check("the panel no longer calls it expired", states.get("cred-a.json") == "rejected", False)
+
+print()
+print("==========================================================================")
+print("AP. a quota that changes between cycles is followed, not averaged")
+print("==========================================================================")
+# The assumption this replaces was written down in startCycle: samples survive
+# a rollover because "they measure the size of the quota, which a rollover does
+# not change". Measured on the live fleet over nine days, the dollars behind
+# one percentage point fell by about a third on every account independently,
+# and pooling held the estimate 20-47% above what the current cycle was itself
+# measuring. Evidence has to be told apart by which quota it priced.
+shutil.rmtree(DATA_DIR, ignore_errors=True)
+# First cycle: $2.00 buys one percentage point, so the quota is $200.
+steps = [("usage.handle", weekly(i)) for i in range(8)]
+# Second cycle: the same $2.00 now buys two points. The quota has halved.
+steps += [("usage.handle", usage([(WEEK, 2 * i, RESET_W + 7 * 86400)]))
+          for i in range(6)]
+rep = run(steps)
+est = win(rep, WEEK)["estimate"]
+# Pooling all twelve samples would answer $141 - an average of two quotas, one
+# of which no longer exists, and a number that was never true of either cycle.
+check("calibration follows the new quota",
+      round(est["quota_usd_by_delta"], 2), 100.00)
+check("and rests only on this cycle's evidence", est["samples"], 5)
+check("the two methods now agree", round(est["quota_usd_by_window"], 2), 100.00)
+
+# The reverse case matters just as much: the estimate must not lag a quota that
+# grew, or the rotator retires credentials that still have room.
+shutil.rmtree(DATA_DIR, ignore_errors=True)
+steps = [("usage.handle", usage([(WEEK, 2 * i, RESET_W)])) for i in range(6)]
+steps += [("usage.handle", usage([(WEEK, i, RESET_W + 7 * 86400)])) for i in range(8)]
+rep = run(steps)
+est = win(rep, WEEK)["estimate"]
+check("a quota that grew is followed too",
+      round(est["quota_usd_by_delta"], 2), 200.00)
 
 print()
 print("=" * 74)

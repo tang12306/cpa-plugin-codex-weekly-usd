@@ -161,6 +161,11 @@ type Sample struct {
 	DP  float64 `json:"dp"`
 	USD float64 `json:"usd"`
 	TS  int64   `json:"ts"`
+	// Cycle is the window cycle this sample was measured in, so evidence can
+	// be told apart by which quota it priced. A timestamp cannot do this job:
+	// a sample recorded either side of a boundary is the same instant, and the
+	// boundary itself is upstream's clock, not ours.
+	Cycle int64 `json:"cycle,omitempty"`
 }
 
 const (
@@ -171,6 +176,12 @@ const (
 	maxSamples = 160
 	// sampleMaxAgeDays drops evidence that is too old to describe the present.
 	sampleMaxAgeDays = 21
+	// minCycleEvidence is how many percentage points of movement the current
+	// cycle has to have produced before it can be priced on its own evidence.
+	// Below that the ratio is dominated by the 1-point rounding of the quota
+	// headers, so the estimate reaches back into earlier cycles - but only far
+	// enough to clear this bar, and newest first.
+	minCycleEvidence = 5
 )
 
 // Window is one quota window's accounting and calibration, keyed by length.
@@ -520,7 +531,7 @@ func (w *Window) advance(r windowReading, now time.Time) {
 	if w.HasLast && r.Percent > w.LastPercent {
 		dp := r.Percent - w.LastPercent
 		if w.PendingUSD > 0 {
-			w.Samples = append(w.Samples, Sample{DP: dp, USD: w.PendingUSD, TS: now.Unix()})
+			w.Samples = append(w.Samples, Sample{DP: dp, USD: w.PendingUSD, TS: now.Unix(), Cycle: w.Key})
 			w.pruneSamples(now)
 		} else {
 			// The percentage moved but we billed nothing for it: another client
@@ -538,8 +549,9 @@ func (w *Window) advance(r windowReading, now time.Time) {
 	w.ObservedAt = now.Unix()
 }
 
-// startCycle resets per-cycle accounting. Calibration samples deliberately
-// survive: they measure the size of the quota, which a rollover does not change.
+// startCycle resets per-cycle accounting. Calibration samples survive the roll,
+// but they no longer all count: freshEvidence prefers the ones this cycle
+// produced, because a rollover demonstrably can change the size of the quota.
 func (w *Window) startCycle(r windowReading, now time.Time, granted bool) {
 	w.Key = r.ResetAt
 	if r.ResetAt > 0 && w.Minutes > 0 {
@@ -703,12 +715,8 @@ func (w *Window) Estimate() Estimate {
 		e.AttributedUSD = 0
 	}
 
-	var sumDP, sumUSD float64
-	for _, s := range w.Samples {
-		sumDP += s.DP
-		sumUSD += s.USD
-	}
-	e.Samples = len(w.Samples)
+	sumDP, sumUSD, used := w.freshEvidence()
+	e.Samples = used
 	if sumDP > 0 && sumUSD > 0 {
 		e.QuotaByDelta = sumUSD / (sumDP / 100)
 	}
@@ -1577,4 +1585,41 @@ func appendEventLines(dir string, events []json.RawMessage) error {
 	}
 	_, err = f.WriteString(buf.String())
 	return err
+}
+
+// freshEvidence chooses which calibration samples still describe the quota.
+//
+// They do not all describe the same thing. Measured across the fleet over nine
+// days, the dollars behind one percentage point fell by about a third on every
+// account independently - so evidence from last week prices a quota that is no
+// longer the one being spent, and pooling it held the estimate 20-47% above
+// what the current cycle was actually measuring. The old code pooled everything
+// within 21 days on the reasoning that "a rollover does not change the size of
+// the quota". The measurements say otherwise.
+//
+// So: the current cycle's own samples, and earlier cycles' only to the extent
+// that this one has not yet moved enough to be divided by - newest first,
+// stopping the moment there is enough. A fresh cycle still gets an estimate
+// instead of a blank, and a cycle that has been running for a while is priced
+// entirely on itself.
+//
+// A window with no reset information has no cycles to tell apart: every sample
+// carries key 0, matches, and the estimate pools them exactly as before.
+func (w *Window) freshEvidence() (sumDP, sumUSD float64, used int) {
+	for _, s := range w.Samples {
+		if s.Cycle == w.Key {
+			sumDP += s.DP
+			sumUSD += s.USD
+			used++
+		}
+	}
+	// Samples are appended in time order, so walking backwards is newest first.
+	for i := len(w.Samples) - 1; i >= 0 && sumDP < minCycleEvidence; i-- {
+		if s := w.Samples[i]; s.Cycle != w.Key {
+			sumDP += s.DP
+			sumUSD += s.USD
+			used++
+		}
+	}
+	return sumDP, sumUSD, used
 }
