@@ -61,7 +61,7 @@ function liftVar(name) {
   return html.slice(from, i + 1);
 }
 
-const src = ["usd", "pct", "chartLabels", "buildBuckets", "agoLabel", "drawChart", "drawQuotaCurve"]
+const src = ["usd", "pct", "chartLabels", "buildBuckets", "agoLabel", "drawChart"]
   .map(lift).join("\n");
 eval(src);
 const I18N = eval("(" + liftVar("I18N") + ")");
@@ -151,23 +151,6 @@ check("real growth still rises", gLast[gLast.length - 1][1] < gLast[1][1], true)
 check("falls back when the field is absent",
   (drawChart(series, 1000, 165, true).match(/<polyline /g) || []).length, 1);
 
-const curve = drawQuotaCurve(series, 10080, 300, 96);
-check("quota curve renders", curve.startsWith("<svg"), true);
-check("curve has reference line", curve.includes("stroke-dasharray"), true);
-const cpts = curve.match(/<polyline[^>]*points='([^']+)'/)[1].split(" ").map(p => p.split(",").map(Number));
-check("curve point per known hour", cpts.length, 24);
-check("curve descends on screen as % rises", cpts[23][1] < cpts[0][1], true);
-
-// A rollover mid-series must restart the curve, not draw a sawtooth.
-const roll = series.map(p => ({ ...p }));
-for (let i = 36; i < 48; i++) roll[i].percent = i - 36;   // percentage drops at ago=11
-const rollCurve = drawQuotaCurve(roll, 10080, 300, 96);
-const rpts = rollCurve.match(/<polyline[^>]*points='([^']+)'/)[1].split(" ").map(p => p.split(",").map(Number));
-check("rollover restarts the curve", rpts.length, 12);
-
-// One reading is not a trend and must render nothing at all.
-check("single point draws nothing",
-  drawQuotaCurve([{ ago: 0, usd: 1, requests: 1, percent: 5 }], 10080, 300, 96), "");
 check("empty series handled", drawChart([], 300, 76, false).includes("No data"), true);
 
 // The SVG builders take their few words as an argument rather than reading a

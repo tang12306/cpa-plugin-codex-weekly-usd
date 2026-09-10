@@ -1442,7 +1442,6 @@ func (a *App) Report() map[string]any {
 			"total_usd":         round4(acct.TotalUSD),
 			"total_requests":    acct.TotalReqs,
 			"unpriced_requests": acct.UnpricedReqs,
-			"series":            seriesOf(acct, now),
 		}
 		if len(acct.UnpricedList) > 0 {
 			row["unpriced_models"] = acct.UnpricedList
@@ -1653,44 +1652,6 @@ func windowLabel(minutes int) string {
 	default:
 		return strconv.Itoa(minutes) + "m"
 	}
-}
-
-// seriesOf flattens the hourly buckets into an ascending series the dashboard
-// can draw directly.
-func seriesOf(acct *Account, now time.Time) []map[string]any {
-	if len(acct.Hours) == 0 {
-		return nil
-	}
-	hours := make([]int64, 0, len(acct.Hours))
-	for k := range acct.Hours {
-		if h, err := strconv.ParseInt(k, 10, 64); err == nil {
-			hours = append(hours, h)
-		}
-	}
-	sort.Slice(hours, func(i, j int) bool { return hours[i] < hours[j] })
-
-	nowHour := now.Unix() / 3600
-	out := make([]map[string]any, 0, len(hours))
-	cumulative := 0.0
-	for _, h := range hours {
-		bucket := acct.Hours[strconv.FormatInt(h, 10)]
-		if bucket == nil {
-			continue
-		}
-		cumulative += bucket.USD
-		point := map[string]any{
-			"ago":      nowHour - h,
-			"usd":      round6(bucket.USD),
-			"cum_usd":  round6(cumulative),
-			"requests": bucket.Requests,
-			"failed":   bucket.Failed,
-		}
-		if bucket.Percent > 0 {
-			point["percent"] = bucket.Percent
-		}
-		out = append(out, point)
-	}
-	return out
 }
 
 // fleetSeries sums spend across every credential into one hourly series.

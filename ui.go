@@ -192,8 +192,6 @@ const panelHTML = `<!doctype html>
   .sw{display:inline-block;vertical-align:middle;margin-right:5px}
   .sw.bar{width:9px;height:9px;border-radius:2px;background:var(--accent);opacity:.62}
   .sw.ln{width:15px;height:0;border-top:2px solid var(--good)}
-  .sw.ln.warn{border-top-color:var(--warn)}
-  .sw.ln.dash{border-top:2px dashed var(--muted)}
   .chartcap{font-size:12px;color:var(--muted);margin:2px 0 10px}
   .mwrap{overflow-x:auto}
   .mwrap table{min-width:0}
@@ -362,9 +360,6 @@ const panelHTML = `<!doctype html>
       mtModel: "模型", mtReq: "请求", mtFail: "失败", mtIn: "输入", mtOut: "输出",
       mtCache: "缓存命中", mtPrice: "单价(入/出)", mtAvg: "均价/次", mtUsd: "金额",
       mtNoPrice: "无价目", mtReasoning: "(含推理 {0})",
-      capHourly: "每小时消耗", capCumulative: "近 7 天",
-      capCurve: "额度百分比（{0}窗口）", capRef: "匀速参考线",
-      capCurveHint: "曲线高过虚线 = 照此速度会在重置前用完",
       pModel: "模型", pIn: "输入", pOut: "输出", pCacheR: "缓存读", pCacheW: "缓存写",
       pOverridden: "已覆盖",
       footPrices: "价目来源：{0}", footVia: "（{0}）", footFetched: "，同步于 {0}",
@@ -483,9 +478,6 @@ const panelHTML = `<!doctype html>
       mtModel: "Model", mtReq: "Req", mtFail: "Failed", mtIn: "Input", mtOut: "Output",
       mtCache: "Cache hit", mtPrice: "Rate (in/out)", mtAvg: "Avg/req", mtUsd: "Spend",
       mtNoPrice: "no price", mtReasoning: "(incl. reasoning {0})",
-      capHourly: "hourly spend", capCumulative: "trailing 7d",
-      capCurve: "quota % ({0} window)", capRef: "constant-rate reference",
-      capCurveHint: "above the dashed line = runs out before reset at this rate",
       pModel: "Model", pIn: "Input", pOut: "Output", pCacheR: "Cache read", pCacheW: "Cache write",
       pOverridden: "overridden",
       footPrices: "Prices: {0}", footVia: " ({0})", footFetched: ", fetched {0}",
@@ -704,67 +696,6 @@ const panelHTML = `<!doctype html>
     }
     return svg + "</svg>";
   }
-
-  // Quota percentage over time against a constant-rate reference. A curve above
-  // the dashed line is the visual form of a pace ratio greater than one: the
-  // window will be exhausted before it resets.
-  function drawQuotaCurve(series, windowMinutes, w, h, L) {
-    L = chartLabels(L);
-    if (!series || !series.length) return "";
-    var b = buildBuckets(series), span = b.span, i;
-
-    // Forward-fill: a percentage stays where it was until the next reading.
-    var fill = new Array(span), seen = null, any = false;
-    for (i = 0; i < span; i++) {
-      if (b.pct[i] !== null) { seen = b.pct[i]; any = true; }
-      fill[i] = seen;
-    }
-    if (!any) return "";
-
-    var padL = 34, padR = 6, padB = 14, padT = 8;
-    var iw = w - padL - padR, ih = h - padB - padT;
-    var cx = function (k) { return padL + iw * (span === 1 ? 0 : k / (span - 1)); };
-    var cy = function (v) { return padT + ih - ih * Math.min(100, Math.max(0, v)) / 100; };
-    var svg = "<svg viewBox='0 0 " + w + " " + h + "' width='100%' height='" + h + "'>";
-
-    for (i = 0; i <= 2; i++) {
-      var y = padT + ih - ih * i / 2;
-      svg += "<line x1='" + padL + "' y1='" + y.toFixed(1) + "' x2='" + (w - padR) + "' y2='" +
-             y.toFixed(1) + "' stroke='var(--grid)'/>";
-      svg += "<text x='" + (padL - 5) + "' y='" + (y + 4).toFixed(1) + "' text-anchor='end' " +
-             "font-size='10' fill='var(--muted)'>" + (i * 50) + "%</text>";
-    }
-
-    var first = 0;
-    while (first < span && fill[first] === null) first++;
-    // A falling percentage means the window rolled over. Only the current
-    // window is drawn, otherwise the curve is a sawtooth and the reference line
-    // gets anchored in a window that has already closed.
-    for (i = first + 1; i < span; i++) {
-      if (fill[i] < fill[i - 1] - 0.001) first = i;
-    }
-    // One point is not a curve; drawing it would show an empty box with a
-    // caption promising a trend that is not there yet.
-    if (span - first < 2) return "";
-
-    // Constant-rate reference: 100% spread evenly across the whole window.
-    if (windowMinutes > 0) {
-      var slope = 100 / (windowMinutes / 60);
-      var start = fill[first], endV = start + slope * (span - 1 - first);
-      svg += "<line x1='" + cx(first).toFixed(1) + "' y1='" + cy(start).toFixed(1) +
-             "' x2='" + cx(span - 1).toFixed(1) + "' y2='" + cy(endV).toFixed(1) +
-             "' stroke='var(--muted)' stroke-width='1.5' stroke-dasharray='4 3' opacity='.7'/>";
-    }
-
-    var pts = [];
-    for (i = first; i < span; i++) pts.push(cx(i).toFixed(1) + "," + cy(fill[i]).toFixed(1));
-    svg += "<polyline fill='none' stroke='var(--warn)' stroke-width='2' stroke-linejoin='round' " +
-           "points='" + pts.join(" ") + "'/>";
-    svg += "<circle cx='" + cx(span - 1).toFixed(1) + "' cy='" + cy(fill[span - 1]).toFixed(1) +
-           "' r='3' fill='var(--warn)'><title>" + pct(fill[span - 1]) + "</title></circle>";
-    return svg + "</svg>";
-  }
-
   function L() {
     return { noData: t("noData"), thisHour: t("thisHour"), hoursAgo: t("hoursAgo"),
              now: t("now"), total: t("total"), reqs: t("reqs") };
@@ -893,20 +824,7 @@ const panelHTML = `<!doctype html>
 
   function detailRow(a) {
     var boxes = (a.windows || []).map(windowDetail).join("");
-    var curveW = (a.windows || []).length ? a.windows[a.windows.length - 1].minutes : 0;
-    var curve = drawQuotaCurve(a.series, curveW, 300, 96, L());
-    var charts =
-      "<div style='margin-bottom:12px'>" + drawChart(a.series, 340, 80, false, L()) +
-        "<div class='chartcap'><i class='sw bar'></i>" + t("capHourly") +
-        " <i class='sw ln' style='margin-left:8px'></i>" + t("capCumulative") + "</div></div>" +
-      (curve
-        ? "<div>" + curve + "<div class='chartcap'><i class='sw ln warn'></i>" +
-          t("capCurve", curveW ? wname({ minutes: curveW }) : "") +
-          " <i class='sw ln dash' style='margin-left:8px'></i>" + t("capRef") +
-          "<br>" + t("capCurveHint") + "</div></div>"
-        : "");
-
-    return "<div class='wgrid'>" + boxes + "</div>" + charts;
+    return "<div class='wgrid'>" + boxes + "</div>";
   }
 
   function sortAccounts(list) {
