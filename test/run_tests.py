@@ -367,10 +367,14 @@ check("ships cumulative line chart", "polyline" in html, True)
 check("ships constant-rate reference", "stroke-dasharray" in html, True)
 check("charts are inline svg only", "<script src" not in html and "http://" not in html, True)
 check("ships a language switcher", 'id="lang"' in html, True)
-check("ships the availability board", 'id="modeltable"' in html, True)
+# Every Codex account serves every model off one meter, so a per-model board
+# repeated the same credential list once per model. The data stays in the
+# report - rotation reads the refusals out of it - but the page no longer
+# draws it.
+check("no per-model availability board", 'id="modeltable"' not in html, True)
 check("ships the rotation board", 'id="rottable"' in html, True)
-check("availability strings in both languages",
-      ("模型可用性" in html) and ("Model availability" in html), True)
+check("rotation strings in both languages",
+      ("凭据轮换" in html) and ("Credential rotation" in html), True)
 check("carries both dictionaries", ("zh: {" in html) and ("en: {" in html), True)
 check("both titles present", ("Codex 额度美元估算" in html) and ("Codex Quota USD" in html), True)
 # Dictionary parity is asserted in test_charts.js, which can evaluate the real

@@ -196,8 +196,6 @@ const panelHTML = `<!doctype html>
   .mwrap{overflow-x:auto}
   .mwrap table{min-width:0}
   .mwrap th,.mwrap td{padding:7px 14px 7px 0}
-  .mwrap td:last-child{white-space:normal;min-width:280px}
-  .chip{display:inline-block;margin:2px 5px 2px 0}
 </style>
 </head>
 <body>
@@ -224,11 +222,6 @@ const panelHTML = `<!doctype html>
 </div>
 
 <div id="alerts"></div>
-<div id="modelbox" class="box" hidden>
-  <h2 id="t-models"></h2>
-  <div class="mwrap"><table id="modeltable"></table></div>
-  <div class="chartcap" id="t-modelhint"></div>
-</div>
 <div id="rotbox" class="box" hidden>
   <h2><span id="t-rot"></span> <span class="legend" id="rot-status"></span></h2>
   <div class="mwrap"><table id="rottable"></table></div>
@@ -277,17 +270,8 @@ const panelHTML = `<!doctype html>
       sortPace: "按消耗节奏排序", sortName: "按名称排序",
       chartTitle: "全部凭据 · 用量走势", legendBars: "每小时消耗（左轴）", legendLine: "近 7 天消耗（右轴）",
       pricesTitle: "当前生效价目表（美元 / 百万 token）",
-      modelsTitle: "模型可用性",
-      modelsHint: "CPA 的冷却是按「凭据 × 模型」的：上游对每个模型有独立额度，所以一个凭据完全可以" +
-        "「astra 已耗尽、其它模型照跑」。某个模型的凭据全部冷却时，外部表现就是「只有这一个模型用不了」，" +
-        "而凭据状态和渠道状态都会显示正常。冷却到期时间取自上游返回的 reset，与代理实际使用的是同一个。",
-      mhModel: "模型", mhState: "状态", mhCap: "可用 / 凭据", mhBack: "最快恢复",
       staleCycle: "窗口已重置，读数待确认",
-      mhTraffic: "请求 / 失败", mhCreds: "各凭据状态", mhNone: "还没有模型可用性数据。",
-      msDown: "全部冷却", msDegraded: "部分冷却", msOK: "正常", msSingle: "单点凭据",
-      csCooling: "冷却", csRecovering: "待验证", csOK: "正常", csDisabled: "已停用",
-      csRejected: "凭据失效", csUntested: "(未试过)", mhUntested: "这个凭据还没服务过这个模型。它照样算容量——任何 Codex 账号都能跑任何模型——只是还没有它在这个模型上的实际记录。", mhRefusedOn: "在 {0} 上被上游拒绝：同一个 token，所以所有模型都用不了", rmRemoved: "{0} 个凭据已删除，不再显示：{1}",
-      mhEstimated: "估计", mhBlocks: "累计 {0} 次冷却", mhReason: "原因：{0}",
+      rmRemoved: "{0} 个凭据已删除，不再显示：{1}",
       rotTitle: "凭据轮换",
       rotHint: "轮换器维持固定数量的凭据处于启用状态，在成员快耗尽之前把它换掉。" +
         "代理的 fill-first 会在一个凭据被拒时于同一请求内改用下一个，所以只要替补已经在池子里，" +
@@ -315,7 +299,7 @@ const panelHTML = `<!doctype html>
       warnRotDegradedEta: "轮换器没能把池子补满（{0}/{1} 个仍在服务），暂时没有合格备用。" +
         "**当前请求不受影响**；最快 {2} 后会有候选恢复额度。",
       warnRotDry: "轮换器处于空跑模式：它会照常判断并记录，但不会真的改写凭据。确认记录无误后把 dry_run 关掉。",
-      mhWindowFull: "{0} 窗口已打满", mhLastOK: "最后成功于 {0}前",
+      rtNone: "还没有候选凭据。",
       updatedAt: "更新于 {0}",
       needKey: "请先填入管理密钥。", keyRejected: "管理密钥被拒绝。", reqFailed: "请求失败：HTTP {0}",
       loadFirst: "请先加载数据。",
@@ -386,19 +370,8 @@ const panelHTML = `<!doctype html>
       sortPace: "Sort by burn pace", sortName: "Sort by name",
       chartTitle: "All credentials · usage", legendBars: "Hourly spend (left axis)", legendLine: "Trailing 7 days (right axis)",
       pricesTitle: "Active rate card (USD per 1M tokens)",
-      modelsTitle: "Model availability",
-      modelsHint: "The proxy cools a credential down per model: upstream keeps a separate allowance " +
-        "for each one, so a credential can be out of astra while every other model keeps working. " +
-        "When every credential for a model is cooling at once it looks from the outside like just " +
-        "that one model is broken, while the credential and channel status both read as healthy. " +
-        "Deadlines come from the reset upstream reported, the same one the proxy cools down to.",
-      mhModel: "Model", mhState: "State", mhCap: "Available / credentials", mhBack: "First back",
       staleCycle: "window has reset; reading not yet confirmed",
-      mhTraffic: "Requests / failed", mhCreds: "Per credential", mhNone: "No model availability data yet.",
-      msDown: "all cooling", msDegraded: "partly cooling", msOK: "healthy", msSingle: "single credential",
-      csCooling: "cooling", csRecovering: "unverified", csOK: "ok", csDisabled: "disabled",
-      csRejected: "credential rejected", csUntested: "(untested)", mhUntested: "This credential has not served this model yet. It still counts as capacity - any Codex account can run any model - there is just no record of it doing so.", mhRefusedOn: "Refused upstream on {0}: same token, so no model can use it", rmRemoved: "{0} deleted credential(s) not shown: {1}",
-      mhEstimated: "estimated", mhBlocks: "{0} lockouts so far", mhReason: "reason: {0}",
+      rmRemoved: "{0} deleted credential(s) not shown: {1}",
       rotTitle: "Credential rotation",
       rotHint: "The rotator holds a fixed number of credentials enabled and replaces a member " +
         "before it runs out. The proxy's fill-first selector retries a refused request on the " +
@@ -433,7 +406,7 @@ const panelHTML = `<!doctype html>
         "standby qualifies yet. **Requests are unaffected**; the soonest candidate recovers in {2}.",
       warnRotDry: "The rotator is in dry run: it decides and records as usual but never rewrites a " +
         "credential. Turn dry_run off once the log looks right.",
-      mhWindowFull: "{0} window is full", mhLastOK: "last success {0} ago",
+      rtNone: "No candidate credentials yet.",
       updatedAt: "updated {0}",
       needKey: "Enter the management key first.", keyRejected: "Management key rejected.",
       reqFailed: "Request failed: HTTP {0}", loadFirst: "Load the data first.",
@@ -516,7 +489,6 @@ const panelHTML = `<!doctype html>
   var keyBox = el("key"), alerts = el("alerts"), rows = el("rows"), cards = el("cards");
   var wrap = el("wrap"), stamp = el("stamp"), foot = el("foot"), head = el("head");
   var chartbox = el("chartbox"), chart = el("chart"), pricebox = el("pricebox"), wtotals = el("wtotals");
-  var modelbox = el("modelbox"), modeltable = el("modeltable");
   var rotbox = el("rotbox"), rottable = el("rottable");
   var last = null, timer = null;
 
@@ -882,49 +854,6 @@ const panelHTML = `<!doctype html>
     return (w.code === "model_unavailable" || w.code === "rotator_stuck") ? "bad" : "warn";
   }
 
-  function modelStateTag(m) {
-    var cls = { down: "bad", degraded: "warn", ok: "ok" }[m.state] || "";
-    var word = { down: t("msDown"), degraded: t("msDegraded"), ok: t("msOK") }[m.state] || m.state;
-    var s = "<span class='tag " + cls + "'>" + word + "</span>";
-    if (m.single_point) s += " <span class='tag warn'>" + t("msSingle") + "</span>";
-    return s;
-  }
-
-  // One chip per credential. The title carries the detail an operator would
-  // otherwise have to dig out of the proxy log: why it is out, which window
-  // filled up, and when it comes back.
-  function credChip(c) {
-    var cls = { cooling: "bad", recovering: "warn", ok: "ok", disabled: "",
-                rejected: "bad" }[c.state] || "";
-    var word = { cooling: t("csCooling"), recovering: t("csRecovering"),
-                 ok: t("csOK"), disabled: t("csDisabled"),
-                 rejected: t("csRejected") }[c.state] || c.state;
-    var label = esc(c.credential) + " · " + word;
-    if (c.state === "cooling") {
-      label += " " + dur(c.cooldown_in_seconds) + (c.cooldown_estimated ? "?" : "");
-    }
-    // A rejection does not expire, so a countdown would be a lie. What matters
-    // is how long it has been refused and why.
-    if (c.state === "rejected" && c.rejected_age_seconds !== undefined) {
-      label += " " + dur(c.rejected_age_seconds);
-    }
-    // Counted as capacity because every account serves every model, not
-    // because this credential has shown anything on this one. Said quietly -
-    // it is the normal state of a standby - but said.
-    if (c.untested && c.state === "ok") label += " " + t("csUntested");
-    var tip = [];
-    if (c.untested) tip.push(t("mhUntested"));
-    if (c.refused_on) tip.push(t("mhRefusedOn", c.refused_on));
-    if (c.reason) tip.push(t("mhReason", c.reason));
-    if (c.blocked_window) tip.push(t("mhWindowFull", c.blocked_window));
-    if (c.cooldown_until) tip.push(c.cooldown_until + (c.cooldown_estimated ? " (" + t("mhEstimated") + ")" : ""));
-    if (c.last_ok_age_seconds !== undefined) tip.push(t("mhLastOK", dur(c.last_ok_age_seconds)));
-    if (c.blocks) tip.push(t("mhBlocks", c.blocks));
-    tip.push(t("mhTraffic") + ": " + (c.requests || 0) + " / " + (c.failed || 0));
-    return "<span class='chip tag " + cls + (c.state === "disabled" ? " off" : "") +
-           "' title='" + esc(tip.join("\n")) + "'>" + label + "</span>";
-  }
-
   var SKIPS = { dead_token: "skDead", exhausted: "skExhausted", below_floor: "skFloor",
                 probe_failed: "skProbe", excluded_by_config: "skExcluded",
                 recently_rotated: "skRecent" };
@@ -964,7 +893,7 @@ const panelHTML = `<!doctype html>
 
     var rows = r.candidates || [];
     if (!rows.length) {
-      rottable.innerHTML = "<tbody><tr><td>" + t("mhNone") + "</td></tr></tbody>";
+      rottable.innerHTML = "<tbody><tr><td>" + t("rtNone") + "</td></tr></tbody>";
     } else {
       var h = "<thead><tr><th>" + t("rtCred") + "</th><th>" + t("rtRole") + "</th><th>" +
               t("rtHead") + "</th><th>" + t("rtWindow") + "</th><th>" + t("rtReset") +
@@ -1003,29 +932,6 @@ const panelHTML = `<!doctype html>
     rotbox.hidden = false;
   }
 
-  function renderModels(models) {
-    if (!models || !models.length) {
-      modeltable.innerHTML = "<tbody><tr><td>" + t("mhNone") + "</td></tr></tbody>";
-      modelbox.hidden = false;
-      return;
-    }
-    var h = "<thead><tr><th>" + t("mhModel") + "</th><th>" + t("mhState") + "</th><th>" +
-            t("mhCap") + "</th><th>" + t("mhBack") + "</th><th>" + t("mhTraffic") + "</th><th>" +
-            t("mhCreds") + "</th></tr></thead><tbody>";
-    models.forEach(function (m) {
-      h += "<tr><td><span class='name'>" + esc(m.model) + "</span></td>" +
-           "<td>" + modelStateTag(m) + "</td>" +
-           "<td class='num'>" + m.available + " / " + m.credentials +
-             (m.disabled ? " <span class='sub2'>+" + m.disabled + " " + t("csDisabled") + "</span>" : "") + "</td>" +
-           "<td class='num'>" + (m.next_recovery_in_seconds === undefined
-             ? "—" : dur(m.next_recovery_in_seconds)) + "</td>" +
-           "<td class='num'>" + (m.requests || 0) + " / " + (m.failed || 0) + "</td>" +
-           "<td>" + (m.by_credential || []).map(credChip).join("") + "</td></tr>";
-    });
-    modeltable.innerHTML = h + "</tbody>";
-    modelbox.hidden = false;
-  }
-
   function applyStatic() {
     document.documentElement.lang = LANG === "zh" ? "zh-CN" : "en";
     el("t-title").textContent = t("title");
@@ -1038,11 +944,9 @@ const panelHTML = `<!doctype html>
     el("t-lg1").textContent = t("legendBars");
     el("t-lg2").textContent = t("legendLine");
     el("t-prices").textContent = t("pricesTitle");
-    el("t-models").textContent = t("modelsTitle");
     el("t-rot").textContent = t("rotTitle");
     el("t-rothint").innerHTML = t("rotHint");
     el("t-rotlog").textContent = t("rotLogTitle");
-    el("t-modelhint").innerHTML = t("modelsHint");
     var opts = el("sort").options;
     var names = ["sortQuota", "sortRemain", "sortUsed", "sortPace", "sortName"];
     for (var i = 0; i < opts.length; i++) opts[i].textContent = t(names[i]);
@@ -1053,7 +957,6 @@ const panelHTML = `<!doctype html>
     last = data;
     alerts.innerHTML = "";
     (data.warnings || []).forEach(function (w) { note(warnClass(w), warnText(w)); });
-    renderModels(data.models);
     renderRotator(data.rotator);
 
     var accounts = data.accounts || [];
@@ -1206,7 +1109,7 @@ const panelHTML = `<!doctype html>
     api("data").then(render).catch(function (err) {
       alerts.innerHTML = ""; note("bad", err.message);
       cards.hidden = wrap.hidden = chartbox.hidden = pricebox.hidden = true;
-      modelbox.hidden = rotbox.hidden = true;
+      rotbox.hidden = true;
       wtotals.innerHTML = "";
     });
   }
@@ -1223,7 +1126,7 @@ const panelHTML = `<!doctype html>
   el("forget").addEventListener("click", function () {
     localStorage.removeItem(STORE); keyBox.value = ""; last = null;
     cards.hidden = wrap.hidden = chartbox.hidden = pricebox.hidden = true;
-    modelbox.hidden = rotbox.hidden = true;
+    rotbox.hidden = true;
     alerts.innerHTML = ""; stamp.textContent = ""; wtotals.innerHTML = "";
     if (timer) { clearInterval(timer); timer = null; }
   });

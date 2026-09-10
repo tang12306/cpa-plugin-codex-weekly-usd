@@ -66,12 +66,12 @@ const src = ["usd", "pct", "chartLabels", "buildBuckets", "agoLabel", "drawChart
 eval(src);
 const I18N = eval("(" + liftVar("I18N") + ")");
 
-// The availability chips are built by the same page, so they are lifted the
-// same way. They read the language through t(), which needs LANG and I18N in
-// scope; everything else about them is a pure string transform.
+// The per-model rows are built by the same page, so they are lifted the same
+// way. They read the language through t(), which needs LANG and I18N in scope;
+// everything else about them is a pure string transform.
 let LANG = "en";
 const t = eval("(" + lift("t").replace(/^  function t/, "function t") + ")");
-eval(["esc", "dur", "modelStateTag", "credChip", "row2", "perModelRows"].map(lift).join("\n"));
+eval(["esc", "dur", "row2", "perModelRows"].map(lift).join("\n"));
 
 let failures = 0;
 function check(name, got, want) {
@@ -183,46 +183,8 @@ check("every value is a string", zhKeys.every(k => typeof I18N.zh[k] === "string
 
 console.log();
 console.log("=".repeat(74));
-console.log("I. availability chips");
+console.log("I. the per-model quota table");
 console.log("=".repeat(74));
-// The board is what an operator reads during an outage, so the chips have to
-// say which credential, what state, and how long - in the selected language.
-const cooling = credChip({ credential: "cred-a.json", state: "cooling", requests: 40,
-                           failed: 2, blocks: 3, cooldown_in_seconds: 3660,
-                           cooldown_until: "2026-09-06T16:07:00Z", reason: "usage_limit_reached",
-                           blocked_window: "5h", cooldown_estimated: false });
-check("cooling chip is marked bad", cooling.includes("tag bad"), true);
-check("cooling chip names the credential", cooling.includes("cred-a.json"), true);
-check("cooling chip shows the countdown", cooling.includes("1h1m"), true);
-check("cooling chip carries the reason", cooling.includes("usage_limit_reached"), true);
-check("cooling chip carries the deadline", cooling.includes("2026-09-06T16:07:00Z"), true);
-
-const guess = credChip({ credential: "c", state: "cooling", cooldown_in_seconds: 600,
-                         cooldown_estimated: true });
-check("an estimated deadline is marked", guess.includes("10m?"), true);
-
-check("a healthy chip is not alarming",
-  credChip({ credential: "c", state: "ok" }).includes("tag ok"), true);
-check("a disabled chip is greyed",
-  credChip({ credential: "c", state: "disabled" }).includes("off"), true);
-
-// A credential name arrives from the auth file and is not trusted markup.
-check("credential names are escaped",
-  credChip({ credential: "<img src=x>", state: "ok" }).includes("&lt;img"), true);
-
-check("a dead model reads as bad",
-  modelStateTag({ state: "down", single_point: false }).includes("tag bad"), true);
-check("a single credential is flagged",
-  modelStateTag({ state: "ok", single_point: true }).includes("single credential"), true);
-
-LANG = "zh";
-check("chips follow the language",
-  credChip({ credential: "c", state: "cooling", cooldown_in_seconds: 60 }).includes("冷却"), true);
-check("state tags follow the language",
-  modelStateTag({ state: "down", single_point: false }).includes("全部冷却"), true);
-LANG = "en";
-
-// I. the per-model quota table
 // One pool of quota shown at every model's price. The expensive model buys
 // less window, so the two figures have to sit side by side: which one applies
 // is decided by what the credential is about to be asked to serve.

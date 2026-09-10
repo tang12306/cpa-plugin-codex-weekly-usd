@@ -6,16 +6,16 @@ import (
 	"time"
 )
 
-// CLIProxyAPI cools a credential down per model, not as a whole: upstream keeps
-// a separate allowance for each model, so one credential can happily serve
-// gpt-5.6-sol while it is locked out of gpt-6-astra. A model goes dark when
-// every credential that serves it is cooling at the same time, and from the
-// outside that looks nothing like a credential outage - the auth list still
-// reports every file as active and every other model keeps working.
+// CLIProxyAPI cools a credential down per model, not as a whole. Upstream does
+// not keep a separate allowance per model - every model reads the same meter,
+// and once it is full the other models are almost always refused too (19 of 23
+// tries in three weeks of production traffic; the four exceptions were at the
+// very edge of a window). So the per-model split is bookkeeping, not capacity,
+// and the panel no longer draws it.
 //
-// This file tracks the standing of each (credential, model) pair so the panel
-// can answer "why is this one model failing, and when does it come back"
-// without anyone reading the proxy's logs.
+// The ledger stays because two things read it: the rotator takes 401/403
+// refusals out of it, and the report warns when a model has nothing left to
+// serve it.
 
 const (
 	// fullPercent is where a window counts as exhausted. Upstream reports whole

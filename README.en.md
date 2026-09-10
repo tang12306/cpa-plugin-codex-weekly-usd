@@ -5,7 +5,7 @@ English · [简体中文](README.md)
 A [CLIProxyAPI](https://github.com/router-for-me/CLIProxyAPI) plugin. Values each Codex credential's quota windows (5-hour / weekly) in US dollars at public OpenAI API pricing.
 
 - **What it's worth**: quota, spent and remaining per window, priced separately per model
-- **Whether it works now**: how many credentials can serve each model, which are cooling down, when they recover
+- **Whether it works now**: alerts when a credential is refused upstream or nothing is left to serve
 - **Rotation** (optional): switch credentials before they run out
 
 ## How it works
