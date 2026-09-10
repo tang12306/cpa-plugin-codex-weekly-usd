@@ -17,7 +17,7 @@ window quota (USD) = spend / (used percent / 100)
 ```
 
 - Windows are identified by length, not by the primary / secondary slot (upstream has swapped them once)
-- A window is one quota pool, metered on one gauge for every model. But **a dollar buys a different share of it in each model** (measured: gpt-6-astra consumes about 1.4x what gpt-5.6-sol does), so quota is estimated per model. The ratio between models is measured inside a single window, then carried to credentials that have never served a given model
+- A window is one quota pool, metered on one gauge for every model. But **a dollar buys a different share of it in each model** (measured: gpt-6-astra consumes about 1.4x what gpt-5.6-sol does), so quota is estimated per model. The ratio between models is measured inside a single window (read from the event log, hourly), then carried to credentials that have never served a given model. Nothing is estimated without enough data: measuring needs the model to move the meter 10+ points on its own, carrying needs 5+ such windows that agree; anything short shows "not enough data"
 - Calibration uses the current cycle's evidence, reaching back to earlier cycles only when there is too little
 
 ## Install

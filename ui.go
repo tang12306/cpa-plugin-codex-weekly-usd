@@ -372,7 +372,13 @@ const panelHTML = `<!doctype html>
       dByWindow: "窗口法估算", dByDelta: "步进法估算", dNA: "不可用",
       dSamples: "校准样本", dSamplesV: "{0} 条 / 覆盖 {1}",
       dPerModel: "分模型额度", dPerModelHint: "同一个额度池，按每个模型分别折算：这么多钱的该模型会把本窗口用完。剩余同理。",
-      dCarried: "推算", dMeasured: "实测", dDominant: "当前主力",
+      dCarried: "推算", dMeasured: "实测", dDominant: "当前主力", dWindowsN: "{0} 个窗口",
+      dCarriedTip: "这个凭据没有实测过这个模型：用它 {0} 的实测额度，乘以两个模型的比值推算。" +
+        "比值是 {1} 个同时跑过这两个模型的窗口的中位数。",
+      dMeasuredTip: "由这个窗口里该模型自己的用量直接算出。",
+      dInsufficient: "数据不足",
+      dInsufficientTip: "要实测，这个窗口里它自己得推动额度至少 {1} 个点；要推算，得有至少 {0} 个窗口里它和" +
+        "另一个模型都各自推动 ≥{1} 个点，且结果一致。现在有 {2} 个这样的窗口。",
       dCoverage: "整窗覆盖", dYes: "是", dNoMid: "否（中途接管）",
       dCycles: "已观察周期", dCyclesV: "{0} 次", dGranted: "，其中 {0} 次周期内重置",
       dExternal: "外部消耗", dExternalV: "{0}（不在本插件账上）", dNone: "无",
@@ -484,7 +490,14 @@ const panelHTML = `<!doctype html>
       dByWindow: "Window estimate", dByDelta: "Delta estimate", dNA: "n/a",
       dSamples: "Calibration", dSamplesV: "{0} samples / {1} covered",
       dPerModel: "Quota by model", dPerModelHint: "One pool of quota, priced in each model: this much of that model would consume the window. Remaining likewise.",
-      dCarried: "carried", dMeasured: "measured", dDominant: "in use",
+      dCarried: "carried", dMeasured: "measured", dDominant: "in use", dWindowsN: "{0} windows",
+      dCarriedTip: "Not measured on this credential: its measured {0} figure times the ratio " +
+        "between the two models, which is the median of {1} windows that ran both.",
+      dMeasuredTip: "Measured from this model's own spend in this window.",
+      dInsufficient: "not enough data",
+      dInsufficientTip: "To be measured it has to move this window's meter {1}+ points on its own; to be " +
+        "carried, at least {0} windows need it and another model each moving the meter {1}+ points, " +
+        "and agreeing. There are {2} such windows so far.",
       dCoverage: "Full-cycle coverage", dYes: "yes", dNoMid: "no (joined mid-cycle)",
       dCycles: "Cycles observed", dCyclesV: "{0}", dGranted: ", {0} granted mid-cycle",
       dExternal: "External usage", dExternalV: "{0} (not on this ledger)", dNone: "none",
@@ -774,24 +787,51 @@ const panelHTML = `<!doctype html>
   // One quota pool priced in every model, cheapest first. A model this window
   // has never served is still listed, carried across the fleet-wide ratio and
   // labelled as such, because that is exactly the credential about to be handed
-  // traffic it has not seen.
+  // traffic it has not seen - and when nothing solid enough backs a figure, the
+  // line says "not enough data" instead of showing a weak one.
   function perModelRows(e) {
-    var q = e.quota_usd_by_model;
-    if (!q) { return ""; }
-    var names = Object.keys(q).sort(function (a, b) { return q[b] - q[a]; });
-    if (!names.length) { return ""; }
+    var q = e.quota_usd_by_model || {};
     var rem = e.remaining_usd_by_model || {};
     var src = e.quota_model_source || {};
+    var wins = e.quota_model_windows || {};
+    var rule = e.quota_model_rule || {};
+    var seen = {};
+    Object.keys(q).concat(Object.keys(src)).forEach(function (m) { seen[m] = true; });
+    // Priced models by what the window buys, then the ones without a figure.
+    var names = Object.keys(seen).sort(function (a, b) {
+      var pa = a in q, pb = b in q;
+      if (pa !== pb) return pa ? -1 : 1;
+      return pa ? q[b] - q[a] : (a < b ? -1 : 1);
+    });
+    if (!names.length) { return ""; }
     var body = names.map(function (m) {
+      if (!(m in q)) {
+        // No figure at all rather than a weak one. It says how far short it is.
+        var have = wins[m] || 0;
+        return "<div class='pmrow'><span class='pmname'>" + esc(m) + "</span>" +
+          "<span class='pmq'>—</span><span class='pmr'>—</span>" +
+          "<span class='pms dim' title='" +
+          esc(t("dInsufficientTip", rule.windows, rule.points, have)) + "'>" +
+          esc(t("dInsufficient") + (rule.windows ? " · " + t("dWindowsN", have + "/" + rule.windows) : "")) +
+          "</span></div>";
+      }
       var carried = (src[m] || "").indexOf("carried") === 0;
+      // A carried figure is only as good as the ratio behind it, so it says
+      // how many windows that ratio rests on, and what it was carried from.
+      var label = carried
+        ? t("dCarried") + (wins[m] ? " · " + t("dWindowsN", wins[m]) : "")
+        : t("dMeasured");
+      var tip = carried
+        ? t("dCarriedTip", src[m].replace(/^carried from /, ""), wins[m] || "?")
+        : t("dMeasuredTip");
       return "<div class='pmrow" + (m === e.dominant_model ? " pmnow" : "") + "'>" +
         "<span class='pmname'>" + esc(m) +
         (m === e.dominant_model ? " <span class='tag ok'>" + t("dDominant") + "</span>" : "") +
         "</span>" +
         "<span class='pmq'>" + usd(q[m]) + "</span>" +
         "<span class='pmr'>" + usd(rem[m] || 0) + "</span>" +
-        "<span class='pms" + (carried ? " dim" : "") + "'>" +
-        (carried ? t("dCarried") : t("dMeasured")) + "</span></div>";
+        "<span class='pms" + (carried ? " dim" : "") + "' title='" + esc(tip) + "'>" +
+        esc(label) + "</span></div>";
     }).join("");
     return row2(t("dPerModel"), "<div class='pm' title='" + esc(t("dPerModelHint")) + "'>" + body + "</div>");
   }

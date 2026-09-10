@@ -1734,17 +1734,43 @@ print("=========================================================================
 # the moment traffic moves - which is what actually happened, and what looked
 # for a while like the quota itself shrinking by a third.
 shutil.rmtree(DATA_DIR, ignore_errors=True)
-# sol: $2.00 buys one point, so sol prices this window at $200.
-steps = [("usage.handle", weekly(i, auth="cred-a.json")) for i in range(6)]
-# astra: 2.5x the price per request, and five points each. The same window is
-# worth $100 of astra - it burns twice as fast per dollar.
-steps += [("usage.handle", weekly(5 + 5 * i, model="gpt-6-astra", auth="cred-a.json"))
-          for i in range(6)]
-# A second credential that has only ever served sol. It must still be able to
-# say what its window is worth in astra, because it is exactly the credential
-# the rotator is about to hand astra traffic to.
-steps += [("usage.handle", weekly(i, auth="cred-b.json")) for i in range(6)]
-rep = run(steps, auth_list=[authfile("cred-a.json"), authfile("cred-b.json")])
+
+
+def mixed(auth, sol_step=1, sol_requests=11):
+    """sol, then astra, on one credential. At sol_step points per request, $2.00
+    of sol moves the meter sol_step points; astra is 2.5x the price per request
+    and moves it five, so the window is worth half as many dollars in astra.
+    Eleven sol readings move the meter ten points, enough to count."""
+    out = [("usage.handle", weekly(sol_step * i, auth=auth)) for i in range(sol_requests)]
+    top = sol_step * (sol_requests - 1)
+    out += [("usage.handle", weekly(top + 5 * i, model="gpt-6-astra", auth=auth))
+            for i in range(6)]
+    return out
+
+
+def sol_only(auth, requests=11):
+    """sol alone. Eleven readings are ten points of meter: a $200 window."""
+    return [("usage.handle", weekly(i, auth=auth)) for i in range(requests)]
+
+
+def mixing(names, **last):
+    """mixed() on each credential, the last one with its own arguments."""
+    out = []
+    for i, n in enumerate(names):
+        out += mixed(n, **(last if i == len(names) - 1 else {}))
+    return out
+
+
+MIXERS = ["cred-%s.json" % c for c in "acdef"]
+AUTHS = [authfile(n) for n in ["cred-b.json"] + MIXERS]
+
+# sol: $2.00 buys one point, so sol prices this window at $200; the same window
+# is worth $100 of astra - it burns twice as fast per dollar. Five credentials
+# run both, because that is what it takes before a ratio is carried anywhere.
+# One more has only ever served sol. It must still be able to say what its
+# window is worth in astra, because it is exactly the credential the rotator is
+# about to hand astra traffic to.
+rep = run(mixing(MIXERS) + sol_only("cred-b.json"), auth_list=AUTHS)
 
 a = win(rep, WEEK, account="cred-a.json")["estimate"]
 bym = a.get("quota_usd_by_model") or {}
@@ -1753,11 +1779,11 @@ check("and in astra, separately", round(bym.get("gpt-6-astra", 0), 2), 100.00)
 check("both from this window's own evidence",
       (a.get("quota_model_source") or {}).get("gpt-6-astra"), "measured")
 check("the model taking the traffic is named", a.get("dominant_model"), "gpt-6-astra")
-# Remaining follows the same split: 30% of the pool is gone whichever model
-# spent it, so what is left is 70% of each model's own figure.
+# Remaining follows the same split: 35% of the pool is gone whichever model
+# spent it, so what is left is 65% of each model's own figure.
 rem = a.get("remaining_usd_by_model") or {}
-check("remaining is priced per model too", round(rem.get("gpt-6-astra", 0), 2), 70.00)
-check("and differs from the sol figure", round(rem.get("gpt-5.6-sol", 0), 2), 140.00)
+check("remaining is priced per model too", round(rem.get("gpt-6-astra", 0), 2), 65.00)
+check("and differs from the sol figure", round(rem.get("gpt-5.6-sol", 0), 2), 130.00)
 
 b = win(rep, WEEK, account="cred-b.json")["estimate"]
 bym = b.get("quota_usd_by_model") or {}
@@ -1767,6 +1793,8 @@ check("and says the figure was carried, not measured",
       (b.get("quota_model_source") or {}).get("gpt-6-astra"), "carried from gpt-5.6-sol")
 check("while its own model is measured",
       (b.get("quota_model_source") or {}).get("gpt-5.6-sol"), "measured")
+check("and says how many windows the ratio rests on",
+      (b.get("quota_model_windows") or {}).get("gpt-6-astra"), 5)
 
 print()
 print("==========================================================================")
@@ -1777,19 +1805,78 @@ print("=========================================================================
 # is not a five-hour one, so only a ratio taken against the same pool says
 # anything about the models.
 shutil.rmtree(DATA_DIR, ignore_errors=True)
-# cred-a's pool is half the size of cred-b's, and only cred-b ever mixes models.
-steps = [("usage.handle", weekly(2 * i, auth="cred-a.json")) for i in range(6)]
-steps += [("usage.handle", weekly(i, auth="cred-b.json")) for i in range(6)]
-steps += [("usage.handle", weekly(5 + 5 * i, model="gpt-6-astra", auth="cred-b.json"))
-          for i in range(6)]
-rep = run(steps, auth_list=[authfile("cred-a.json"), authfile("cred-b.json")])
-a = win(rep, WEEK, account="cred-a.json")["estimate"]
-bym = a.get("quota_usd_by_model") or {}
+# cred-g's pool is half the size of the others', and only the others mix models.
+steps = [("usage.handle", weekly(2 * i, auth="cred-g.json")) for i in range(6)]
+rep = run(steps + mixing(MIXERS), auth_list=AUTHS + [authfile("cred-g.json")])
+g = win(rep, WEEK, account="cred-g.json")["estimate"]
+bym = g.get("quota_usd_by_model") or {}
 check("the small pool is priced in sol", round(bym.get("gpt-5.6-sol", 0), 2), 100.00)
-# Half the pool, same 2x model ratio: $50, not the $100 that carrying cred-b's
-# absolute figure across would have given.
+# Half the pool, same 2x model ratio: $50, not the $100 that carrying another
+# account's absolute figure across would have given.
 check("and carries the ratio, not the other account's dollars",
       round(bym.get("gpt-6-astra", 0), 2), 50.00)
+
+print()
+print("==========================================================================")
+print("AR2. nothing is estimated without enough data behind it")
+print("==========================================================================")
+# One window used to be enough to carry a figure, and five points of meter
+# within it. On the live fleet that priced luna from two windows holding $0.67
+# of luna between them. A figure short of real support is not shown at all: the
+# line says so instead, and says how far short it is.
+
+
+def about_b(rep, key, model="gpt-6-astra"):
+    est = win(rep, WEEK, account="cred-b.json")["estimate"]
+    return (est.get(key) or {}).get(model)
+
+
+shutil.rmtree(DATA_DIR, ignore_errors=True)
+rep = run(mixing(MIXERS[:4]) + sol_only("cred-b.json"), auth_list=AUTHS)
+check("four windows are not enough to carry a figure", about_b(rep, "quota_usd_by_model"), None)
+check("the model is listed as short of data, not dropped",
+      about_b(rep, "quota_model_source"), "insufficient")
+check("with how far it has got", about_b(rep, "quota_model_windows"), 4)
+check("and the bar it has to clear",
+      (win(rep, WEEK, account="cred-b.json")["estimate"].get("quota_model_rule") or {}).get("windows"), 5)
+
+shutil.rmtree(DATA_DIR, ignore_errors=True)
+# Five windows, but in one of them sol moved the meter five points - which on
+# whole-number percentages can be off by a fifth either way. It does not count.
+rep = run(mixing(MIXERS, sol_requests=6) + sol_only("cred-b.json"), auth_list=AUTHS)
+check("a window that barely moved does not count", about_b(rep, "quota_usd_by_model"), None)
+
+shutil.rmtree(DATA_DIR, ignore_errors=True)
+# Five windows that disagree: sol at $2, $1 and 50 cents a point against the
+# same astra. A median of numbers that far apart describes none of them.
+rep = run(mixed("cred-a.json") + mixed("cred-c.json") + mixed("cred-d.json", sol_step=2)
+          + mixed("cred-e.json", sol_step=4) + mixed("cred-f.json", sol_step=4)
+          + sol_only("cred-b.json"), auth_list=AUTHS)
+check("windows that disagree do not settle a ratio", about_b(rep, "quota_usd_by_model"), None)
+check("even when there are enough of them", about_b(rep, "quota_model_windows"), 5)
+
+shutil.rmtree(DATA_DIR, ignore_errors=True)
+# Measured has the same bar: five points of this window's own meter is not a
+# measurement, and nothing can be carried from a figure that is not there.
+rep = run(mixing(MIXERS) + sol_only("cred-b.json", requests=6), auth_list=AUTHS)
+check("five points of meter is not a measurement",
+      about_b(rep, "quota_model_source", "gpt-5.6-sol"), "insufficient")
+check("and nothing is carried from it", about_b(rep, "quota_model_source"), "insufficient")
+# The headline figure has its own confidence label and is not touched by this.
+check("the window's own estimate is untouched",
+      win(rep, WEEK, account="cred-b.json")["estimate"]["method"] != "none", True)
+
+shutil.rmtree(DATA_DIR, ignore_errors=True)
+# Production's ratios come from the event log, which holds weeks of requests the
+# live samples never saw - and nothing tested that path. It was never even read
+# when there was no state file, the one time the log is all there is. Run the
+# mixing credentials, throw the state away, and start again from the log alone.
+run(mixing(MIXERS), auth_list=AUTHS)
+os.remove(os.path.join(DATA_DIR, "state.json"))
+rep = run(sol_only("cred-b.json"), auth_list=AUTHS)
+check("the ratio is recovered from the event log",
+      round(about_b(rep, "quota_usd_by_model") or 0, 2), 100.00)
+check("with the windows it rests on", about_b(rep, "quota_model_windows"), 5)
 
 print()
 print("==========================================================================")

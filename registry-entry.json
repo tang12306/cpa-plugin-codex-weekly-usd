@@ -3,7 +3,7 @@
   "name": "Codex Quota USD",
   "description": "把每个 Codex 凭据的每个额度窗口（5 小时 / 一周）换算成官方 API 计费下的美元：按官方价目给 token 计价，除以上游返回的额度百分比，反推该窗口额度值多少钱、还剩多少、烧得快不快。Values each Codex credential's quota windows in USD at public OpenAI API pricing.",
   "author": "tang12306",
-  "version": "2.8.0",
+  "version": "2.8.1",
   "repository": "https://github.com/tang12306/cpa-plugin-codex-weekly-usd",
   "homepage": "https://github.com/tang12306/cpa-plugin-codex-weekly-usd",
   "license": "MIT",

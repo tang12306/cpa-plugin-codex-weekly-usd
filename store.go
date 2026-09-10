@@ -281,9 +281,10 @@ type App struct {
 
 	rot *rotator
 
-	// bootWeights are the model burn ratios recovered from the event log at
-	// startup, used only until live calibration can measure them.
-	bootWeights ModelWeights
+	// logWeights are the model burn ratios read from the event log, at startup
+	// and then hourly. The log holds every request the live samples hold and
+	// weeks more, so it is what the ratios come from whenever it can answer.
+	logWeights ModelWeights
 
 	dirty     bool
 	events    []json.RawMessage
@@ -321,6 +322,7 @@ func newApp(cfg Config) (*App, error) {
 	app.rot = newRotator(app)
 	app.prices.setOverrides(cfg.PriceOverrides)
 	app.loadState()
+	app.loadModelWeights()
 	app.start()
 	return app, nil
 }
@@ -383,6 +385,10 @@ func (a *App) loop() {
 				a.prices.refresh(url)
 				a.pruneEventLogs()
 			}
+			// The ratios were read once at startup and never again, so a
+			// plugin left running for a week kept pricing models on whatever
+			// the log said the day it loaded.
+			a.refreshModelWeights()
 		}
 	}
 }
@@ -729,14 +735,101 @@ type Estimate struct {
 	QuotaByModel     map[string]float64 `json:"quota_usd_by_model,omitempty"`
 	RemainingByModel map[string]float64 `json:"remaining_usd_by_model,omitempty"`
 	ModelSource      map[string]string  `json:"quota_model_source,omitempty"`
-	DominantModel    string             `json:"dominant_model,omitempty"`
+	// ModelWindows is, for each carried figure, how many windows the ratio
+	// behind it rests on - and for a model without a figure, how many there
+	// are so far. A carried figure is only as good as that ratio.
+	ModelWindows  map[string]int `json:"quota_model_windows,omitempty"`
+	DominantModel string         `json:"dominant_model,omitempty"`
+	// ModelRule is the bar a figure has to clear, sent along whenever some
+	// model falls short of it, so the panel can say by how much.
+	ModelRule *ModelRule `json:"quota_model_rule,omitempty"`
+}
+
+// ModelRule is the evidence a per-model figure needs: Points of meter that the
+// model moved on its own in a window, and Windows such windows agreeing on its
+// ratio to another model before the figure can be carried.
+type ModelRule struct {
+	Windows int     `json:"windows"`
+	Points  float64 `json:"points"`
 }
 
 // ModelWeights is how fast each model burns a window per dollar spent, as
 // ratios between models. The scale is arbitrary and never reported: only
-// weight[a]/weight[b] is ever used, which is what makes the numbers comparable
+// Ratio[a]/Ratio[b] is ever used, which is what makes the numbers comparable
 // across accounts whose quotas are different sizes.
-type ModelWeights map[string]float64
+//
+// Ratio holds only the models whose ratio is settled. Windows holds every model
+// the fleet has served, with the number of windows behind its ratio - zero for
+// one nothing has measured - so a model can be listed as short of evidence
+// rather than vanish.
+type ModelWeights struct {
+	Ratio   map[string]float64
+	Windows map[string]int
+}
+
+// Nothing is estimated without enough data behind it; short of that, the panel
+// says so instead of printing a number.
+//
+// A window counts toward a ratio only where both models moved the meter at
+// least minRatioPoints on their own: percentages arrive as whole numbers, so a
+// five-point move can be off by a fifth either way. A ratio is used only once
+// minRatioWindows such windows exist - the median of five survives two bad
+// ones - and the middle half of them sits within maxRatioSpread of the median.
+//
+// Measured on this fleet: sol, 13 windows with the middle half between 0.71
+// and 0.79 around 0.74 - settled. terra, 3 windows. luna, 1. Under the first
+// rules (one window, five points) luna was priced from $0.67 of luna, and one
+// of terra's windows put it at 2.9x where the rest sat near 1.2x.
+const (
+	minRatioWindows = 5
+	minRatioPoints  = 10.0
+	maxRatioSpread  = 1.25
+)
+
+// settledRatio reports whether a set of per-window ratios is enough to use: at
+// least minRatioWindows of them, with the middle half close to the median.
+func settledRatio(rs []float64) bool {
+	if len(rs) < minRatioWindows {
+		return false
+	}
+	sorted := append([]float64(nil), rs...)
+	sort.Float64s(sorted)
+	med := median(sorted)
+	q := len(sorted) / 4
+	lo, hi := sorted[q], sorted[len(sorted)-1-q]
+	return med > 0 && lo >= med/maxRatioSpread && hi <= med*maxRatioSpread
+}
+
+// modelEvidence is what one window says about one model on its own: the
+// points it moved the meter by and the dollars that took.
+type modelEvidence struct{ dp, usd float64 }
+
+// ratioEvidence folds one window into the per-pair ratio lists. Only models
+// that moved the meter far enough on their own to be worth dividing by count.
+func ratioEvidence(pool map[string]modelEvidence, seen map[string]int, ratios map[string]map[string][]float64) {
+	q := map[string]float64{}
+	for m, ev := range pool {
+		if ev.dp >= minRatioPoints && ev.usd > 0 {
+			q[m] = ev.usd / (ev.dp / 100)
+		}
+	}
+	for m := range q {
+		seen[m]++
+	}
+	for m, qm := range q {
+		for n, qn := range q {
+			if m == n {
+				continue
+			}
+			if ratios[m] == nil {
+				ratios[m] = map[string][]float64{}
+			}
+			// quota is dollars per window, so it moves opposite to the burn
+			// rate: the cheaper-per-dollar model buys more window.
+			ratios[m][n] = append(ratios[m][n], qn/qm)
+		}
+	}
+}
 
 // dominantShare is how much of a sample's spend must belong to one model
 // before that sample is allowed to price it. Below this the sample is a blend
@@ -745,10 +838,23 @@ const dominantShare = 0.95
 
 // localQuota prices the window in each model this window's own evidence can
 // speak for. It needs no weights: a sample where one model produced 95% of the
-// spend measures that model directly.
+// spend measures that model directly - once that model has moved the meter by
+// minRatioPoints, the same bar a window has to clear to count toward a ratio.
 func (w *Window) localQuota() map[string]float64 {
-	type acc struct{ dp, usd float64 }
-	per := map[string]*acc{}
+	out := map[string]float64{}
+	for m, a := range w.localEvidence() {
+		if a.dp >= minRatioPoints && a.usd > 0 {
+			out[m] = a.usd / (a.dp / 100)
+		}
+	}
+	return out
+}
+
+// localEvidence gathers, per model, the samples in which that model produced
+// 95% of the spend: current cycle first, reaching back only while some model is
+// short of a figure worth dividing by.
+func (w *Window) localEvidence() map[string]modelEvidence {
+	per := map[string]*modelEvidence{}
 	fold := func(s Sample) {
 		if s.DP <= 0 || s.USD <= 0 || len(s.ByModel) == 0 {
 			return
@@ -759,7 +865,7 @@ func (w *Window) localQuota() map[string]float64 {
 			}
 			a := per[m]
 			if a == nil {
-				a = &acc{}
+				a = &modelEvidence{}
 				per[m] = a
 			}
 			a.dp += s.DP
@@ -772,8 +878,9 @@ func (w *Window) localQuota() map[string]float64 {
 			fold(s)
 		}
 	}
-	// Reach back exactly as freshEvidence does, and for the same reason: a
-	// cycle that has just rolled has not moved enough to be divided by.
+	// Reach back as freshEvidence does, and for the same reason: a cycle that
+	// has just rolled has not moved enough to be divided by. The bar is the
+	// per-model one, since that is what these figures have to clear.
 	for i := len(w.Samples) - 1; i >= 0; i-- {
 		s := w.Samples[i]
 		if s.Cycle == w.Key {
@@ -781,7 +888,7 @@ func (w *Window) localQuota() map[string]float64 {
 		}
 		short := false
 		for _, a := range per {
-			if a.dp < minCycleEvidence {
+			if a.dp < minRatioPoints {
 				short = true
 			}
 		}
@@ -790,16 +897,14 @@ func (w *Window) localQuota() map[string]float64 {
 		}
 		fold(s)
 	}
-	out := map[string]float64{}
+	out := make(map[string]modelEvidence, len(per))
 	for m, a := range per {
-		if a.dp >= minCycleEvidence && a.usd > 0 {
-			out[m] = a.usd / (a.dp / 100)
-		}
+		out[m] = *a
 	}
 	return out
 }
 
-func (w *Window) Estimate() Estimate { return w.EstimateWith(nil) }
+func (w *Window) Estimate() Estimate { return w.EstimateWith(ModelWeights{}) }
 
 func (w *Window) EstimateWith(weights ModelWeights) Estimate {
 	var e Estimate
@@ -879,9 +984,6 @@ func (e *Estimate) fillModels(w *Window, weights ModelWeights) {
 		}
 	}
 
-	if len(local) == 0 && (e.QuotaUSD <= 0 || e.DominantModel == "") {
-		return
-	}
 	quota := map[string]float64{}
 	source := map[string]string{}
 	for m, q := range local {
@@ -892,7 +994,7 @@ func (e *Estimate) fillModels(w *Window, weights ModelWeights) {
 	// keeping - by share, not by count, because a cycle that spent $37 of one
 	// model and one cent of another is not a blend of anything, and demanding
 	// a single entry threw away the reading over that cent.
-	if _, ok := quota[e.DominantModel]; !ok && e.QuotaUSD > 0 && best > 0 {
+	if _, ok := quota[e.DominantModel]; !ok && e.QuotaUSD > 0 && best > 0 && e.Evidence >= minRatioPoints {
 		total := 0.0
 		for _, agg := range w.ByModel {
 			if agg != nil {
@@ -906,14 +1008,15 @@ func (e *Estimate) fillModels(w *Window, weights ModelWeights) {
 
 	// Carry to the models this window has no evidence for. The anchor is the
 	// best-evidenced model we do have a figure for.
-	if len(weights) > 0 && len(quota) > 0 {
+	windows := map[string]int{}
+	if len(weights.Ratio) > 0 && len(quota) > 0 {
 		// The model taking the traffic anchors the carry when we have priced it,
 		// because that is the figure the rest of the panel is describing. Map
 		// order is random, so the fallback is by name rather than by luck: two
 		// renders of the same state must not disagree.
 		anchor, anchorQ := "", 0.0
 		for m, q := range quota {
-			if weights[m] <= 0 {
+			if weights.Ratio[m] <= 0 {
 				continue
 			}
 			if m == e.DominantModel {
@@ -925,20 +1028,54 @@ func (e *Estimate) fillModels(w *Window, weights ModelWeights) {
 			}
 		}
 		if anchor != "" {
-			for m, wm := range weights {
+			for m, wm := range weights.Ratio {
 				if _, ok := quota[m]; ok || wm <= 0 {
 					continue
 				}
-				quota[m] = anchorQ * weights[anchor] / wm
+				quota[m] = anchorQ * weights.Ratio[anchor] / wm
 				source[m] = "carried from " + anchor
+				// The ratio between two models that are not the weights' own
+				// anchor goes through it, so it is as thin as the thinner leg.
+				n := weights.Windows[m]
+				if na := weights.Windows[anchor]; na < n {
+					n = na
+				}
+				windows[m] = n
 			}
 		}
 	}
-	if len(quota) == 0 {
+	// Every model the fleet has served, and every model this window has, gets
+	// a line. One that can be neither measured nor carried says so rather than
+	// dropping off the list: a model that silently disappears reads as one
+	// nobody uses, not as one nothing is known about.
+	short := false
+	listed := func(m string) {
+		if _, ok := source[m]; ok || m == "" {
+			return
+		}
+		source[m] = "insufficient"
+		windows[m] = weights.Windows[m]
+		short = true
+	}
+	for m := range weights.Windows {
+		listed(m)
+	}
+	for m := range w.ByModel {
+		listed(m)
+	}
+	if len(source) == 0 {
 		return
 	}
-	e.QuotaByModel = quota
+	if len(quota) > 0 {
+		e.QuotaByModel = quota
+	}
 	e.ModelSource = source
+	if len(windows) > 0 {
+		e.ModelWindows = windows
+	}
+	if short {
+		e.ModelRule = &ModelRule{Windows: minRatioWindows, Points: minRatioPoints}
+	}
 	e.RemainingByModel = map[string]float64{}
 	for m, q := range quota {
 		r := q * (1 - w.Percent/100)
@@ -1054,18 +1191,15 @@ func (a *App) loadState() {
 		hostLog("info", fmt.Sprintf("migrated %d credential(s) to per-length windows; prior calibration discarded because it mixed window sizes", migrated))
 	}
 	a.rot.restore(sf.Rotator)
+}
 
-	// Recover the model ratios from history. Stored calibration carries no
-	// model split before this version, so without this the ratios cannot be
-	// learned until some window happens to serve two models - which on a fleet
-	// that has moved wholesale to one model may be a long wait.
-	if a.bootWeights = a.bootstrapModelWeights(); len(a.bootWeights) > 1 {
-		parts := make([]string, 0, len(a.bootWeights))
-		for m, w := range a.bootWeights {
-			parts = append(parts, fmt.Sprintf("%s=%.2f", m, w))
-		}
-		sort.Strings(parts)
-		hostLog("info", "model burn ratios recovered from the event log: "+strings.Join(parts, " "))
+// loadModelWeights recovers the model ratios from the event log. It runs apart
+// from loadState, which returns early when there is no state file: a fresh or
+// unreadable state is exactly when the log is the only record there is, and it
+// used to be skipped in precisely that case.
+func (a *App) loadModelWeights() {
+	if a.logWeights = bootstrapModelWeights(a.cfg.DataDir); len(a.logWeights.Windows) > 0 {
+		hostLog("info", "model burn ratios recovered from the event log: "+describeWeights(a.logWeights))
 	}
 }
 
@@ -1882,12 +2016,22 @@ func copyUSD(in map[string]float64) map[string]float64 {
 // evidence, and that is exactly the credential the rotator is about to promote
 // into traffic it has never seen.
 //
+// The event log is read first. It holds every request the live samples hold
+// and weeks more, read the same way; the live samples used to take over the
+// moment they covered two models, which meant one window this week replacing
+// fourteen from the log - and every model only the log had seen dropping off
+// the panel at once.
+//
 // Caller holds a.mu.
 func (a *App) deriveModelWeights() ModelWeights {
-	// Every window that priced two or more models on its own evidence
-	// contributes one ratio per pair.
+	if len(a.logWeights.Windows) > 0 {
+		return a.logWeights
+	}
+	// No event log: every window that priced two or more models on its own
+	// evidence contributes one ratio per pair.
 	ratios := map[string]map[string][]float64{}
 	seen := map[string]int{}
+	known := map[string]bool{}
 	for _, acct := range a.accounts {
 		if acct == nil {
 			continue
@@ -1896,34 +2040,40 @@ func (a *App) deriveModelWeights() ModelWeights {
 			if w == nil {
 				continue
 			}
-			local := w.localQuota()
-			for m := range local {
-				seen[m]++
+			for m := range w.ByModel {
+				known[m] = true
 			}
-			for m, qm := range local {
-				for n, qn := range local {
-					if m == n || qm <= 0 || qn <= 0 {
-						continue
-					}
-					if ratios[m] == nil {
-						ratios[m] = map[string][]float64{}
-					}
-					// quota is dollars per window, so it moves opposite to the
-					// burn rate: the cheaper-per-dollar model buys more window.
-					ratios[m][n] = append(ratios[m][n], qn/qm)
-				}
-			}
+			ratioEvidence(w.localEvidence(), seen, ratios)
 		}
 	}
-	// weight[m]/weight[anchor] = quota[anchor]/quota[m]: quota is dollars per
-	// window, so it moves opposite to the burn rate.
-	live := weightsFrom(seen, ratios)
-	if len(live) >= 2 {
-		return live
+	return weightsFrom(seen, ratios, known)
+}
+
+// refreshModelWeights re-reads the ratios from the event log. The scan happens
+// outside the lock: it reads every log file, and requests must not wait on it.
+func (a *App) refreshModelWeights() {
+	a.mu.Lock()
+	dir := a.cfg.DataDir
+	a.mu.Unlock()
+	weights := bootstrapModelWeights(dir)
+	a.mu.Lock()
+	a.logWeights = weights
+	a.mu.Unlock()
+}
+
+// describeWeights renders the ratios for the log, each with the number of
+// windows behind it, and the models still short of a settled one.
+func describeWeights(w ModelWeights) string {
+	parts := make([]string, 0, len(w.Windows))
+	for m, n := range w.Windows {
+		if r, ok := w.Ratio[m]; ok {
+			parts = append(parts, fmt.Sprintf("%s=%.2f (%d windows)", m, r, n))
+		} else {
+			parts = append(parts, fmt.Sprintf("%s=not enough data (%d windows)", m, n))
+		}
 	}
-	// Nothing has watched two models against one pool yet. The event log has,
-	// and it is the same evidence read the same way.
-	return a.bootWeights
+	sort.Strings(parts)
+	return strings.Join(parts, " ")
 }
 
 func median(in []float64) float64 {
@@ -1951,11 +2101,11 @@ func median(in []float64) float64 {
 // This reads the same evidence the live path does and pairs it the same way:
 // the quota header describes the state before the request it arrives with, so
 // spend accumulates until the percentage moves and is then attributed to that
-// move. Run once at startup; the live samples take over as they accumulate.
-func (a *App) bootstrapModelWeights() ModelWeights {
-	paths, err := filepath.Glob(filepath.Join(a.cfg.DataDir, "events", "*.jsonl"))
+// move. Run at startup and hourly after that.
+func bootstrapModelWeights(dataDir string) ModelWeights {
+	paths, err := filepath.Glob(filepath.Join(dataDir, "events", "*.jsonl"))
 	if err != nil || len(paths) == 0 {
-		return nil
+		return ModelWeights{}
 	}
 	sort.Strings(paths)
 
@@ -1980,6 +2130,8 @@ func (a *App) bootstrapModelWeights() ModelWeights {
 		pend    map[string]float64
 	}
 	runs := map[poolKey]*run{}
+	// Every model the log has seen served, measured or not.
+	known := map[string]bool{}
 
 	for _, path := range paths {
 		fh, errOpen := os.Open(path)
@@ -1997,6 +2149,7 @@ func (a *App) bootstrapModelWeights() ModelWeights {
 			if json.Unmarshal(sc.Bytes(), &e) != nil || !e.Priced || e.Failed || e.Model == "" {
 				continue
 			}
+			known[e.Model] = true
 			for key, val := range raw {
 				if !strings.HasPrefix(key, "pct_") {
 					continue
@@ -2050,33 +2203,26 @@ func (a *App) bootstrapModelWeights() ModelWeights {
 	ratios := map[string]map[string][]float64{}
 	seen := map[string]int{}
 	for _, pool := range pools {
-		local := map[string]float64{}
+		ev := make(map[string]modelEvidence, len(pool))
 		for m, a := range pool {
-			if a.dp >= minCycleEvidence && a.usd > 0 {
-				local[m] = a.usd / (a.dp / 100)
-			}
+			ev[m] = modelEvidence{a.dp, a.usd}
 		}
-		for m := range local {
-			seen[m]++
-		}
-		for m, qm := range local {
-			for n, qn := range local {
-				if m == n {
-					continue
-				}
-				if ratios[m] == nil {
-					ratios[m] = map[string][]float64{}
-				}
-				ratios[m][n] = append(ratios[m][n], qn/qm)
-			}
-		}
+		ratioEvidence(ev, seen, ratios)
 	}
-	return weightsFrom(seen, ratios)
+	return weightsFrom(seen, ratios, known)
 }
 
 // weightsFrom turns per-window model ratios into one comparable set, anchored
-// on whichever model the most windows have priced.
-func weightsFrom(seen map[string]int, ratios map[string]map[string][]float64) ModelWeights {
+// on whichever model the most windows have priced. A model's ratio is used only
+// once it is settled (see settledRatio): a figure carried across a thinner one
+// is a guess, and a guess printed as a dollar amount reads as a measurement.
+// Every model in known is kept in Windows either way, so it can be listed as
+// short of data rather than disappear.
+func weightsFrom(seen map[string]int, ratios map[string]map[string][]float64, known map[string]bool) ModelWeights {
+	out := ModelWeights{Ratio: map[string]float64{}, Windows: map[string]int{}}
+	for m := range known {
+		out.Windows[m] = 0
+	}
 	anchor := ""
 	for m, n := range seen {
 		if anchor == "" || n > seen[anchor] || (n == seen[anchor] && m < anchor) {
@@ -2084,19 +2230,21 @@ func weightsFrom(seen map[string]int, ratios map[string]map[string][]float64) Mo
 		}
 	}
 	if anchor == "" {
-		return nil
+		return out
 	}
-	out := ModelWeights{anchor: 1}
+	out.Ratio[anchor] = 1
+	out.Windows[anchor] = seen[anchor]
 	for m := range seen {
 		if m == anchor {
 			continue
 		}
-		if rs := ratios[m][anchor]; len(rs) > 0 {
-			out[m] = median(rs)
+		// weight[m]/weight[anchor] = quota[anchor]/quota[m]: quota is dollars
+		// per window, so it moves opposite to the burn rate.
+		rs := ratios[m][anchor]
+		out.Windows[m] = len(rs)
+		if settledRatio(rs) {
+			out.Ratio[m] = median(rs)
 		}
-	}
-	if len(out) < 2 {
-		return nil
 	}
 	return out
 }

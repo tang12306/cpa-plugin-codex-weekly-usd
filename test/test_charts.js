@@ -202,6 +202,28 @@ check("a carried figure is not passed off as measured",
   perModel.includes("carried"), true);
 check("and is visually distinguished", perModel.includes("pms dim"), true);
 check("remaining is shown beside the quota", perModel.includes("$70"), true);
+// A carried figure is only as good as the ratio behind it, so it says so.
+const backed = perModelRows({
+  quota_usd_by_model: { "gpt-5.6-sol": 200, "gpt-6-astra": 100 },
+  quota_model_source: { "gpt-5.6-sol": "measured", "gpt-6-astra": "carried from gpt-5.6-sol" },
+  quota_model_windows: { "gpt-6-astra": 5 },
+});
+check("a carried figure says how many windows back it", backed.includes("carried · 5 windows"), true);
+check("and what it was carried from", backed.includes("its measured gpt-5.6-sol figure"), true);
+// Short of that, no figure at all - and the line says how far short.
+const short = perModelRows({
+  quota_usd_by_model: { "gpt-6-astra": 67.4 },
+  quota_model_source: { "gpt-6-astra": "measured", "gpt-5.6-terra": "insufficient" },
+  quota_model_windows: { "gpt-5.6-terra": 3 },
+  quota_model_rule: { windows: 5, points: 10 },
+});
+check("a model without enough data is still listed", short.includes("gpt-5.6-terra"), true);
+check("says so instead of a number", short.includes("not enough data · 3/5"), true);
+check("and comes after the priced ones",
+  short.indexOf("gpt-6-astra") < short.indexOf("gpt-5.6-terra"), true);
+check("its tooltip gives the bar", short.includes("at least 5 windows"), true);
+check("a window with no figure at all still lists its models",
+  perModelRows({ quota_model_source: { "gpt-5.6-luna": "insufficient" } }).includes("gpt-5.6-luna"), true);
 // A window nothing has priced renders nothing, not an empty table.
 check("no estimate, no table", perModelRows({}), "");
 // Model names come from upstream and are not trusted markup.
