@@ -1215,6 +1215,20 @@ func lookupAuth(entries []authEntry, acct *Account) (authEntry, bool) {
 	return authEntry{}, false
 }
 
+// hasAccount reports whether a credential has any accounting yet. Caller holds
+// a.mu - accountFor takes the lock itself and would deadlock from Report.
+func (a *App) hasAccount(e authEntry) bool {
+	for _, acct := range a.accounts {
+		if acct == nil {
+			continue
+		}
+		if _, ok := lookupAuth([]authEntry{e}, acct); ok {
+			return true
+		}
+	}
+	return false
+}
+
 // Report builds the JSON payload the dashboard renders.
 //
 // It holds the state lock for the whole build. The accounts it walks are the
@@ -1269,6 +1283,33 @@ func (a *App) Report() map[string]any {
 	var totalReqs, totalFailed int64
 
 	for _, acct := range accounts {
+		// A deleted credential is settled before anything about it is counted.
+		// It used to be settled after: its windows had already gone into the
+		// fleet totals by the time the row was dropped, so the panel reported
+		// twelve credentials in one place and nine in another - three of the
+		// twelve being accounts whose files no longer exist. The guard on
+		// len(entries) matters: an auth list that came back empty is a failure
+		// to ask, not evidence that every credential was deleted.
+		if _, known := lookupAuth(entries, acct); !known && len(entries) > 0 {
+			var newest int64
+			for _, w := range acct.Windows {
+				if w != nil && w.ObservedAt > newest {
+					newest = w.ObservedAt
+				}
+			}
+			gone := map[string]any{
+				"auth_id":        acct.AuthID,
+				"total_usd":      round4(acct.TotalUSD),
+				"total_requests": acct.TotalReqs,
+				"last_seen":      nil,
+			}
+			if newest > 0 {
+				gone["last_seen"] = time.Unix(newest, 0).UTC().Format(time.RFC3339)
+			}
+			removed = append(removed, gone)
+			continue
+		}
+
 		windows := make([]map[string]any, 0, len(acct.Windows))
 		lengths := make([]int, 0, len(acct.Windows))
 		for _, w := range acct.Windows {
@@ -1435,26 +1476,40 @@ func (a *App) Report() map[string]any {
 			row["disabled"] = entry.Disabled
 			row["status"] = entry.Status
 			row["unavailable"] = entry.Unavailable
-		} else if len(entries) > 0 {
-			// The host no longer lists this credential: the auth file was
-			// deleted. Its accounting is real history and stays in state.json,
-			// but showing it beside live credentials invites reading a deleted
-			// account as a working one - and it cannot be acted on, since there
-			// is nothing left to enable. The guard on len(entries) matters: an
-			// auth list that came back empty is a failure to ask, not evidence
-			// that every credential was deleted.
-			removed = append(removed, map[string]any{
-				"auth_id":        acct.AuthID,
-				"total_usd":      round4(acct.TotalUSD),
-				"total_requests": acct.TotalReqs,
-				"last_seen":      row["observed_at"],
-			})
-			continue
 		} else {
+			// Only reachable with an empty auth list: deleted credentials
+			// were settled at the top of the loop.
 			row["label"] = acct.AuthID
 		}
 
 		rows = append(rows, row)
+	}
+
+	// A credential that has never served anything has no accounting, and so
+	// had no row: the panel counted nine credentials while ten existed. It is
+	// capacity all the same - every account can serve every model - and it is
+	// exactly the one the operator needs to see, since its quota windows have
+	// not started and will not until something is sent through it.
+	for _, e := range entries {
+		if e.Type != "" && e.Type != "codex" {
+			continue
+		}
+		if a.hasAccount(e) {
+			continue
+		}
+		rows = append(rows, map[string]any{
+			"auth_id":        firstNonEmpty(e.Name, e.ID),
+			"label":          firstNonEmpty(e.Label, e.Email, e.Name),
+			"email":          e.Email,
+			"disabled":       e.Disabled,
+			"status":         e.Status,
+			"unavailable":    e.Unavailable,
+			"has_quota_data": false,
+			"never_used":     true,
+			"windows":        []map[string]any{},
+			"total_usd":      0.0,
+			"total_requests": int64(0),
+		})
 	}
 
 	sort.Slice(rows, func(i, j int) bool {

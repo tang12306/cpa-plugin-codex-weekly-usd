@@ -333,7 +333,7 @@ const panelHTML = `<!doctype html>
       warnModelSingleOff: "模型 {0} 只有 1 个可用凭据（{1}），另有 {2} 个已停用。" +
         "它一旦撞 429，该模型就整体不可用。",
       totalsTitle: "{0} 窗口合计",
-      cCreds: "凭据数", cQuota: "额度总值", cSpent: "已用", cRemain: "剩余",
+      cCreds: "凭据数", cWinCreds: "有此窗口读数", cQuota: "额度总值", cSpent: "已用", cRemain: "剩余",
       cPriced: "{0} 个已定价", cAtRisk: "{0} 个逼近上限",
       cObserved: "实测消耗", cObservedN: "最长窗口内，插件亲眼记账部分",
       cSaved: "缓存省下", cSavedN: "对比全价输入",
@@ -454,7 +454,7 @@ const panelHTML = `<!doctype html>
       warnModelSingleOff: "Model {0} runs on a single credential ({1}), with {2} more disabled. " +
         "Its next 429 takes the whole model down.",
       totalsTitle: "{0} window totals",
-      cCreds: "Credentials", cQuota: "Quota value", cSpent: "Spent", cRemain: "Remaining",
+      cCreds: "Credentials", cWinCreds: "With a reading", cQuota: "Quota value", cSpent: "Spent", cRemain: "Remaining",
       cPriced: "{0} priced", cAtRisk: "{0} near the limit",
       cObserved: "Observed spend", cObservedN: "What the plugin billed itself, longest window",
       cSaved: "Cache savings", cSavedN: "vs paying full input price",
@@ -1158,10 +1158,15 @@ const panelHTML = `<!doctype html>
 
     // One summary block per window length: the 5-hour and the weekly limit are
     // separate quotas, and the same spend counts against both.
+    // Each window card counts the credentials that have a reading for that
+    // window - a subset of the fleet, not a second fleet count. Both used to
+    // be labelled "credentials", so the page said twelve in one place and nine
+    // in another; the denominator makes the relationship impossible to misread.
     var wt = data.window_totals || [];
+    var fleetCreds = (data.totals || {}).credentials;
     wtotals.innerHTML = wt.map(function (x) {
       return "<div class='box'><h2>" + t("totalsTitle", wname(x)) + "</h2><div class='cards' style='margin:0'>" +
-        card(t("cCreds"), x.credentials,
+        card(t("cWinCreds"), fleetCreds ? x.credentials + " / " + fleetCreds : x.credentials,
              t("cPriced", x.estimated) + (x.at_risk ? " · " + t("cAtRisk", x.at_risk) : "")) +
         card(t("cQuota"), usd(x.quota_usd)) +
         card(t("cSpent"), usd(x.spent_usd)) +
