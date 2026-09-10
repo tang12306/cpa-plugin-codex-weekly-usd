@@ -24,9 +24,12 @@ HARNESS = os.path.join(BUILD, "harness")
 DATA_DIR = os.path.join(BUILD, "cwu-test")
 os.makedirs(BUILD, exist_ok=True)
 
-IN_TOKENS = 200_000
-OUT_TOKENS = 33_333
-COST = IN_TOKENS / 1e6 * 5 + OUT_TOKENS / 1e6 * 30  # $2.00 (to 5 decimals)
+# Chosen so one request costs exactly $2.00 at the sol rate card, which is what
+# every round number in this suite is built on.
+IN_TOKENS = 250_000
+OUT_TOKENS = 50_000
+SOL_IN, SOL_OUT, SOL_CACHE = 4, 20, 0.4
+COST = IN_TOKENS / 1e6 * SOL_IN + OUT_TOKENS / 1e6 * SOL_OUT  # $2.00 exactly
 WEEK = 10080
 FIVEH = 300
 RESET_W = 1787424611
@@ -171,7 +174,8 @@ print("=" * 74)
 shutil.rmtree(DATA_DIR, ignore_errors=True)
 rep = run([("usage.handle", weekly(0, cache_read=100_000))])
 w = win(rep, WEEK)
-want = 100_000 / 1e6 * 5 + 100_000 / 1e6 * 0.5 + OUT_TOKENS / 1e6 * 30
+want = ((IN_TOKENS - 100_000) / 1e6 * SOL_IN + 100_000 / 1e6 * SOL_CACHE
+        + OUT_TOKENS / 1e6 * SOL_OUT)
 check("cached request cost", round(w["usd_observed"], 4), round(want, 4))
 check("reasoning tokens recorded", w["tokens"]["ReasoningTokens"], 12000)
 

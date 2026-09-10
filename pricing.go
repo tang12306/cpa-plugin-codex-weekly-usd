@@ -42,10 +42,11 @@ var builtinPrices = map[string]Price{
 	"gpt-5.4-pro":         {Input: 30, Output: 180},
 	"gpt-5.5":             {Input: 5, Output: 30, CacheRead: 0.5},
 	"gpt-5.5-pro":         {Input: 30, Output: 180},
-	"gpt-5.6":             {Input: 5, Output: 30, CacheRead: 0.5, CacheWrite: 6.25},
-	"gpt-5.6-sol":         {Input: 5, Output: 30, CacheRead: 0.5, CacheWrite: 6.25},
+	"gpt-5.6":             {Input: 4, Output: 20, CacheRead: 0.4, CacheWrite: 5},
+	"gpt-5.6-sol":         {Input: 4, Output: 20, CacheRead: 0.4, CacheWrite: 5},
 	"gpt-5.6-terra":       {Input: 2, Output: 12, CacheRead: 0.2, CacheWrite: 2.5},
 	"gpt-5.6-luna":        {Input: 0.2, Output: 1.2, CacheRead: 0.02, CacheWrite: 0.25},
+	"gpt-6-astra":         {Input: 10, Output: 50, CacheRead: 1, CacheWrite: 12.5},
 }
 
 // effortSuffixes are reasoning-effort decorations that gateways append to a
