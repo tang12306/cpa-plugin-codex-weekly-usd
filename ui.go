@@ -175,6 +175,14 @@ const panelHTML = `<!doctype html>
   .wgrid{display:grid;grid-template-columns:repeat(auto-fit,minmax(330px,1fr));gap:18px;margin-bottom:16px}
   .wbox{border:1px solid var(--line);border-radius:9px;padding:12px 14px;background:var(--panel)}
   .kv{display:grid;grid-template-columns:auto auto;gap:3px 14px;font-size:12.5px}
+  .pm{display:grid;gap:2px;min-width:0}
+  .pmrow{display:grid;grid-template-columns:1fr auto auto auto;gap:10px;align-items:baseline;white-space:nowrap}
+  .pmrow.pmnow{font-weight:600}
+  .pmname{overflow:hidden;text-overflow:ellipsis}
+  .pmq,.pmr{font-variant-numeric:tabular-nums;text-align:right}
+  .pmr{opacity:.85}
+  .pms{font-size:11px;opacity:.7}
+  .pms.dim{opacity:.45;font-style:italic}
   .kv .k{color:var(--muted)}
   .kv .v{text-align:right;font-variant-numeric:tabular-nums}
   .toggle{cursor:pointer;user-select:none;color:var(--accent)}
@@ -344,6 +352,8 @@ const panelHTML = `<!doctype html>
       dInOut: "输入 / 输出", dCacheRead: "缓存读取",
       dByWindow: "窗口法估算", dByDelta: "步进法估算", dNA: "不可用",
       dSamples: "校准样本", dSamplesV: "{0} 条 / 覆盖 {1}",
+      dPerModel: "分模型额度", dPerModelHint: "同一个额度池，按每个模型分别折算：这么多钱的该模型会把本窗口用完。剩余同理。",
+      dCarried: "推算", dMeasured: "实测", dDominant: "当前主力",
       dCoverage: "整窗覆盖", dYes: "是", dNoMid: "否（中途接管）",
       dCycles: "已观察周期", dCyclesV: "{0} 次", dGranted: "，其中 {0} 次周期内重置",
       dExternal: "外部消耗", dExternalV: "{0}（不在本插件账上）", dNone: "无",
@@ -463,6 +473,8 @@ const panelHTML = `<!doctype html>
       dInOut: "Input / output", dCacheRead: "Cache reads",
       dByWindow: "Window estimate", dByDelta: "Delta estimate", dNA: "n/a",
       dSamples: "Calibration", dSamplesV: "{0} samples / {1} covered",
+      dPerModel: "Quota by model", dPerModelHint: "One pool of quota, priced in each model: this much of that model would consume the window. Remaining likewise.",
+      dCarried: "carried", dMeasured: "measured", dDominant: "in use",
       dCoverage: "Full-cycle coverage", dYes: "yes", dNoMid: "no (joined mid-cycle)",
       dCycles: "Cycles observed", dCyclesV: "{0}", dGranted: ", {0} granted mid-cycle",
       dExternal: "External usage", dExternalV: "{0} (not on this ledger)", dNone: "none",
@@ -796,6 +808,31 @@ const panelHTML = `<!doctype html>
 
   function row2(k, v) { return "<div class='k'>" + esc(k) + "</div><div class='v'>" + v + "</div>"; }
 
+  // One quota pool priced in every model, cheapest first. A model this window
+  // has never served is still listed, carried across the fleet-wide ratio and
+  // labelled as such, because that is exactly the credential about to be handed
+  // traffic it has not seen.
+  function perModelRows(e) {
+    var q = e.quota_usd_by_model;
+    if (!q) { return ""; }
+    var names = Object.keys(q).sort(function (a, b) { return q[b] - q[a]; });
+    if (!names.length) { return ""; }
+    var rem = e.remaining_usd_by_model || {};
+    var src = e.quota_model_source || {};
+    var body = names.map(function (m) {
+      var carried = (src[m] || "").indexOf("carried") === 0;
+      return "<div class='pmrow" + (m === e.dominant_model ? " pmnow" : "") + "'>" +
+        "<span class='pmname'>" + esc(m) +
+        (m === e.dominant_model ? " <span class='tag ok'>" + t("dDominant") + "</span>" : "") +
+        "</span>" +
+        "<span class='pmq'>" + usd(q[m]) + "</span>" +
+        "<span class='pmr'>" + usd(rem[m] || 0) + "</span>" +
+        "<span class='pms" + (carried ? " dim" : "") + "'>" +
+        (carried ? t("dCarried") : t("dMeasured")) + "</span></div>";
+    }).join("");
+    return row2(t("dPerModel"), "<div class='pm' title='" + esc(t("dPerModelHint")) + "'>" + body + "</div>");
+  }
+
   function windowDetail(w) {
     var e = w.estimate || {};
     var tk = w.tokens || {};
@@ -810,6 +847,7 @@ const panelHTML = `<!doctype html>
       row2(t("dInOut"), tok(tk.InputTokens) + " / " + tok(tk.OutputTokens)) +
       row2(t("dCacheRead"), tok(tk.CacheReadTokens) +
            (w.cache_hit_rate !== undefined ? " (" + pct(w.cache_hit_rate) + ")" : "")) +
+      perModelRows(e) +
       row2(t("dByWindow"), e.quota_usd_by_window ? usd(e.quota_usd_by_window) : t("dNA")) +
       row2(t("dByDelta"), e.quota_usd_by_delta ? usd(e.quota_usd_by_delta) : t("dNA")) +
       row2(t("dSamples"), t("dSamplesV", e.samples || 0, pct(e.evidence_percent))) +

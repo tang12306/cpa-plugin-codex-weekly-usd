@@ -239,9 +239,15 @@ func (a *App) quotaUSDFor(e authEntry, minutes int) float64 {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 
+	// Priced in the model this credential is actually serving where that is
+	// known. A window's quota is one pool, but a dollar of an expensive model
+	// empties it faster - answering with the cheap model's figure is how a
+	// credential came to look like it could serve for hours longer than it
+	// could, the moment traffic moved to a costlier model.
+	weights := a.deriveModelWeights()
 	if minutes > 0 {
 		if w := acct.Windows[strconv.Itoa(minutes)]; w != nil {
-			if est := w.Estimate(); est.QuotaUSD > 0 {
+			if est := w.EstimateWith(weights); est.QuotaUSD > 0 {
 				return est.QuotaUSD
 			}
 		}
@@ -253,7 +259,7 @@ func (a *App) quotaUSDFor(e authEntry, minutes int) float64 {
 		if w == nil {
 			continue
 		}
-		if est := w.Estimate(); est.QuotaUSD > best {
+		if est := w.EstimateWith(weights); est.QuotaUSD > best {
 			best = est.QuotaUSD
 		}
 	}

@@ -71,7 +71,7 @@ const I18N = eval("(" + liftVar("I18N") + ")");
 // scope; everything else about them is a pure string transform.
 let LANG = "en";
 const t = eval("(" + lift("t").replace(/^  function t/, "function t") + ")");
-eval(["esc", "dur", "modelStateTag", "credChip"].map(lift).join("\n"));
+eval(["esc", "dur", "modelStateTag", "credChip", "row2", "perModelRows"].map(lift).join("\n"));
 
 let failures = 0;
 function check(name, got, want) {
@@ -238,6 +238,30 @@ check("chips follow the language",
 check("state tags follow the language",
   modelStateTag({ state: "down", single_point: false }).includes("全部冷却"), true);
 LANG = "en";
+
+// I. the per-model quota table
+// One pool of quota shown at every model's price. The expensive model buys
+// less window, so the two figures have to sit side by side: which one applies
+// is decided by what the credential is about to be asked to serve.
+const perModel = perModelRows({
+  quota_usd_by_model: { "gpt-5.6-sol": 200, "gpt-6-astra": 100 },
+  remaining_usd_by_model: { "gpt-5.6-sol": 140, "gpt-6-astra": 70 },
+  quota_model_source: { "gpt-5.6-sol": "measured", "gpt-6-astra": "carried from gpt-5.6-sol" },
+  dominant_model: "gpt-6-astra",
+});
+check("both models are listed", /gpt-5\.6-sol[\s\S]*gpt-6-astra|gpt-6-astra[\s\S]*gpt-5\.6-sol/.test(perModel), true);
+check("the model that buys more window is listed first",
+  perModel.indexOf("gpt-5.6-sol") < perModel.indexOf("gpt-6-astra"), true);
+check("the model actually in use is marked", /gpt-6-astra <span class='tag ok'>/.test(perModel), true);
+check("a carried figure is not passed off as measured",
+  perModel.includes("carried"), true);
+check("and is visually distinguished", perModel.includes("pms dim"), true);
+check("remaining is shown beside the quota", perModel.includes("$70"), true);
+// A window nothing has priced renders nothing, not an empty table.
+check("no estimate, no table", perModelRows({}), "");
+// Model names come from upstream and are not trusted markup.
+check("model names are escaped",
+  perModelRows({ quota_usd_by_model: { "<img src=x>": 10 } }).includes("&lt;img"), true);
 
 console.log();
 console.log("=".repeat(74));

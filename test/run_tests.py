@@ -134,7 +134,19 @@ def run(steps, path=None, price_url="", route="data", auth_list=None, rotator=No
 
 
 def win(report, minutes, account=0):
-    for w in report["accounts"][account]["windows"]:
+    """account is an index, or a credential name - the row order is the map's,
+    not the order the steps were fed in, so anything with more than one
+    credential must say which one it means."""
+    rows = report["accounts"]
+    if isinstance(account, str):
+        rows = [r for r in rows if account in (r.get("label"), r.get("auth_id"))]
+        if not rows:
+            raise AssertionError("no account row for %s (have %s)"
+                                 % (account, [r.get("label") for r in report["accounts"]]))
+        row = rows[0]
+    else:
+        row = rows[account]
+    for w in row["windows"]:
         if w["minutes"] == minutes:
             return w
     return None
@@ -1611,6 +1623,74 @@ rep = run(steps)
 est = win(rep, WEEK)["estimate"]
 check("a quota that grew is followed too",
       round(est["quota_usd_by_delta"], 2), 200.00)
+
+print()
+print("==========================================================================")
+print("AQ. one quota pool, priced separately in each model")
+print("==========================================================================")
+# A window is one pool of quota, but a dollar does not buy the same share of it
+# in every model: measured on the live fleet, a dollar of gpt-6-astra consumes
+# about 1.4x the quota a dollar of gpt-5.6-sol does. A single blended figure
+# therefore describes the mix that produced it and nothing else, and goes stale
+# the moment traffic moves - which is what actually happened, and what looked
+# for a while like the quota itself shrinking by a third.
+shutil.rmtree(DATA_DIR, ignore_errors=True)
+# sol: $2.00 buys one point, so sol prices this window at $200.
+steps = [("usage.handle", weekly(i, auth="cred-a.json")) for i in range(6)]
+# astra: 2.5x the price per request, and five points each. The same window is
+# worth $100 of astra - it burns twice as fast per dollar.
+steps += [("usage.handle", weekly(5 + 5 * i, model="gpt-6-astra", auth="cred-a.json"))
+          for i in range(6)]
+# A second credential that has only ever served sol. It must still be able to
+# say what its window is worth in astra, because it is exactly the credential
+# the rotator is about to hand astra traffic to.
+steps += [("usage.handle", weekly(i, auth="cred-b.json")) for i in range(6)]
+rep = run(steps, auth_list=[authfile("cred-a.json"), authfile("cred-b.json")])
+
+a = win(rep, WEEK, account="cred-a.json")["estimate"]
+bym = a.get("quota_usd_by_model") or {}
+check("the window is priced in sol", round(bym.get("gpt-5.6-sol", 0), 2), 200.00)
+check("and in astra, separately", round(bym.get("gpt-6-astra", 0), 2), 100.00)
+check("both from this window's own evidence",
+      (a.get("quota_model_source") or {}).get("gpt-6-astra"), "measured")
+check("the model taking the traffic is named", a.get("dominant_model"), "gpt-6-astra")
+# Remaining follows the same split: 30% of the pool is gone whichever model
+# spent it, so what is left is 70% of each model's own figure.
+rem = a.get("remaining_usd_by_model") or {}
+check("remaining is priced per model too", round(rem.get("gpt-6-astra", 0), 2), 70.00)
+check("and differs from the sol figure", round(rem.get("gpt-5.6-sol", 0), 2), 140.00)
+
+b = win(rep, WEEK, account="cred-b.json")["estimate"]
+bym = b.get("quota_usd_by_model") or {}
+check("a credential that never served astra still prices it",
+      round(bym.get("gpt-6-astra", 0), 2), 100.00)
+check("and says the figure was carried, not measured",
+      (b.get("quota_model_source") or {}).get("gpt-6-astra"), "carried from gpt-5.6-sol")
+check("while its own model is measured",
+      (b.get("quota_model_source") or {}).get("gpt-5.6-sol"), "measured")
+
+print()
+print("==========================================================================")
+print("AR. the model ratio is measured inside a window, so pool size cancels")
+print("==========================================================================")
+# The ratio has to come from one window watching both models. Across windows it
+# would be meaningless: two accounts have different quotas and a weekly window
+# is not a five-hour one, so only a ratio taken against the same pool says
+# anything about the models.
+shutil.rmtree(DATA_DIR, ignore_errors=True)
+# cred-a's pool is half the size of cred-b's, and only cred-b ever mixes models.
+steps = [("usage.handle", weekly(2 * i, auth="cred-a.json")) for i in range(6)]
+steps += [("usage.handle", weekly(i, auth="cred-b.json")) for i in range(6)]
+steps += [("usage.handle", weekly(5 + 5 * i, model="gpt-6-astra", auth="cred-b.json"))
+          for i in range(6)]
+rep = run(steps, auth_list=[authfile("cred-a.json"), authfile("cred-b.json")])
+a = win(rep, WEEK, account="cred-a.json")["estimate"]
+bym = a.get("quota_usd_by_model") or {}
+check("the small pool is priced in sol", round(bym.get("gpt-5.6-sol", 0), 2), 100.00)
+# Half the pool, same 2x model ratio: $50, not the $100 that carrying cred-b's
+# absolute figure across would have given.
+check("and carries the ratio, not the other account's dollars",
+      round(bym.get("gpt-6-astra", 0), 2), 50.00)
 
 print()
 print("=" * 74)
