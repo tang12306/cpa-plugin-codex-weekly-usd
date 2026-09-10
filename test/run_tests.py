@@ -747,19 +747,94 @@ print("V. it never empties the pool just because nothing qualifies")
 print("=" * 74)
 shutil.rmtree(DATA_DIR, ignore_errors=True)
 rep = rotate({
-    "cred-a.json": {"disabled": False, "windows": [(WEEKF, 98, 400000)]},
+    "cred-a.json": {"disabled": False, "windows": [(WEEKF, 100, 400000)]},
     "cred-c.json": {"disabled": True, "windows": [(WEEKF, 100, 400000)]},
-    "cred-d.json": {"disabled": True, "windows": [(WEEKF, 97, 400000)]},
+    "cred-d.json": {"disabled": True, "windows": [(WEEKF, 100, 400000)]},
 })
 check("nothing was written", len(saves()), 0)
 check("the incumbent stays enabled", rep["last_reason"], "pool_has_nothing_serving")
-check("a standby at the floor is not a replacement",
+check("a spent standby is not a replacement",
       [c.get("skipped") for c in rep["candidates"] if c["file"] == "cred-d.json"][0],
-      "below_floor")
+      "exhausted")
 # Nothing here can serve at all, so this one really is an alarm.
 check("and it warns", any(w["code"] == "rotator_stuck" for w in rep.get("warnings", [])), True)
 check("not downgraded to degraded",
       any(w["code"] == "rotator_degraded" for w in rep.get("warnings", [])), False)
+
+print()
+print("=" * 74)
+print("V2. below the floor everywhere: run the members down, then use what is left")
+print("=" * 74)
+# The floor keeps a replacement from being about to need replacing itself.
+# Once nothing clears it, holding the rest back saves it for nothing. Seen late
+# in one week: six standbys between 5% and 10% - $39 of allowance - that the
+# rotator would never promote, so the pool would have failed requests once
+# its two members ran dry, with all of that still sitting there.
+shutil.rmtree(DATA_DIR, ignore_errors=True)
+rep = rotate({
+    "cred-a.json": {"disabled": False, "windows": [(WEEKF, 94, 400000)]},   # 6% left
+    "cred-b.json": {"disabled": False, "windows": [(WEEKF, 95, 400000)]},   # 5% left
+    "cred-c.json": {"disabled": True, "windows": [(WEEKF, 92, 400000)]},    # 8% left
+    "cred-d.json": {"disabled": True, "windows": [(WEEKF, 100, 400000)]},   # spent
+})
+# Both members still serve. Trading one low credential for another gains
+# nothing and costs a switch, so they run on.
+check("members still serving are left to run down", len(saves()), 0)
+check("reported as running low", rep["last_reason"], "pool_running_low")
+low = [w for w in rep.get("warnings", []) if w["code"] == "rotator_low"]
+check("warned as running low", len(low), 1)
+check("counting what is left to take over", low[0]["reserves"] if low else None, 1)
+check("with the first reset", (low[0].get("in_seconds") or 0) > 0 if low else False, True)
+# Nothing is failing, so neither of the alarms that say something is.
+check("not raised as stuck", any(w["code"] == "rotator_stuck" for w in rep.get("warnings", [])), False)
+check("not called a member short",
+      any(w["code"] == "rotator_degraded" for w in rep.get("warnings", [])), False)
+
+shutil.rmtree(DATA_DIR, ignore_errors=True)
+# One member has run dry. The one still serving is listed first on purpose:
+# retirement used to follow the host's order, which would have switched off the
+# member still serving and kept the empty one.
+rep = rotate({
+    "cred-a.json": {"disabled": False, "windows": [(WEEKF, 95, 400000)]},   # 5% left, serving
+    "cred-b.json": {"disabled": False, "windows": [(WEEKF, 100, 400000)]},  # empty
+    "cred-c.json": {"disabled": True, "windows": [(WEEKF, 96, 400000)]},    # 4% left
+    "cred-d.json": {"disabled": True, "windows": [(WEEKF, 92, 400000)]},    # 8% left
+    "cred-e.json": {"disabled": True, "windows": [(WEEKF, 100, 400000)]},   # spent
+})
+log = saves()
+check("the standby with the most left takes the empty slot",
+      log[0] if log else None, ("cred-d.json", False))
+check("the empty member is the one retired", ("cred-b.json", True) in log, True)
+check("the member still serving is kept", ("cred-a.json", True) in log, False)
+check("nothing else was touched", len(log), 2)
+check("the log says why a low one was chosen",
+      any("below the floor" in e.get("reason", "") for e in rep.get("log", [])
+          if e.get("action") == "enable"), True)
+
+shutil.rmtree(DATA_DIR, ignore_errors=True)
+# A pool a member short is filled from below the floor too: the second member
+# is what a refused request fails over to, and a low one beats none.
+rep = rotate({
+    "cred-a.json": {"disabled": False, "windows": [(WEEKF, 98, 400000)]},   # 2% left
+    "cred-c.json": {"disabled": True, "windows": [(WEEKF, 100, 400000)]},   # spent
+    "cred-d.json": {"disabled": True, "windows": [(WEEKF, 97, 400000)]},    # 3% left
+})
+log = saves()
+check("the empty slot is filled from below the floor", log, [("cred-d.json", False)])
+check("and the incumbent is not retired for it", ("cred-a.json", True) in log, False)
+
+shutil.rmtree(DATA_DIR, ignore_errors=True)
+# The retirement order on its own, with an ordinary replacement: one good
+# standby for two failing members. The empty one has to be the one that goes.
+rep = rotate({
+    "cred-a.json": {"disabled": False, "windows": [(WEEKF, 95, 400000)]},   # 5% left, serving
+    "cred-b.json": {"disabled": False, "windows": [(WEEKF, 100, 400000)]},  # empty
+    "cred-c.json": {"disabled": True, "windows": [(WEEKF, 10, 400000)]},    # fresh
+})
+log = saves()
+check("one good standby is promoted", ("cred-c.json", False) in log, True)
+check("and the empty member makes way for it", ("cred-b.json", True) in log, True)
+check("not the one still serving", ("cred-a.json", True) in log, False)
 
 print()
 print("=" * 74)

@@ -125,6 +125,9 @@ type candidate struct {
 	Skip      string  `json:"skipped,omitempty"`
 	Status    int     `json:"status_code,omitempty"`
 	Plan      string  `json:"plan_type,omitempty"`
+	// Reserve marks a pick taken from below the floor because nothing above it
+	// was left. Set by choose, never by rank.
+	Reserve bool `json:"-"`
 }
 
 // probeMemo is what one probe taught us, kept so the same question is not asked
@@ -167,6 +170,9 @@ type RotatorState struct {
 	// back. They are what separates "degraded" from "down".
 	HealthyEnabled int   `json:"healthy_enabled,omitempty"`
 	RecoversAt     int64 `json:"recovers_at,omitempty"`
+	// Reserves counts the standbys below the floor that still have allowance:
+	// what takes over, one at a time, once the enabled members run out.
+	Reserves int `json:"reserves,omitempty"`
 	// Probes is the probe ledger, by credential file name. It has to outlive a
 	// restart: without it every restart would re-probe every credential,
 	// including ones already known to be refused.
@@ -456,7 +462,7 @@ func (r *rotator) tick(force bool) {
 	// would hand callers a failure instead of the handover they were promised.
 	if cfg.ConfirmBeforeSwitch {
 		asked := false
-		for _, c := range r.picksFrom(candidates, short) {
+		for _, c := range r.choose(candidates, short, r.unservedSlots(enabled, results, cfg)) {
 			e, found := entryFor(pool, c.File)
 			if !found {
 				continue
@@ -488,41 +494,52 @@ func (r *rotator) tick(force bool) {
 	// may have been stale, and a sweep that finds everything healthy should end
 	// without touching anything.
 	enabled, standby = splitPool(r.app.authMetadata(), cfg)
-	short, why = r.poolShortfall(enabled, r.derive(enabled, now), cfg)
+	fresh := r.derive(enabled, now)
+	short, why = r.poolShortfall(enabled, fresh, cfg)
 	if short <= 0 {
 		r.note(why)
 		return
 	}
 
-	picks := r.picksFrom(candidates, short)
+	unserved := r.unservedSlots(enabled, fresh, cfg)
+	picks := r.choose(candidates, short, unserved)
 	if len(picks) == 0 {
 		// Never empty the pool because there is nothing to replace it with.
 		// Whatever is enabled stays enabled, and the panel says why.
-		healthy := cfg.KeepEnabled - short
+		serving := cfg.KeepEnabled - unserved
 		soonest := soonestRecovery(candidates)
+		reserves := countReserves(candidates)
 		r.mu.Lock()
-		r.state.HealthyEnabled = healthy
+		r.state.HealthyEnabled = serving
 		r.state.RecoversAt = soonest
+		r.state.Reserves = reserves
 		r.mu.Unlock()
 		r.app.markDirty()
 
-		// Being one short of the target while still serving is not the same
-		// situation as having nothing that can serve, and logging them the same
-		// way trains the operator to ignore both.
+		// Three different situations, and logging them the same way trains the
+		// operator to ignore all of them: members low but all still serving,
+		// the pool a member short, and nothing left that can serve at all.
 		reason := "no_standby_available"
-		if healthy <= 0 {
+		switch {
+		case serving <= 0:
 			reason = "pool_has_nothing_serving"
+		case unserved == 0:
+			reason = "pool_running_low"
 		}
 		if r.note(reason) {
 			msg := fmt.Sprintf("rotator: pool is %d short of %d and no standby qualifies; leaving it untouched",
 				short, cfg.KeepEnabled)
+			if reason == "pool_running_low" {
+				msg = fmt.Sprintf("rotator: every member is below the floor and no standby has more left; "+
+					"running them down (%d standby(s) below the floor still hold some)", reserves)
+			}
 			if soonest > 0 {
 				msg += fmt.Sprintf(" (soonest candidate recovers in %s)", time.Until(time.Unix(soonest, 0)).Truncate(time.Minute))
 			}
-			if healthy <= 0 {
+			if serving <= 0 {
 				hostLog("error", msg+" - NOTHING in the pool can serve")
 			} else {
-				hostLog("info", msg+fmt.Sprintf(" - %d member(s) still serving", healthy))
+				hostLog("info", msg+fmt.Sprintf(" - %d member(s) still serving", serving))
 			}
 		}
 		return
@@ -609,6 +626,66 @@ func (r *rotator) picksFrom(candidates []candidate, short int) []candidate {
 // countPicks reports how many of the gap the known-good candidates can fill.
 func (r *rotator) countPicks(candidates []candidate, short int) int {
 	return len(r.picksFrom(candidates, short))
+}
+
+// choose is picksFrom plus a last resort. When the candidates that clear the
+// floor cannot cover the slots nothing is serving, the standbys below the floor
+// that still hold something fill the rest, most left first.
+//
+// The floor is there so a replacement is not itself about to need replacing.
+// Once nothing clears it that reason is gone, and holding the rest back saves
+// it for nothing: the pool starts failing requests while several credentials
+// still have allowance on them. On this fleet, late in one week, six standbys
+// sat between 5% and 10% - $39 between them - with nothing able to reach it.
+//
+// Only slots that have stopped serving are covered this way. A member that is
+// merely low keeps serving until it is empty; trading it for another low one
+// gains nothing, so this adds no churn - each such promotion follows a
+// credential actually running out.
+func (r *rotator) choose(candidates []candidate, short, unserved int) []candidate {
+	picks := r.picksFrom(candidates, short)
+	for _, c := range candidates {
+		if len(picks) >= unserved {
+			break
+		}
+		if !isReserve(c) {
+			continue
+		}
+		c.Reserve = true
+		picks = append(picks, c)
+	}
+	return picks
+}
+
+// isReserve reports whether a candidate is below the floor but not empty.
+func isReserve(c candidate) bool {
+	return !c.Enabled && c.Skip == skipTooLow && c.Headroom > 0
+}
+
+func countReserves(candidates []candidate) int {
+	n := 0
+	for _, c := range candidates {
+		if isReserve(c) {
+			n++
+		}
+	}
+	return n
+}
+
+// unservedSlots counts the pool slots with nothing behind them that can take a
+// request: members missing outright, and members exhausted or refused. A member
+// on its last few percent is low, not gone, and does not count.
+func (r *rotator) unservedSlots(enabled []authEntry, results map[string]probeResult, cfg RotatorConfig) int {
+	serving := 0
+	for _, e := range enabled {
+		if state, _ := r.memberState(e, results[e.Name], cfg); state != "exhausted" && state != "dead" {
+			serving++
+		}
+	}
+	if serving >= cfg.KeepEnabled {
+		return 0
+	}
+	return cfg.KeepEnabled - serving
 }
 
 // entryFor finds the auth entry a candidate was scored from.
@@ -1172,6 +1249,10 @@ func (r *rotator) rank(results map[string]probeResult, entries []authEntry, cfg 
 }
 
 func (r *rotator) pickReason(c candidate) string {
+	if c.Reserve {
+		return fmt.Sprintf("headroom %.0f%%, below the floor but nothing above it is left (covers %.1fh)",
+			c.Headroom, c.ServiceH)
+	}
 	if c.Safe {
 		return fmt.Sprintf("headroom %.0f%%, covers %.1fh, binding window resets in %.1fh",
 			c.Headroom, c.ServiceH, c.ExpiresIn)
@@ -1246,11 +1327,38 @@ func (r *rotator) retireDrained(enabled []authEntry, results map[string]probeRes
 			live++
 		}
 	}
+	// Retire what can no longer serve before what merely runs low. In the
+	// host's order, a pool with one member empty and one on its last few
+	// percent could give up the one still serving and keep the empty one -
+	// which, once the only replacements are low themselves, strands the pool.
+	type member struct {
+		e        authEntry
+		state    string
+		headroom float64
+	}
+	severity := map[string]int{"dead": 0, "exhausted": 1, "draining": 2}
+	order := make([]member, 0, len(enabled))
 	for _, e := range enabled {
+		state, headroom := r.memberState(e, results[e.Name], cfg)
+		order = append(order, member{e, state, headroom})
+	}
+	sort.SliceStable(order, func(i, j int) bool {
+		si, iok := severity[order[i].state]
+		sj, jok := severity[order[j].state]
+		if iok != jok {
+			return iok
+		}
+		if si != sj {
+			return si < sj
+		}
+		return order[i].headroom < order[j].headroom
+	})
+
+	for _, m := range order {
+		e, state, headroom := m.e, m.state, m.headroom
 		if contains(cfg.NeverDisable, e.Name) || touched[e.Name] {
 			continue
 		}
-		state, headroom := r.memberState(e, results[e.Name], cfg)
 		// Only spend, refused or emptying members are retired. "unknown" is
 		// none of those: it means the probe budget ran out before the question
 		// could be answered, and disabling on that would turn a gap in the
@@ -1499,6 +1607,15 @@ func (r *rotator) Report(cfg RotatorConfig, board []candidate) map[string]any {
 	} else if cfg.Enabled && r.state.LastReason == "no_standby_available" {
 		w := map[string]any{"code": "rotator_degraded", "serving": r.state.HealthyEnabled,
 			"target": cfg.KeepEnabled}
+		if v, ok := out["recovers_in_seconds"]; ok {
+			w["in_seconds"] = v
+		}
+		warnings = append(warnings, w)
+	} else if cfg.Enabled && r.state.LastReason == "pool_running_low" {
+		// Every member still serves, so nothing is failing - but everything is
+		// on its last few percent, and whether anything takes over after that
+		// is the one question worth answering.
+		w := map[string]any{"code": "rotator_low", "reserves": r.state.Reserves}
 		if v, ok := out["recovers_in_seconds"]; ok {
 			w["in_seconds"] = v
 		}

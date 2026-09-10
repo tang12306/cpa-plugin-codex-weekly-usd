@@ -53,6 +53,7 @@ Everything else has a default; see [config.go](config.go). Prices are refreshed 
 
 - Keeps `keep_enabled` credentials enabled. When one is refused, CPA retries the next one within the same request, so a switch is invisible to callers
 - A replacement is written with a `priority` below every enabled credential, joining the back of the queue. CPA's fill-first picks by file name within one priority; without this, a standby whose name sorts late is never served
+- When every standby is below the floor, the enabled credentials run down to zero, then the standbys with the most left take over one at a time; nothing is left unused
 - Runs on arithmetic, not upstream calls; it probes once before a switch and once after a window resets. Probes use the credential's own `proxy_url`
 - Credentials refused upstream (401/403) are disabled, and become candidates again once a fresh login replaces the token
 - Writes the credential file directly (`disabled`, `priority`) and lets CPA's file watcher apply it

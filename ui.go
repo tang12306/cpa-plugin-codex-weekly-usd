@@ -299,6 +299,10 @@ const panelHTML = `<!doctype html>
         "**当前请求不受影响**——代理会在被拒时自动改用池中还能用的那个。",
       warnRotDegradedEta: "轮换器没能把池子补满（{0}/{1} 个仍在服务），暂时没有合格备用。" +
         "**当前请求不受影响**；最快 {2} 后会有候选恢复额度。",
+      warnRotLow: "在役凭据余量都已低于阈值，也没有余量更多的备用可换，它们会继续用到 0。**当前请求不受影响**。",
+      warnRotLowReserves: "用完后依次换上剩余最多的备用（还有 {0} 个有余量）。",
+      warnRotLowLast: "其余备用都已用完：在役的用完后将没有凭据可用。",
+      warnRotLowEta: "最早 {0}后有凭据重置。",
       warnRotDry: "轮换器处于空跑模式：它会照常判断并记录，但不会真的改写凭据。确认记录无误后把 dry_run 关掉。",
       rtNone: "还没有候选凭据。",
       updatedAt: "更新于 {0}",
@@ -405,6 +409,11 @@ const panelHTML = `<!doctype html>
         "when one is refused.",
       warnRotDegradedEta: "The rotator could not fill the pool ({0}/{1} still serving) and no " +
         "standby qualifies yet. **Requests are unaffected**; the soonest candidate recovers in {2}.",
+      warnRotLow: "Every enabled credential is below the floor and no standby has more left, so they " +
+        "run on down to zero. **Requests are unaffected.**",
+      warnRotLowReserves: " After that, the standbys with the most left take over one at a time ({0} still have some).",
+      warnRotLowLast: " Every other standby is spent: once these run out, nothing can serve.",
+      warnRotLowEta: " The first window resets in {0}.",
       warnRotDry: "The rotator is in dry run: it decides and records as usual but never rewrites a " +
         "credential. Turn dry_run off once the log looks right.",
       rtNone: "No candidate credentials yet.",
@@ -544,9 +553,23 @@ const panelHTML = `<!doctype html>
     return t("wMins", m);
   }
   function heat(p) { return p >= 90 ? "var(--bad)" : p >= 70 ? "var(--warn)" : "var(--good)"; }
+  // Alerts stay plain text - several carry credential names, which are not
+  // trusted markup - with **...** marking the part to read first. It used to
+  // reach the page as literal asterisks.
   function note(cls, text) {
     var d = document.createElement("div");
-    d.className = "msg " + cls; d.textContent = text; alerts.appendChild(d);
+    d.className = "msg " + cls;
+    String(text).split("**").forEach(function (part, i) {
+      if (!part) return;
+      if (i % 2) {
+        var b = document.createElement("b");
+        b.textContent = part;
+        d.appendChild(b);
+      } else {
+        d.appendChild(document.createTextNode(part));
+      }
+    });
+    alerts.appendChild(d);
   }
 
   // Flatten a series into fixed hourly buckets ending at "now".
@@ -845,6 +868,12 @@ const panelHTML = `<!doctype html>
         return w.in_seconds === undefined
           ? t("warnRotDegraded", w.serving, w.target)
           : t("warnRotDegradedEta", w.serving, w.target, dur(w.in_seconds));
+      // The parts carry their own separator: none between Chinese sentences, a
+      // space between English ones.
+      case "rotator_low":
+        return t("warnRotLow") +
+          (w.reserves ? t("warnRotLowReserves", w.reserves) : t("warnRotLowLast")) +
+          (w.in_seconds === undefined ? "" : t("warnRotLowEta", dur(w.in_seconds)));
       case "rotator_dry_run": return t("warnRotDry");
       case "model_single_point":
         return w.disabled

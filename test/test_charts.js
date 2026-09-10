@@ -237,5 +237,35 @@ LANG = "en";
 
 console.log();
 console.log("=".repeat(74));
+console.log("K. alerts");
+console.log("=".repeat(74));
+// Alerts are built from DOM nodes rather than markup, so a stand-in document
+// that records what was built is all note() needs.
+const document = {
+  createElement: tag => ({ tag, children: [], className: "", textContent: "",
+                           appendChild(c) { this.children.push(c); } }),
+  createTextNode: text => ({ text }),
+};
+const alerts = { children: [], appendChild(c) { this.children.push(c); } };
+eval(["note", "warnText"].map(lift).join("\n"));
+const flat = m => m.children.map(n => n.tag === "b" ? "<b>" + n.textContent + "</b>" : n.text).join("");
+note("warn", "requests **are unaffected** for now");
+check("emphasis is bold, not asterisks", flat(alerts.children[0]), "requests <b>are unaffected</b> for now");
+note("bad", "<img src=x> is **refused**");
+check("text around it stays text", alerts.children[1].children[0].text, "<img src=x> is ");
+
+LANG = "zh";
+const lowZh = warnText({ code: "rotator_low", reserves: 3, in_seconds: 30 * 3600 });
+check("running low says what takes over", lowZh.includes("还有 3 个"), true);
+check("and when the first window resets", lowZh.includes("1天"), true);
+check("chinese sentences run on unspaced", lowZh.includes("。 "), false);
+check("says so when nothing is behind them",
+  warnText({ code: "rotator_low", reserves: 0 }).includes("将没有凭据可用"), true);
+LANG = "en";
+check("english sentences are spaced",
+  warnText({ code: "rotator_low", reserves: 2 }).includes("unaffected.** After that"), true);
+
+console.log();
+console.log("=".repeat(74));
 if (failures) { console.log("FAILED: " + failures + " check(s)"); process.exit(1); }
 console.log("all chart checks passed");
