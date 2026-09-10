@@ -155,9 +155,10 @@ const panelHTML = `<!doctype html>
   .name{font-weight:600}
   .sub2{font-size:12px;color:var(--muted);font-weight:400}
   .wcell{display:flex;flex-direction:column;gap:3px;min-width:140px;align-items:flex-end}
-  .meter{position:relative;height:7px;border-radius:4px;background:var(--line);overflow:hidden;width:132px}
+  .meter{position:relative;height:7px;border-radius:4px;background:var(--line);overflow:hidden;width:110px}
   .meter>i{position:absolute;inset:0 auto 0 0;display:block;border-radius:4px}
-  .mlabel{display:flex;justify-content:space-between;font-size:11px;color:var(--muted);width:132px}
+  .mrow{display:flex;align-items:center;gap:6px;font-size:11px;color:var(--muted)}
+  .mrow .mv{min-width:38px;text-align:right;font-variant-numeric:tabular-nums}
   .tag{display:inline-block;padding:1px 7px;border-radius:999px;font-size:11px;
        border:1px solid var(--line);color:var(--muted);white-space:nowrap}
   .tag.high,.tag.ok{color:var(--good);border-color:var(--good)}
@@ -324,7 +325,7 @@ const panelHTML = `<!doctype html>
       tagDisabled: "已停用", tagUnavailable: "不可用", tagStale: "读数陈旧",
       rowTotals: "{0} 次累计 · {1}", rowObserved: "{0}前观测",
       watching: "观测中", needTick: "待百分比走动 1%",
-      left: "剩", resetsIn: "{0}后重置",
+      left: "剩", resetsIn: "{0}后重置", barUsed: "已用", barTime: "时间",
       paceFast: "偏快", paceSlow: "宽裕", paceNormal: "正常",
       confHigh: "高置信", confMedium: "中置信", confLow: "低置信", confNone: "无估算",
       mWindow: "窗口法", mDelta: "步进法",
@@ -431,7 +432,7 @@ const panelHTML = `<!doctype html>
       tagDisabled: "disabled", tagUnavailable: "unavailable", tagStale: "stale reading",
       rowTotals: "{0} total · {1}", rowObserved: "observed {0} ago",
       watching: "watching", needTick: "needs 1% of movement",
-      left: "left", resetsIn: "resets in {0}",
+      left: "left", resetsIn: "resets in {0}", barUsed: "used", barTime: "time",
       paceFast: "fast", paceSlow: "comfortable", paceNormal: "normal",
       confHigh: "high", confMedium: "medium", confLow: "low", confNone: "none",
       mWindow: "window", mDelta: "delta",
@@ -681,6 +682,14 @@ const panelHTML = `<!doctype html>
     return "<span class='tag " + cls + "'>" + word + " ×" + r.toFixed(2) + "</span>";
   }
 
+  // Each bar carries its own word and number. The two figures used to share one
+  // line above both bars, which left the reader to work out that the one on the
+  // right belonged to the lower bar.
+  function meterRow(label, p, fill) {
+    return "<div class='mrow'><span>" + label + "</span><div class='meter'><i style='width:" +
+           Math.min(100, p) + "%;" + fill + "'></i></div><span class='mv'>" + pct(p) + "</span></div>";
+  }
+
   function windowCell(w) {
     if (!w) return "<td class='num'><span class='tag'>—</span></td>";
     var e = w.estimate || {};
@@ -688,13 +697,9 @@ const panelHTML = `<!doctype html>
     var p = w.used_percent || 0;
     var stale = !!w.used_percent_stale;
     var s = "<td><div class='wcell'>";
-    s += "<div class='mlabel'><span>" + pct(p) + "</span><span>" +
-         (w.time_progress_percent !== undefined ? pct(w.time_progress_percent) : "") + "</span></div>";
-    s += "<div class='meter'><i style='width:" + Math.min(100, p) + "%;background:" + heat(p) +
-         (stale ? ";opacity:.35" : "") + "'></i></div>";
+    s += meterRow(t("barUsed"), p, "background:" + heat(p) + (stale ? ";opacity:.35" : ""));
     if (w.time_progress_percent !== undefined) {
-      s += "<div class='meter'><i style='width:" + Math.min(100, w.time_progress_percent) +
-           "%;background:var(--muted);opacity:.5'></i></div>";
+      s += meterRow(t("barTime"), w.time_progress_percent, "background:var(--muted);opacity:.5");
     }
     s += "<div class='sub2'>" + (waiting ? "<span class='tag'>" + t("watching") + "</span>"
          : t("left") + " <b>" + usd(e.remaining_usd) + "</b> / " + usd(e.quota_usd)) + "</div>";

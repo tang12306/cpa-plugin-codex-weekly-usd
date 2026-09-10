@@ -66,12 +66,12 @@ const src = ["usd", "pct", "chartLabels", "buildBuckets", "agoLabel", "drawChart
 eval(src);
 const I18N = eval("(" + liftVar("I18N") + ")");
 
-// The per-model rows are built by the same page, so they are lifted the same
-// way. They read the language through t(), which needs LANG and I18N in scope;
+// The table cells are built by the same page, so they are lifted the same way.
+// They read the language through t(), which needs LANG and I18N in scope;
 // everything else about them is a pure string transform.
 let LANG = "en";
 const t = eval("(" + lift("t").replace(/^  function t/, "function t") + ")");
-eval(["esc", "dur", "row2", "perModelRows"].map(lift).join("\n"));
+eval(["esc", "dur", "row2", "perModelRows", "heat", "paceTag", "meterRow", "windowCell"].map(lift).join("\n"));
 
 let failures = 0;
 function check(name, got, want) {
@@ -207,6 +207,33 @@ check("no estimate, no table", perModelRows({}), "");
 // Model names come from upstream and are not trusted markup.
 check("model names are escaped",
   perModelRows({ quota_usd_by_model: { "<img src=x>": 10 } }).includes("&lt;img"), true);
+
+console.log();
+console.log("=".repeat(74));
+console.log("J. each bar is labelled");
+console.log("=".repeat(74));
+// The two bars once shared a single line of figures, and which number belonged
+// to which bar was left to guess. Each row now carries its own word and value.
+const cellRows = w => windowCell(w).match(/<div class='mrow'>.*?<\/span><\/div>/g) || [];
+const week = { used_percent: 85, time_progress_percent: 34.3, pace_ratio: 2.48,
+               reset_in_seconds: 396000,
+               estimate: { method: "delta", quota_usd: 65.87, remaining_usd: 9.88 } };
+const wr = cellRows(week);
+check("one row per bar", wr.length, 2);
+check("the used bar names itself", /<span>used<\/span>/.test(wr[0]), true);
+check("and carries its own figure", wr[0].includes("85.0%"), true);
+check("the time bar names itself", /<span>time<\/span>/.test(wr[1]), true);
+check("and carries its own figure", wr[1].includes("34.3%"), true);
+check("neither figure strays into the other row",
+  !wr[0].includes("34.3%") && !wr[1].includes("85.0%"), true);
+check("a reading from before the reset is dimmed",
+  cellRows({ ...week, used_percent_stale: true })[0].includes("opacity:.35"), true);
+check("no clock, no time bar",
+  cellRows({ ...week, time_progress_percent: undefined }).length, 1);
+LANG = "zh";
+const zr = cellRows(week);
+check("labels follow the language", zr[0].includes("已用") && zr[1].includes("时间"), true);
+LANG = "en";
 
 console.log();
 console.log("=".repeat(74));
