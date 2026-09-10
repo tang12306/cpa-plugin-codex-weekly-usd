@@ -1557,6 +1557,7 @@ func (a *App) Report() map[string]any {
 		"generated_at":    now.UTC().Format(time.RFC3339),
 		"plugin":          pluginID,
 		"plugin_version":  pluginVersion,
+		"panel_stamp":     panelStamp,
 		"price_source":    priceSnapshot["source"],
 		"price_transport": priceSnapshot["transport"],
 		"price_fetched":   priceSnapshot["fetched_at"],

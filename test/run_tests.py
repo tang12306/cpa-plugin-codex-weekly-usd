@@ -359,6 +359,25 @@ out = subprocess.run([HARNESS, SO, panel_script], capture_output=True, text=True
 env = json.loads(out.split("--- management.handle (rc=0) ---")[1].strip())
 html = base64.b64decode(env["result"]["Body"]).decode()
 check("content-type", env["result"]["Headers"]["content-type"][0], "text/html; charset=utf-8")
+# The shell is the one response a browser may keep. The host shows plugin pages
+# in an iframe it paints white, and a shell refetched on every visit left that
+# white on screen for a whole round trip each time the page was opened.
+check("the shell may be cached", env["result"]["Headers"]["cache-control"][0],
+      "private, max-age=86400")
+marker = 'var PANEL_STAMP = "'
+at = html.find(marker)
+page_stamp = html[at + len(marker):html.find('"', at + len(marker))] if at >= 0 else ""
+check("the shell names its own build", bool(page_stamp) and "__" not in page_stamp, True)
+# A cached page has to be able to tell it is out of date, so every report names
+# the page it belongs with - and the data itself is never cached.
+data_script = os.path.join(BUILD, "panel-data.txt")
+script([], data_script)
+out = subprocess.run([HARNESS, SO, data_script], capture_output=True, text=True).stdout
+denv = [json.loads(b.split("\n", 1)[1].strip()) for b in out.split("--- ")
+        if b.startswith("management.handle")][-1]
+check("the data is never cached", denv["result"]["Headers"]["cache-control"][0], "no-store")
+check("a report names the page it belongs with",
+      json.loads(base64.b64decode(denv["result"]["Body"])).get("panel_stamp"), page_stamp)
 check("is html", html.startswith("<!doctype html>"), True)
 check("leaks no credential id", "codex-demo-team.json" not in html, True)
 check("leaks no plan or percent data", ("premium" not in html) and ("10080" not in html), True)

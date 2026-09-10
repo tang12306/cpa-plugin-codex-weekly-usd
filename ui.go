@@ -1,6 +1,8 @@
 package main
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"strings"
 	"time"
@@ -32,7 +34,7 @@ func (a *App) HandleManagement(payload []byte) json.RawMessage {
 
 	switch {
 	case strings.HasSuffix(path, "/panel") || path == "" || strings.HasSuffix(path, pluginID):
-		return jsonResponse(200, "text/html; charset=utf-8", []byte(panelHTML))
+		return panelResponse()
 	case strings.HasSuffix(path, "/prices"):
 		return marshalResponse(a.prices.Snapshot())
 	case strings.HasSuffix(path, "/data"):
@@ -86,6 +88,36 @@ func marshalResponse(v any) json.RawMessage {
 		body = []byte(`{"error":"encode failed"}`)
 	}
 	return jsonResponse(200, "application/json; charset=utf-8", body)
+}
+
+// panelStamp names this build of the panel. The page carries it and so does
+// every report, which is how a cached page notices the plugin has moved on.
+// The hash covers the page itself, so a changed page is caught even when the
+// version number was not bumped.
+var panelStamp = func() string {
+	sum := sha256.Sum256([]byte(panelHTML))
+	return pluginVersion + "-" + hex.EncodeToString(sum[:4])
+}()
+
+var panelPage = []byte(strings.Replace(panelHTML, "__PANEL_STAMP__", panelStamp, 1))
+
+// panelResponse serves the shell with permission to cache it. The host shows a
+// plugin page in an iframe it paints white, and with no-store the page was
+// fetched again on every visit - a round trip of white each time it was opened.
+// The shell holds no data and changes only with the plugin, so the browser may
+// keep it; the stamp check in the page covers the upgrade. Everything else
+// stays no-store.
+func panelResponse() json.RawMessage {
+	resp := managementResponse{
+		StatusCode: 200,
+		Headers: map[string][]string{
+			"content-type":  {"text/html; charset=utf-8"},
+			"cache-control": {"private, max-age=86400"},
+		},
+		Body: panelPage,
+	}
+	raw, _ := json.Marshal(resp)
+	return raw
 }
 
 func jsonResponse(status int, contentType string, body []byte) json.RawMessage {
@@ -1137,10 +1169,27 @@ const panelHTML = `<!doctype html>
     }).catch(function () { pricebox.hidden = true; });
   }
 
+  // The browser keeps this page for a day (see panelResponse), so after an
+  // upgrade it can be older than the plugin answering it. Every report names
+  // the page it belongs with; on a mismatch, reload once for the current one.
+  // Once per stamp: if a reload still brings back the old page, showing it
+  // beats a loop.
+  var PANEL_STAMP = "__PANEL_STAMP__";
+  function outdated(data) {
+    var want = data && data.panel_stamp;
+    if (!want || want === PANEL_STAMP) return false;
+    try {
+      if (sessionStorage.getItem("cwu.reloadedFor") === want) return false;
+      sessionStorage.setItem("cwu.reloadedFor", want);
+    } catch (e) { return false; }
+    location.reload();
+    return true;
+  }
+
   function load() {
     if (!keyBox.value.trim()) { alerts.innerHTML = ""; note("warn", t("needKey")); return; }
     localStorage.setItem(STORE, keyBox.value.trim());
-    api("data").then(render).catch(function (err) {
+    api("data").then(function (data) { if (!outdated(data)) render(data); }).catch(function (err) {
       alerts.innerHTML = ""; note("bad", err.message);
       cards.hidden = wrap.hidden = chartbox.hidden = pricebox.hidden = true;
       rotbox.hidden = true;
