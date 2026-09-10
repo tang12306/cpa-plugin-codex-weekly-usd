@@ -530,9 +530,26 @@ func (r *rotator) tick(force bool) {
 
 	// Enable before disabling, always: a moment with an empty pool is a total
 	// outage, and there is no ordering where disabling first is safer.
+	//
+	// A newcomer joins the BACK of the serving queue. The host serves
+	// fill-first: the highest priority wins, and within one priority the
+	// lowest credential ID - which is a hash-like file name, so effectively an
+	// arbitrary fixed order. Left to that, a standby whose name sorts late is
+	// never served: every replacement that sorts ahead of it takes the traffic
+	// the moment it is enabled, and the standby only ever catches the odd
+	// failover. One sat enabled for two and a half days that way on 21
+	// requests, while its weekly window ran down unused.
+	//
+	// So each promotion is written one priority below every enabled member.
+	// The standby that has waited longest then serves next, automatically,
+	// when the incumbent retires - nothing has to be rewritten at retirement,
+	// and only the file already being written for the promotion is touched.
+	next := r.backOfQueue(enabled)
 	promoted := make([]candidate, 0, len(picks))
 	for _, c := range picks {
-		if err := r.setDisabled(c, false, "promoted: "+r.pickReason(c), cfg); err != nil {
+		prio := next
+		next--
+		if err := r.writeState(c, false, &prio, "promoted: "+r.pickReason(c), cfg); err != nil {
 			hostLog("warn", "rotator: could not enable "+c.File+": "+err.Error())
 			continue
 		}
@@ -1259,6 +1276,12 @@ func (r *rotator) retireDrained(enabled []authEntry, results map[string]probeRes
 // round trip through a typed struct would quietly drop whatever this plugin
 // does not know about.
 func (r *rotator) setDisabled(c candidate, disabled bool, reason string, cfg RotatorConfig) error {
+	return r.writeState(c, disabled, nil, reason, cfg)
+}
+
+// writeState is setDisabled with an optional serving priority written in the
+// same document, so a promotion costs one write, not two.
+func (r *rotator) writeState(c candidate, disabled bool, priority *int, reason string, cfg RotatorConfig) error {
 	action := "enable"
 	if disabled {
 		action = "disable"
@@ -1298,6 +1321,10 @@ func (r *rotator) setDisabled(c candidate, disabled bool, reason string, cfg Rot
 		return fmt.Errorf("refusing to write %s: not a credential document", c.File)
 	}
 	doc["disabled"] = json.RawMessage(fmt.Sprintf("%t", disabled))
+	if priority != nil {
+		// Read by the host's file loader as a plain integer; absent means 0.
+		doc["priority"] = json.RawMessage(strconv.Itoa(*priority))
+	}
 
 	body, err := json.Marshal(doc)
 	if err != nil {
@@ -1701,4 +1728,53 @@ func (r *rotator) rejectionStands(e authEntry, memo probeMemo) bool {
 		return true
 	}
 	return tokenFingerprint(token) == memo.Fingerprint
+}
+
+// credentialPriority reads the serving priority the host will use for a
+// credential. Absent - which is every credential nothing has queued yet - is 0,
+// exactly as the host reads it.
+func (r *rotator) credentialPriority(e authEntry) int {
+	if strings.TrimSpace(e.AuthIndex) == "" {
+		return 0
+	}
+	payload, _ := json.Marshal(map[string]any{"auth_index": e.AuthIndex})
+	result, err := hostCall("host.auth.get", payload)
+	if err != nil {
+		return 0
+	}
+	var got struct {
+		JSON json.RawMessage `json:"json"`
+	}
+	if json.Unmarshal(result, &got) != nil {
+		return 0
+	}
+	var doc struct {
+		Priority json.RawMessage `json:"priority"`
+	}
+	if json.Unmarshal(got.JSON, &doc) != nil || len(doc.Priority) == 0 {
+		return 0
+	}
+	var n float64
+	if json.Unmarshal(doc.Priority, &n) == nil {
+		return int(n)
+	}
+	var str string
+	if json.Unmarshal(doc.Priority, &str) == nil {
+		if v, errAtoi := strconv.Atoi(strings.TrimSpace(str)); errAtoi == nil {
+			return v
+		}
+	}
+	return 0
+}
+
+// backOfQueue is the priority that places a newcomer behind every credential
+// currently enabled.
+func (r *rotator) backOfQueue(enabled []authEntry) int {
+	lowest, seen := 0, false
+	for _, e := range enabled {
+		if p := r.credentialPriority(e); !seen || p < lowest {
+			lowest, seen = p, true
+		}
+	}
+	return lowest - 1
 }

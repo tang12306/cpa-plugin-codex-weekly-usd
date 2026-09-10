@@ -604,6 +604,8 @@ def rot_fixtures(creds):
                "disabled": spec.get("disabled", False)}
         if spec.get("proxy"):
             doc["proxy_url"] = spec["proxy"]
+        if "priority" in spec:
+            doc["priority"] = spec["priority"]
         entry = {"auth_index": index, "name": name, "json": doc}
         if spec.get("with_path"):
             # host.auth.get reports where the credential lives, and the plugin
@@ -1741,6 +1743,46 @@ check("a token refused on astra is refused on sol too",
 check("and the panel says where it was refused",
       rows["cred-b.json"].get("refused_on"), "gpt-6-astra")
 check("it is not counted as sol capacity", sol["available"], 1)
+
+print()
+print("==========================================================================")
+print("AT. a replacement joins the back of the serving queue")
+print("==========================================================================")
+# The host serves fill-first: highest priority wins, and within one priority the
+# lowest credential ID - a hash-like file name, so an arbitrary fixed order. A
+# standby whose name sorted late was therefore never served: each replacement
+# that sorted ahead of it took the traffic the moment it was enabled. One sat
+# enabled for two and a half days that way on 21 requests while its weekly
+# window ran down unused.
+shutil.rmtree(DATA_DIR, ignore_errors=True)
+rotate({
+    "cred-a.json": {"disabled": False, "windows": [(WEEKF, 96, 400000)], "with_path": True},
+    # The standby. Its name sorts after the replacement's, which is the case
+    # that used to leave it idle forever.
+    "cred-z.json": {"disabled": False, "windows": [(WEEKF, 8, 400000)], "with_path": True},
+    "cred-b.json": {"disabled": True, "windows": [(WEEKF, 5, 400000)], "with_path": True},
+})
+disk = {n: json.load(open(os.path.join(live, n))) for n in sorted(os.listdir(live))}
+check("the drained incumbent is retired", disk["cred-a.json"]["disabled"], True)
+check("the replacement is enabled", disk["cred-b.json"]["disabled"], False)
+check("behind everything already enabled", disk["cred-b.json"].get("priority"), -1)
+check("the standby is not rewritten to get there", "priority" in disk["cred-z.json"], False)
+# What the host will do with that: the highest priority is served first.
+enabled = [n for n, d in disk.items() if not d["disabled"]]
+serving = max(enabled, key=lambda n: (disk[n].get("priority", 0), [-ord(ch) for ch in n]))
+check("so the standby that waited serves next, not the newcomer", serving, "cred-z.json")
+
+# Once priorities exist the newcomer still goes to the back, below the lowest.
+shutil.rmtree(DATA_DIR, ignore_errors=True)
+rotate({
+    "cred-a.json": {"disabled": False, "windows": [(WEEKF, 96, 400000)],
+                    "with_path": True, "priority": -3},
+    "cred-z.json": {"disabled": False, "windows": [(WEEKF, 8, 400000)],
+                    "with_path": True, "priority": -4},
+    "cred-b.json": {"disabled": True, "windows": [(WEEKF, 5, 400000)], "with_path": True},
+})
+disk = {n: json.load(open(os.path.join(live, n))) for n in sorted(os.listdir(live))}
+check("a queued newcomer lands below the lowest", disk["cred-b.json"].get("priority"), -5)
 
 print()
 print("=" * 74)
