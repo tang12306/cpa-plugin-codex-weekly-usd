@@ -210,75 +210,158 @@ type modelBucket struct {
 // first one is due back. Disabled credentials are listed but never counted as
 // capacity - eight of nine disabled is exactly the situation that turns one
 // credential's 429 into a dead model.
+//
+// Every live credential counts towards every model. This used to be built
+// from the per-model ledger, which only has an entry for a model once a
+// credential has served it - so a credential that had only ever run astra was
+// not counted as sol capacity, and the panel warned "only one credential can
+// serve sol" while two enabled accounts could. Any Codex account serves any
+// model; history says what a credential has done, not what it can do.
+//
+// What is NOT carried across models is a quota lockout. The used-percentage is
+// one meter shared by every model on the account - it runs straight across
+// back-to-back model switches - but enforcement is per model: on this fleet,
+// sol has been refused at 100% and terra or luna served on the same account,
+// at the same 100%, seconds to minutes later. A lockout on one model therefore
+// says nothing reliable about another, and inventing one would hide capacity
+// that is really there. A refusal of the credential itself (401/403) is
+// different: it is about the token, and every model uses the same token.
 func modelHealth(entries []authEntry, accounts []*Account, now time.Time) ([]map[string]any, []map[string]any) {
 	buckets := map[string]*modelBucket{}
 
-	for _, acct := range accounts {
-		entry, known := lookupAuth(entries, acct)
-		if !known && len(entries) > 0 {
-			// The credential was deleted. Its availability history describes
-			// something that no longer exists and cannot be acted on.
+	// The credentials to report on. With no auth list - a failure to ask, not
+	// evidence that nothing exists - fall back to whatever has accounting.
+	type cred struct {
+		entry    authEntry
+		known    bool
+		acct     *Account
+		disabled bool
+		name     string
+		refused  *ModelHealth
+	}
+	creds := make([]cred, 0, len(entries))
+	if len(entries) > 0 {
+		for _, e := range entries {
+			if e.Type != "" && e.Type != "codex" {
+				continue
+			}
+			c := cred{entry: e, known: true, disabled: e.Disabled,
+				name: firstNonEmpty(e.Label, e.Email, e.Name, e.ID)}
+			for _, acct := range accounts {
+				if acct == nil {
+					continue
+				}
+				if _, ok := lookupAuth([]authEntry{e}, acct); ok {
+					c.acct = acct
+					c.name = displayName(entries, acct)
+					break
+				}
+			}
+			creds = append(creds, c)
+		}
+	} else {
+		for _, acct := range accounts {
+			if acct != nil {
+				creds = append(creds, cred{acct: acct, name: displayName(entries, acct)})
+			}
+		}
+	}
+
+	// Every model the fleet has served is a model every credential can serve.
+	models := map[string]bool{}
+	for i := range creds {
+		c := &creds[i]
+		if c.acct == nil {
 			continue
 		}
-		disabled := known && entry.Disabled
-		name := displayName(entries, acct)
-
-		for model, h := range acct.Models {
+		for model, h := range c.acct.Models {
 			if h == nil {
 				continue
 			}
-			b := buckets[model]
-			if b == nil {
-				b = &modelBucket{}
-				buckets[model] = b
+			models[model] = true
+			if h.Rejected && (c.refused == nil || h.RejectedAt > c.refused.RejectedAt) {
+				c.refused = h
 			}
-			state := h.state(now)
-			if disabled {
+		}
+	}
+
+	for model := range models {
+		b := &modelBucket{}
+		buckets[model] = b
+		for _, c := range creds {
+			var h *ModelHealth
+			if c.acct != nil {
+				h = c.acct.Models[model]
+			}
+			state := stateOK
+			untested := h == nil
+			switch {
+			case c.disabled:
 				state = stateDisabled
+			case c.refused != nil:
+				state = stateRejected
+			case h != nil:
+				state = h.state(now)
 			}
 
 			row := map[string]any{
-				"credential": name,
-				"auth_id":    acct.AuthID,
+				"credential": c.name,
 				"state":      state,
-				"requests":   h.Requests,
-				"failed":     h.Failed,
-				"blocks":     h.Blocks,
+				"requests":   int64(0),
+				"failed":     int64(0),
+				"blocks":     int64(0),
 			}
-			if h.LastSeen > 0 {
-				row["last_seen_age_seconds"] = ageSeconds(h.LastSeen, now)
+			if c.acct != nil {
+				row["auth_id"] = c.acct.AuthID
+			} else {
+				row["auth_id"] = firstNonEmpty(c.entry.Name, c.entry.ID)
 			}
-			if h.LastOK > 0 {
-				row["last_ok_age_seconds"] = ageSeconds(h.LastOK, now)
+			if untested {
+				// Capacity on the strength of the account, not of anything
+				// this credential has shown on this model. Worth saying so.
+				row["untested"] = true
+			}
+			if h != nil {
+				row["requests"], row["failed"], row["blocks"] = h.Requests, h.Failed, h.Blocks
+				if h.LastSeen > 0 {
+					row["last_seen_age_seconds"] = ageSeconds(h.LastSeen, now)
+				}
+				if h.LastOK > 0 {
+					row["last_ok_age_seconds"] = ageSeconds(h.LastOK, now)
+				}
+				if h.CooldownUntil > 0 && state != stateOK && state != stateDisabled && state != stateRejected {
+					until := time.Unix(h.CooldownUntil, 0)
+					row["cooldown_until"] = until.UTC().Format(time.RFC3339)
+					row["cooldown_in_seconds"] = int64(math.Max(0, time.Until(until).Seconds()))
+					row["cooldown_estimated"] = h.Estimated
+					if h.Reason != "" {
+						row["reason"] = h.Reason
+					}
+					if h.BlockedWindow > 0 {
+						row["blocked_window"] = windowLabel(h.BlockedWindow)
+					}
+				}
+				b.requests += h.Requests
+				b.failed += h.Failed
 			}
 			if state == stateRejected {
-				row["reason"] = firstNonEmpty(h.Reason, "unauthorized")
-				if h.RejectedAt > 0 {
-					row["rejected_age_seconds"] = ageSeconds(h.RejectedAt, now)
+				row["reason"] = firstNonEmpty(c.refused.Reason, "unauthorized")
+				if c.refused.RejectedAt > 0 {
+					row["rejected_age_seconds"] = ageSeconds(c.refused.RejectedAt, now)
 				}
-			}
-			if h.CooldownUntil > 0 && state != stateOK && state != stateDisabled {
-				until := time.Unix(h.CooldownUntil, 0)
-				row["cooldown_until"] = until.UTC().Format(time.RFC3339)
-				row["cooldown_in_seconds"] = int64(math.Max(0, time.Until(until).Seconds()))
-				row["cooldown_estimated"] = h.Estimated
-				if h.Reason != "" {
-					row["reason"] = h.Reason
-				}
-				if h.BlockedWindow > 0 {
-					row["blocked_window"] = windowLabel(h.BlockedWindow)
+				if h == nil || !h.Rejected {
+					// Refused on another model; the token is the same one.
+					row["refused_on"] = c.refused.Model
 				}
 			}
 			b.creds = append(b.creds, row)
-			b.requests += h.Requests
-			b.failed += h.Failed
 
-			if disabled {
+			if c.disabled {
 				b.disabled++
 				continue
 			}
 			b.total++
-			b.soleCredential = name
+			b.soleCredential = c.name
 			switch state {
 			case stateCooling:
 				b.cooling++
@@ -287,6 +370,8 @@ func modelHealth(entries []authEntry, accounts []*Account, now time.Time) ([]map
 				}
 			case stateRecovering:
 				b.recovering++
+			case stateRejected:
+				// Counted as capacity it is not: a refused token serves nothing.
 			default:
 				b.available++
 			}

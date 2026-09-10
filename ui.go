@@ -288,7 +288,7 @@ const panelHTML = `<!doctype html>
       mhTraffic: "请求 / 失败", mhCreds: "各凭据状态", mhNone: "还没有模型可用性数据。",
       msDown: "全部冷却", msDegraded: "部分冷却", msOK: "正常", msSingle: "单点凭据",
       csCooling: "冷却", csRecovering: "待验证", csOK: "正常", csDisabled: "已停用",
-      csRejected: "凭据失效", rmRemoved: "{0} 个凭据已删除，不再显示：{1}",
+      csRejected: "凭据失效", csUntested: "(未试过)", mhUntested: "这个凭据还没服务过这个模型。它照样算容量——任何 Codex 账号都能跑任何模型——只是还没有它在这个模型上的实际记录。", mhRefusedOn: "在 {0} 上被上游拒绝：同一个 token，所以所有模型都用不了", rmRemoved: "{0} 个凭据已删除，不再显示：{1}",
       mhEstimated: "估计", mhBlocks: "累计 {0} 次冷却", mhReason: "原因：{0}",
       rotTitle: "凭据轮换",
       rotHint: "轮换器维持固定数量的凭据处于启用状态，在成员快耗尽之前把它换掉。" +
@@ -402,7 +402,7 @@ const panelHTML = `<!doctype html>
       mhTraffic: "Requests / failed", mhCreds: "Per credential", mhNone: "No model availability data yet.",
       msDown: "all cooling", msDegraded: "partly cooling", msOK: "healthy", msSingle: "single credential",
       csCooling: "cooling", csRecovering: "unverified", csOK: "ok", csDisabled: "disabled",
-      csRejected: "credential rejected", rmRemoved: "{0} deleted credential(s) not shown: {1}",
+      csRejected: "credential rejected", csUntested: "(untested)", mhUntested: "This credential has not served this model yet. It still counts as capacity - any Codex account can run any model - there is just no record of it doing so.", mhRefusedOn: "Refused upstream on {0}: same token, so no model can use it", rmRemoved: "{0} deleted credential(s) not shown: {1}",
       mhEstimated: "estimated", mhBlocks: "{0} lockouts so far", mhReason: "reason: {0}",
       rotTitle: "Credential rotation",
       rotHint: "The rotator holds a fixed number of credentials enabled and replaces a member " +
@@ -990,7 +990,13 @@ const panelHTML = `<!doctype html>
     if (c.state === "rejected" && c.rejected_age_seconds !== undefined) {
       label += " " + dur(c.rejected_age_seconds);
     }
+    // Counted as capacity because every account serves every model, not
+    // because this credential has shown anything on this one. Said quietly -
+    // it is the normal state of a standby - but said.
+    if (c.untested && c.state === "ok") label += " " + t("csUntested");
     var tip = [];
+    if (c.untested) tip.push(t("mhUntested"));
+    if (c.refused_on) tip.push(t("mhRefusedOn", c.refused_on));
     if (c.reason) tip.push(t("mhReason", c.reason));
     if (c.blocked_window) tip.push(t("mhWindowFull", c.blocked_window));
     if (c.cooldown_until) tip.push(c.cooldown_until + (c.cooldown_estimated ? " (" + t("mhEstimated") + ")" : ""));

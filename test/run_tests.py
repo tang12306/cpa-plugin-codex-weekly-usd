@@ -1693,6 +1693,56 @@ check("and carries the ratio, not the other account's dollars",
       round(bym.get("gpt-6-astra", 0), 2), 50.00)
 
 print()
+print("==========================================================================")
+print("AS. every live credential is capacity for every model")
+print("==========================================================================")
+# The ledger only has an entry for a model once a credential has served it, and
+# the availability board used to be built from it - so an account that had only
+# ever run astra was not counted as sol capacity, and the panel warned "only one
+# credential can serve sol" while two enabled accounts could. Any Codex account
+# serves any model. History says what a credential has done, not what it can do.
+shutil.rmtree(DATA_DIR, ignore_errors=True)
+rep = run([
+    ("usage.handle", usage([(WEEK, 5, LATER)], model="gpt-5.6-sol", auth="cred-a.json")),
+    ("usage.handle", usage([(WEEK, 6, LATER)], model="gpt-6-astra", auth="cred-a.json")),
+    ("usage.handle", usage([(WEEK, 3, LATER)], model="gpt-6-astra", auth="cred-b.json")),
+] + [("usage.handle", usage([(WEEK, 5 + i, LATER)], model="gpt-5.6-sol", auth="cred-a.json"))
+     for i in range(25)],
+    auth_list=[authfile("cred-a.json"), authfile("cred-b.json"),
+               # Never served anything at all: no accounting, still an account.
+               authfile("cred-new.json"),
+               authfile("cred-off.json", disabled=True)])
+sol = health(rep, "gpt-5.6-sol")
+check("sol counts every enabled credential", sol["credentials"], 3)
+check("and all of them are available", sol["available"], 3)
+check("disabled ones are listed, not counted", sol["disabled"], 1)
+check("so it is not a single point of failure", sol["single_point"], False)
+check("and nothing warns that it is", len(codes(rep, "model_single_point")), 0)
+rows = {c["credential"]: c for c in sol["by_credential"]}
+check("a credential that never ran sol is marked untested",
+      rows["cred-b.json"].get("untested"), True)
+check("one that did is not", rows["cred-a.json"].get("untested", False), False)
+check("a credential with no accounting at all is still listed",
+      rows.get("cred-new.json", {}).get("state"), "ok")
+
+# A refusal of the credential is about its token, and every model uses the same
+# token - so it does cross models, unlike a quota lockout (M).
+shutil.rmtree(DATA_DIR, ignore_errors=True)
+rep = run([
+    ("usage.handle", usage([(WEEK, 5, LATER)], model="gpt-5.6-sol", auth="cred-a.json")),
+    ("usage.handle", usage([(WEEK, 3, LATER)], model="gpt-6-astra", auth="cred-b.json")),
+    ("usage.handle", usage([], model="gpt-6-astra", auth="cred-b.json",
+                           failed=True, status=401, body=REVOKED_BODY)),
+], auth_list=[authfile("cred-a.json"), authfile("cred-b.json")])
+sol = health(rep, "gpt-5.6-sol")
+rows = {c["credential"]: c for c in sol["by_credential"]}
+check("a token refused on astra is refused on sol too",
+      rows["cred-b.json"]["state"], "rejected")
+check("and the panel says where it was refused",
+      rows["cred-b.json"].get("refused_on"), "gpt-6-astra")
+check("it is not counted as sol capacity", sol["available"], 1)
+
+print()
 print("=" * 74)
 if failures:
     print("FAILED: " + ", ".join(failures))
