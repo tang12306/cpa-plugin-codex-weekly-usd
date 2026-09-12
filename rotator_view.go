@@ -95,7 +95,7 @@ func (a *App) trafficRejection(e authEntry) (bool, string, int64) {
 	return rejected, reason, at
 }
 
-// observeWindows folds a probe's reading into the accounting state, exactly as
+// observeReading folds a probe's reading into the accounting state, exactly as
 // a served request's headers would be.
 //
 // Without it a probe only ever reaches the rotator's own view: the panel keeps
@@ -106,22 +106,48 @@ func (a *App) trafficRejection(e authEntry) (bool, string, int64) {
 // Movement with no spend of ours behind it is recorded as unexplained, which is
 // the truth: from this plugin's side the credential was idle, so anything that
 // moved was spent by something else.
-func (a *App) observeWindows(e authEntry, windows []windowReading, now time.Time) {
-	if len(windows) == 0 {
+func (a *App) observeReading(e authEntry, res probeResult, now time.Time) {
+	if len(res.Windows) == 0 {
 		return
 	}
 	acct := a.accountFor(e)
-	if acct == nil {
-		return
-	}
 	a.mu.Lock()
 	defer a.mu.Unlock()
-	for _, r := range windows {
+	if acct == nil && e.ID != "" {
+		// Traffic may have opened it since accountFor looked.
+		acct = a.accounts[e.ID]
+	}
+	if acct == nil {
+		// A credential that has never served has no accounting yet, and the
+		// panel shows it as "never used" with nothing to say about its quota -
+		// while a reading of it is sitting right here. It is filed under the
+		// key live traffic uses, so its first request lands in the same place.
+		if e.ID == "" {
+			return
+		}
+		acct = &Account{
+			AuthID:    e.ID,
+			AuthIndex: e.AuthIndex,
+			Provider:  e.Type,
+			FirstSeen: now.Unix(),
+			Windows:   map[string]*Window{},
+			Hours:     map[string]*HourAgg{},
+		}
+		a.accounts[e.ID] = acct
+	}
+	for _, r := range res.Windows {
 		if r.Minutes <= 0 {
 			continue
 		}
 		acct.window(r.Minutes).advance(r, now)
 	}
+	// The standing travels with the percentages. A reading taken after a reset
+	// has to clear the "limit reached" a refused request left behind, or the
+	// panel goes on flagging a credential that was just made whole.
+	if res.PlanType != "" {
+		acct.PlanType = res.PlanType
+	}
+	acct.Credits = res.Credits
 	a.dirty = true
 }
 

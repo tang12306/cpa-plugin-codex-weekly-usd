@@ -103,6 +103,9 @@ type RotatorConfig struct {
 	// dialer, headers and quota parsing included - rather than against a stub
 	// of itself. Leaving it unset uses the real Codex endpoint.
 	ProbeURL string `yaml:"probe_url"`
+	// UsageURL is the usage endpoint quota is read from, a setting for the same
+	// reason as ProbeURL. Unset uses the real one.
+	UsageURL string `yaml:"usage_url"`
 	// DisableDeadTokens switches off a credential upstream has stopped
 	// accepting. Disabling is the safe direction: it removes capacity that was
 	// not working anyway.
@@ -120,6 +123,18 @@ type RotatorConfig struct {
 	// wrong or the panel showing a percentage that stopped being true hours
 	// ago.
 	ResyncAfterReset bool `yaml:"resync_after_reset"`
+	// KickstartAfterReset sends one short message ("你好") to a credential
+	// whose longest window has been reset but not started. A window starts
+	// counting down at its first request, not at the reset, so a reset that
+	// lands on an idle credential is a week that has not begun, and every hour
+	// it waits pushes the next refill an hour later. Costs about twenty tokens
+	// per reset. Off by default: it is a request made with the credential.
+	KickstartAfterReset bool `yaml:"kickstart_after_reset"`
+	// KickstartSweepMinutes is how often idle credentials are re-read so that
+	// a reset nothing else would reveal is still found. Live traffic showing a
+	// reset arriving early triggers a sweep at once regardless. Negative turns
+	// the periodic sweep off.
+	KickstartSweepMinutes int `yaml:"kickstart_sweep_minutes"`
 	// MaxProbesPerDayPerCredential is the backstop. The per-cycle rule below
 	// should already hold probing to a handful a day; this bounds the damage if
 	// some reading never settles and the per-cycle rule keeps renewing.
@@ -153,10 +168,12 @@ func defaultConfig() Config {
 			MaxChangesPerDay:     20,
 			ProbeModel:           "gpt-5.6-sol",
 			ProbeURL:             probeURL,
+			UsageURL:             usageURL,
 			DisableDeadTokens:    true,
 			ConfirmBeforeSwitch:  true,
 			ResyncAfterReset:     true,
 
+			KickstartSweepMinutes:        60,
 			MaxProbesPerDayPerCredential: 6,
 		},
 	}
@@ -226,11 +243,17 @@ func (rc *RotatorConfig) normalize(def RotatorConfig) {
 	if strings.TrimSpace(rc.ProbeURL) == "" {
 		rc.ProbeURL = def.ProbeURL
 	}
+	if strings.TrimSpace(rc.UsageURL) == "" {
+		rc.UsageURL = def.UsageURL
+	}
 	if strings.TrimSpace(rc.Provider) == "" {
 		rc.Provider = def.Provider
 	}
 	if rc.MaxProbesPerDayPerCredential <= 0 {
 		rc.MaxProbesPerDayPerCredential = def.MaxProbesPerDayPerCredential
+	}
+	if rc.KickstartSweepMinutes == 0 {
+		rc.KickstartSweepMinutes = def.KickstartSweepMinutes
 	}
 }
 
@@ -253,7 +276,7 @@ func configFields() []map[string]any {
 		{"Name": "flush_seconds", "Type": "integer", "Description": "Seconds between state snapshots to disk."},
 		{"Name": "stale_after_minutes", "Type": "integer", "Description": "Flag a credential whose newest quota reading is older than this."},
 		{"Name": "model_health_days", "Type": "integer", "Description": "Days a (credential, model) availability record is kept after its last request."},
-		{"Name": "rotator", "Type": "object", "Description": "Credential pool: {enabled, dry_run, keep_enabled, switch_at_percent, lead_time_minutes, horizon_hours, probe_model, never_enable, never_disable}. Off by default; the only part that writes auth files."},
+		{"Name": "rotator", "Type": "object", "Description": "Credential pool: {enabled, dry_run, keep_enabled, switch_at_percent, lead_time_minutes, horizon_hours, probe_model, kickstart_after_reset, kickstart_sweep_minutes, never_enable, never_disable}. Off by default; the only part that writes auth files."},
 	}
 }
 

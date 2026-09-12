@@ -294,6 +294,18 @@ type App struct {
 	stop      chan struct{}
 	started   bool
 	startedAt time.Time
+
+	// earlyReset is when live traffic last showed a window reset before its
+	// time. Upstream resetting every account looks exactly like that from the
+	// credential that happens to be serving, and it is the rotator's cue to
+	// read the idle ones at once rather than at the next scheduled sweep.
+	earlyReset int64
+}
+
+func (a *App) earlyResetAt() int64 {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return a.earlyReset
 }
 
 type authEntry struct {
@@ -495,7 +507,9 @@ func (a *App) HandleUsage(payload []byte) {
 	// keeps its own ledger rather than sharing one.
 	for _, wr := range rl.Windows {
 		w := acct.window(wr.Minutes)
-		w.advance(wr, now)
+		if w.advance(wr, now) {
+			a.earlyReset = now.Unix()
+		}
 		w.bill(cost, saved, rec, model, priced)
 	}
 
@@ -519,11 +533,25 @@ func (a *App) HandleUsage(payload []byte) {
 }
 
 // advance folds a fresh reading into one window, opening a new cycle when the
-// old one ended and calibrating from the percentage step.
-func (w *Window) advance(r windowReading, now time.Time) {
+// old one ended and calibrating from the percentage step. early reports a new
+// cycle that arrived before the old one was due: a reset someone granted, not
+// the clock.
+func (w *Window) advance(r windowReading, now time.Time) (early bool) {
 	switch {
+	case w.Key != 0 && r.ResetAt > 0 && absInt64(r.ResetAt-w.Key) > 120 && w.untouched(r):
+		// A window nothing has touched has no fixed end yet: upstream reports
+		// it as resetting one full period from whenever it is asked. Reading an
+		// idle credential twice is not two cycles, so the boundary moves and
+		// nothing else does.
+		w.Key = r.ResetAt
+		if w.Minutes > 0 {
+			w.Start = r.ResetAt - int64(w.Minutes)*60
+		}
+
 	case w.Key == 0 || (r.ResetAt > 0 && absInt64(r.ResetAt-w.Key) > 120):
-		// The reset timestamp moved: the cycle rolled over normally.
+		// The reset timestamp moved: the cycle rolled over - normally, unless
+		// the old one still had time to run and the usage fell with it.
+		early = w.Key != 0 && w.ResetAt > now.Unix()+120 && r.Percent < w.Percent
 		w.startCycle(r, now, false)
 
 	case w.HasLast && r.Percent < w.LastPercent-0.001:
@@ -531,6 +559,7 @@ func (w *Window) advance(r windowReading, now time.Time) {
 		// granted a mid-cycle reset. Without this branch the old cycle's spend
 		// would be divided by the new small percentage and the quota estimate
 		// would explode.
+		early = true
 		w.startCycle(r, now, true)
 	}
 
@@ -566,6 +595,14 @@ func (w *Window) advance(r windowReading, now time.Time) {
 	w.Percent = r.Percent
 	w.ResetAt = r.ResetAt
 	w.ObservedAt = now.Unix()
+	return early
+}
+
+// untouched reports whether this cycle has seen nothing at all - no request, no
+// movement - and the new reading says the same.
+func (w *Window) untouched(r windowReading) bool {
+	return w.HasLast && w.LastPercent <= 0 && r.Percent <= 0 &&
+		w.Requests == 0 && w.PendingUSD == 0
 }
 
 // startCycle resets per-cycle accounting. Calibration samples survive the roll,
@@ -1222,14 +1259,22 @@ func (a *App) Flush() {
 	for k, v := range a.accounts {
 		snapshot.Accounts[k] = v
 	}
+	// Encoded under the lock. The accounts are the live ones, and the request
+	// path inserts into their maps - a new hour bucket on the first request of
+	// every hour, a new model the first time one is served. Encoding a map
+	// while another goroutine writes it is a fatal runtime error, not a
+	// recoverable panic, and in a c-shared library it takes the whole proxy
+	// down; Report holds this lock for the same reason. The write to disk, the
+	// slow part, still happens outside it.
+	body, errEncode := json.MarshalIndent(snapshot, "", "  ")
 	events := a.events
 	a.events = nil
 	a.dirty = false
 	dir := a.cfg.DataDir
 	a.mu.Unlock()
 
-	if body, err := json.MarshalIndent(snapshot, "", "  "); err == nil {
-		if err = writeFileAtomic(filepath.Join(dir, "state.json"), body); err != nil {
+	if errEncode == nil {
+		if err := writeFileAtomic(filepath.Join(dir, "state.json"), body); err != nil {
 			hostLog("warn", "state write failed: "+err.Error())
 		}
 	}

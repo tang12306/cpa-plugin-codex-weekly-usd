@@ -26,12 +26,14 @@ import (
 // Three facts from upstream shape the rules here, all of them measured rather
 // than assumed:
 //
-//   - A minimal request is a free quota reading. Two back to back both report
-//     the same percentage, so probing costs nothing worth counting - but the
-//     reading only exists on a request that upstream accepts. A rejected one
-//     (bad model, malformed body) carries no quota headers at all.
-//   - A refusal still carries them. A 429 reports the percentages that caused
-//     it, so an exhausted credential is readable rather than a blind spot.
+//   - Reading quota costs nothing. The usage endpoint the Codex clients poll
+//     for their status line reports every window without calling a model (see
+//     quota_read.go). The fallback, a minimal model request, carries the same
+//     figures in its headers, and two of those back to back read the same
+//     percentage.
+//   - An exhausted credential is readable rather than a blind spot. The usage
+//     endpoint reports it like any other, and a refused model request's 429
+//     carries the percentages that caused it.
 //   - A disabled credential is not frozen. Credentials disabled here have been
 //     observed consuming quota anyway, which means something outside this proxy
 //     uses them. Stored percentages are therefore evidence, not fact, and a
@@ -94,6 +96,11 @@ type probeResult struct {
 	// Rolled marks a standing whose window was only believed to have reset,
 	// worked out from the clock rather than read from upstream.
 	Rolled bool `json:"-"`
+	// ViaModel marks a reading taken from a model request's headers. Those
+	// describe the moment before the request, and the request itself starts
+	// any window it finds waiting - so such a reading must not queue a
+	// kick-start of its own.
+	ViaModel bool `json:"-"`
 }
 
 // alive reports whether this reading shows a credential that can serve. A 429
@@ -177,6 +184,12 @@ type RotatorState struct {
 	// restart: without it every restart would re-probe every credential,
 	// including ones already known to be refused.
 	Probes map[string]probeMemo `json:"probes,omitempty"`
+	// KickDue lists credentials read as reset and not yet started, with when
+	// that was seen; Kicks is what the last kick-start of each did; IdleSweepAt
+	// is when idle credentials were last read for a reset. See kickstart.go.
+	KickDue     map[string]int64    `json:"kick_due,omitempty"`
+	Kicks       map[string]kickMemo `json:"kicks,omitempty"`
+	IdleSweepAt int64               `json:"idle_sweep_at,omitempty"`
 }
 
 // rotatorLease names the one instance allowed to write credentials.
@@ -376,6 +389,13 @@ func (r *rotator) tick(force bool) {
 			}
 			results[e.Name] = r.ask(e, res, cfg, now, "re-reading a window the clock says has reset")
 		}
+	}
+
+	// A reset window on an idle credential does not start counting down until
+	// something is sent through it. Like the resync above, this runs whether or
+	// not the pool is short: its job is the next refill, not the current pool.
+	if cfg.KickstartAfterReset {
+		r.kickstart(pool, cfg, now)
 	}
 
 	short, why := r.poolShortfall(enabled, results, cfg)
@@ -967,18 +987,34 @@ func (r *rotator) probeAllowed(e authEntry, res probeResult, cfg RotatorConfig, 
 	return true, ""
 }
 
-// refreshAll re-reads every credential the plugin is allowed to ask about.
+// refreshGap is how recently a credential must have been asked for a refresh to
+// leave it alone. Every panel load refreshes, and two open browsers, or a few
+// quick reloads, would otherwise ask the same question several times over.
+const refreshGap = 30 * time.Second
+
+// refreshWorkers bounds how many credentials a refresh reads at once. The
+// panel waits for the answer, so reading one after another - several seconds
+// each through a slow proxy - would leave it waiting for the slowest sum.
+const refreshWorkers = 4
+
+// refreshAll re-reads every credential the plugin is allowed to ask about. The
+// panel calls it whenever it is opened or refreshed.
 //
 // Every automatic path deliberately waits for a reason: a window whose reset
 // time has passed, a pool that is short, a replacement about to take traffic.
-// A quota reset granted out of band satisfies none of them - it moves no clock
-// and empties no pool - so nothing would ever notice it, and the panel would
-// go on reporting percentages that stopped being true the moment it happened.
+// A quota reset spent by hand satisfies none of them - it moves no clock and
+// empties no pool - and it happens on the proxy's own management page, which
+// this plugin cannot see. So nothing would notice it until a window happened to
+// roll, and the panel would go on reporting percentages that stopped being true
+// the moment it happened. The operator opening the panel is the moment to look.
 //
-// This is the operator saying the stored numbers are wrong. It therefore
-// bypasses the per-cycle budget, but not the daily cap and not the rule about
-// credentials upstream has refused: asking those again cannot change the
-// answer, and only a fresh login can.
+// That is only affordable because the usage endpoint is free, so this uses it
+// alone and never falls back to a model request. For the same reason it books
+// nothing against the rotator's daily cap: that cap exists to bound what the
+// rotator asks on its own, and letting page loads spend it would leave the
+// rotator unable to check a replacement later the same day. What it keeps is
+// the rule about credentials upstream has refused - asking again cannot change
+// that answer, only a fresh login can.
 func (r *rotator) refreshAll(entries []authEntry, cfg RotatorConfig, now time.Time) map[string]any {
 	pool := make([]authEntry, 0, len(entries))
 	for _, e := range entries {
@@ -988,40 +1024,86 @@ func (r *rotator) refreshAll(entries []authEntry, cfg RotatorConfig, now time.Ti
 	}
 	results := r.derive(pool, now)
 
-	rows := make([]map[string]any, 0, len(pool))
-	read, skipped := 0, 0
+	var rows []map[string]any
+	var due []authEntry
 	for _, e := range pool {
 		row := map[string]any{"file": e.Name, "credential": firstNonEmpty(e.Label, e.Email, e.Name)}
-		allowed, why := r.probeAllowed(e, results[e.Name], cfg, now, true)
-		if !allowed {
+		switch allowed, why := r.probeAllowed(e, results[e.Name], cfg, now, true); {
+		case !allowed && why != skipProbeBudget:
 			row["skipped"] = why
-			skipped++
-			rows = append(rows, row)
-			continue
+		default:
+			if memo, ok := r.memo(e.Name); ok && now.Sub(time.Unix(memo.At, 0)) < refreshGap {
+				row["skipped"] = "read_just_now"
+			} else {
+				due = append(due, e)
+				continue
+			}
 		}
-		fresh := r.ask(e, results[e.Name], cfg, now, "operator asked for a re-read")
-		row["status_code"] = fresh.StatusCode
-		if fresh.Error != "" {
-			row["error"] = fresh.Error
-		}
-		for _, w := range fresh.Windows {
-			row[windowLabel(w.Minutes)+"_used_percent"] = round2(w.Percent)
-		}
-		read++
 		rows = append(rows, row)
 	}
 
+	read := r.readMany(due, cfg, now, "operator refresh")
+	failed := 0
+	for _, row := range read {
+		if _, bad := row["error"]; bad {
+			failed++
+		}
+	}
 	return map[string]any{
-		"read":        read,
-		"skipped":     skipped,
-		"credentials": rows,
+		"read":        len(read) - failed,
+		"failed":      failed,
+		"skipped":     len(rows),
+		"credentials": append(read, rows...),
 	}
 }
 
-// ask probes one credential, once, and books it against the budget. It is the
-// only path in this file that reaches upstream.
+// readMany reads credentials from the usage endpoint, a few at a time, filing
+// each reading the way refreshAll describes: no budget spent, no cycle claimed.
+func (r *rotator) readMany(entries []authEntry, cfg RotatorConfig, now time.Time, why string) []map[string]any {
+	rows := make([]map[string]any, len(entries))
+	var wg sync.WaitGroup
+	next := make(chan int)
+	for n := 0; n < refreshWorkers && n < len(entries); n++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for i := range next {
+				e := entries[i]
+				fresh := r.settle(e, probeResult{}, r.look(e, cfg), now, why, false)
+				row := map[string]any{"file": e.Name, "credential": firstNonEmpty(e.Label, e.Email, e.Name),
+					"status_code": fresh.StatusCode}
+				if fresh.Error != "" {
+					row["error"] = fresh.Error
+				}
+				for _, w := range fresh.Windows {
+					row[windowLabel(w.Minutes)+"_used_percent"] = round2(w.Percent)
+				}
+				if unstarted(fresh.Windows) {
+					row["waiting_to_start"] = true
+				}
+				rows[i] = row
+			}
+		}()
+	}
+	for i := range entries {
+		next <- i
+	}
+	close(next)
+	wg.Wait()
+	return rows
+}
+
+// ask probes one credential for the rotator, once, and books it against the
+// budget. It and refreshAll are the only paths in this file that reach
+// upstream.
 func (r *rotator) ask(e authEntry, res probeResult, cfg RotatorConfig, now time.Time, why string) probeResult {
-	fresh := r.probe(e, cfg)
+	return r.settle(e, res, r.probe(e, cfg), now, why, true)
+}
+
+// settle files a fresh reading everywhere it belongs: the probe ledger, the
+// rotator's own view, and the accounting the panel reports from. budgeted says
+// whether it counts against the daily cap.
+func (r *rotator) settle(e authEntry, res, fresh probeResult, now time.Time, why string, budgeted bool) probeResult {
 	// Roll before anything reads the reading. derive() applies the same
 	// arithmetic, and if the budget were keyed to the raw boundary while the
 	// derived picture used the rolled one, the two would never agree and the
@@ -1031,17 +1113,29 @@ func (r *rotator) ask(e authEntry, res probeResult, cfg RotatorConfig, now time.
 	}
 
 	memo := probeMemo{At: now.Unix(), StatusCode: fresh.StatusCode, Reason: why}
-	if prev, ok := r.memo(e.Name); ok && prev.DayKey == now.UTC().Format("2006-01-02") {
+	prev, hadPrev := r.memo(e.Name)
+	today := now.UTC().Format("2006-01-02")
+	if hadPrev && prev.DayKey == today {
 		memo.DayCount = prev.DayCount
 	}
-	memo.DayKey = now.UTC().Format("2006-01-02")
-	memo.DayCount++
-	// Key the budget to the reading we just got when there is one, so it renews
-	// when the window does; otherwise to the reading we were working from.
-	if len(fresh.Windows) > 0 {
-		memo.Epoch = probeEpoch(fresh.Windows, now)
-	} else {
-		memo.Epoch = probeEpoch(res.Windows, now)
+	memo.DayKey = today
+	switch {
+	case budgeted:
+		memo.DayCount++
+		// Key the budget to the reading we just got when there is one, so it
+		// renews when the window does; otherwise to the reading we were working
+		// from.
+		if len(fresh.Windows) > 0 {
+			memo.Epoch = probeEpoch(fresh.Windows, now)
+		} else {
+			memo.Epoch = probeEpoch(res.Windows, now)
+		}
+	case hadPrev:
+		// The operator's read leaves the rotator's cycle unclaimed. Claiming it
+		// would mean a page opened at ten blocks the check a replacement gets
+		// before taking traffic at two - and that check exists precisely
+		// because a token can be revoked while nobody is looking.
+		memo.Epoch = prev.Epoch
 	}
 	if fresh.rejected() {
 		memo.Rejected = true
@@ -1049,6 +1143,12 @@ func (r *rotator) ask(e authEntry, res probeResult, cfg RotatorConfig, now time.
 			memo.Fingerprint = tokenFingerprint(token)
 		}
 	}
+
+	// A window read as reset and not started is waiting for its first request.
+	// Checked before the lock: config takes the app lock, and that is never
+	// taken while holding the rotator's.
+	waiting := fresh.Error == "" && !fresh.ViaModel && unstarted(fresh.Windows) &&
+		r.config().KickstartAfterReset
 
 	r.mu.Lock()
 	if r.state.Probes == nil {
@@ -1059,10 +1159,13 @@ func (r *rotator) ask(e authEntry, res probeResult, cfg RotatorConfig, now time.
 		r.probes[e.Name] = fresh
 	}
 	r.mu.Unlock()
+	if waiting {
+		r.markKickDue(e.Name, now)
+	}
 
 	// The reading is worth as much to the accounting side as to this one: it is
 	// the same measurement a served request would have produced.
-	r.app.observeWindows(e, fresh.Windows, now)
+	r.app.observeReading(e, fresh, now)
 	// And a served probe is proof the credential works, which is the only
 	// thing that can lift a refusal recorded against it. Nothing else can:
 	// a refused credential is disabled, so the successful request that would
@@ -1080,9 +1183,9 @@ func (r *rotator) ask(e authEntry, res probeResult, cfg RotatorConfig, now time.
 	return fresh
 }
 
-// probe asks upstream for one credential's quota. The request is the smallest
-// accepted shape: upstream only reports quota on a request it accepts, so there
-// is no cheaper reading to be had.
+// probe asks upstream for one credential's quota: the usage endpoint first, and
+// the smallest accepted model request only when that endpoint cannot answer.
+// The model request costs next to nothing, but it is a request all the same.
 func (r *rotator) probe(e authEntry, cfg RotatorConfig) probeResult {
 	res := probeResult{File: e.Name, Index: e.AuthIndex, At: time.Now().Unix()}
 
@@ -1091,30 +1194,19 @@ func (r *rotator) probe(e authEntry, cfg RotatorConfig) probeResult {
 		res.Error = err.Error()
 		return res
 	}
-
-	body, _ := json.Marshal(map[string]any{
-		"model":  cfg.ProbeModel,
-		"store":  false,
-		"stream": true,
-		"input": []map[string]any{{
-			"role":    "user",
-			"content": []map[string]any{{"type": "input_text", "text": "hi"}},
-		}},
-	})
-	headers := map[string][]string{
-		"authorization":      {"Bearer " + token},
-		"chatgpt-account-id": {account},
-		"openai-beta":        {"responses=experimental"},
-		"originator":         {"codex_cli_rs"},
-		"user-agent":         {probeUserAgent},
-		"content-type":       {"application/json"},
+	if got, answered := readUsage(token, account, proxyURL, firstNonEmpty(cfg.UsageURL, usageURL), time.Now()); answered {
+		got.File, got.Index, got.At = res.File, res.Index, res.At
+		return got
 	}
-	status, respHeaders, err := probeDo(proxyURL, "POST", firstNonEmpty(cfg.ProbeURL, probeURL), headers, body)
+
+	body, headers := modelRequest(token, account, "hi", cfg)
+	status, respHeaders, _, err := probeDo(proxyURL, "POST", firstNonEmpty(cfg.ProbeURL, probeURL), headers, body, 0)
 	if err != nil {
 		res.Error = err.Error()
 		return res
 	}
 	res.StatusCode = status
+	res.ViaModel = true
 
 	rl := parseRateLimit(respHeaders)
 	res.Windows = rl.Windows
@@ -1126,6 +1218,22 @@ func (r *rotator) probe(e authEntry, cfg RotatorConfig) probeResult {
 		res.Error = "no quota headers on a successful probe"
 	}
 	return res
+}
+
+// look reads one credential for the operator: the usage endpoint and nothing
+// else. When that endpoint cannot answer, the row says so and the stored
+// reading stands; turning a page load into a model request per credential is
+// not a trade worth making.
+func (r *rotator) look(e authEntry, cfg RotatorConfig) probeResult {
+	res := probeResult{File: e.Name, Index: e.AuthIndex, At: time.Now().Unix()}
+	token, account, proxyURL, err := r.credential(e)
+	if err != nil {
+		res.Error = err.Error()
+		return res
+	}
+	got, _ := readUsage(token, account, proxyURL, firstNonEmpty(cfg.UsageURL, usageURL), time.Now())
+	got.File, got.Index, got.At = res.File, res.Index, res.At
+	return got
 }
 
 // credential pulls the access token out of the auth file through the host, and
@@ -1512,11 +1620,30 @@ func (r *rotator) record(rec switchRecord) {
 // snapshot and restore carry the audit trail and the circuit breaker across a
 // restart, so a proxy that bounces cannot spend its daily switch budget twice.
 // Both are called with the app lock already held.
+//
+// Every map is copied, not just the log. The copy is encoded after this lock is
+// released, while refreshes and kick-starts keep writing the live maps from
+// other goroutines - and encoding a map while another goroutine writes it is a
+// fatal runtime error that a c-shared library takes the whole proxy down with.
 func (r *rotator) snapshot() RotatorState {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	out := r.state
 	out.Log = append([]switchRecord(nil), r.state.Log...)
+	out.Probes = copyMap(r.state.Probes)
+	out.KickDue = copyMap(r.state.KickDue)
+	out.Kicks = copyMap(r.state.Kicks)
+	return out
+}
+
+func copyMap[K comparable, V any](in map[K]V) map[K]V {
+	if in == nil {
+		return nil
+	}
+	out := make(map[K]V, len(in))
+	for k, v := range in {
+		out[k] = v
+	}
 	return out
 }
 
@@ -1643,6 +1770,14 @@ func (r *rotator) Report(cfg RotatorConfig, board []candidate) map[string]any {
 		}
 		out["probes_today"] = spent
 		out["probes_refused_credentials"] = refused
+	}
+
+	if cfg.KickstartAfterReset {
+		out["kickstart"] = true
+		out["kicks_today"] = r.kicksToday(time.Now())
+		if waiting := r.waitingToStart(); len(waiting) > 0 {
+			out["waiting_to_start"] = waiting
+		}
 	}
 
 	if len(r.state.Log) > 0 {

@@ -19,10 +19,11 @@ window quota (USD) = spend / (used percent / 100)
 - Windows are identified by length, not by the primary / secondary slot (upstream has swapped them once)
 - A window is one quota pool, metered on one gauge for every model. But **a dollar buys a different share of it in each model** (measured: gpt-6-astra consumes about 1.4x what gpt-5.6-sol does), so quota is estimated per model. The ratio between models is measured inside a single window (read from the event log, hourly), then carried to credentials that have never served a given model. Nothing is estimated without enough data: measuring needs the model to move the meter 10+ points on its own, carrying needs 5+ such windows that agree; anything short shows "not enough data"
 - Calibration uses the current cycle's evidence, reaching back to earlier cycles only when there is too little
+- Opening or refreshing the panel re-reads every credential's quota from the usage endpoint the Codex clients use for their status line: no model is called and no quota is spent, and a credential is read at most once every 30 seconds. So a reset spent on CPA's management page, or another client's usage, shows up as soon as the panel is opened. The panel's once-a-minute update only redraws what the plugin already has
 
 ## Install
 
-Search `codex-weekly-usd` in the plugin store, or download from [Releases](https://github.com/tang12306/cpa-plugin-codex-weekly-usd/releases) and place it at:
+Download from [Releases](https://github.com/tang12306/cpa-plugin-codex-weekly-usd/releases) and place it at:
 
 ```
 <CLIProxyAPI working dir>/plugins/<goos>/<goarch>/codex-weekly-usd.so
@@ -45,6 +46,7 @@ plugins:
         keep_enabled: 2       # credentials kept enabled at once
         switch_at_percent: 10 # switch when the tightest window has less headroom than this
         probe_model: gpt-5.6-sol
+        kickstart_after_reset: false # true = after a quota reset, send "你好" so the 7-day countdown starts at once
 ```
 
 Everything else has a default; see [config.go](config.go). Prices are refreshed daily from `models.dev` (through CPA's configured proxy), with a built-in table as the offline fallback. Models without a price are flagged, never counted as free.
@@ -54,7 +56,8 @@ Everything else has a default; see [config.go](config.go). Prices are refreshed 
 - Keeps `keep_enabled` credentials enabled. When one is refused, CPA retries the next one within the same request, so a switch is invisible to callers
 - A replacement is written with a `priority` below every enabled credential, joining the back of the queue. CPA's fill-first picks by file name within one priority; without this, a standby whose name sorts late is never served
 - When every standby is below the floor, the enabled credentials run down to zero, then the standbys with the most left take over one at a time; nothing is left unused
-- Runs on arithmetic, not upstream calls; it probes once before a switch and once after a window resets. Probes use the credential's own `proxy_url`
+- Runs on arithmetic, not upstream calls; it reads quota once before a switch and once after a window resets (from the usage endpoint, falling back to a minimal request only when that cannot answer). Both use the credential's own `proxy_url`
+- After a quota reset a window does not count down until its **first request**, so an idle credential sits at "0%, a full 7 days to go", and every idle hour pushes its next refill an hour later. With `kickstart_after_reset` on, a window read as reset and not started gets one "你好" from that credential (about 20 tokens), then is read back to confirm the countdown is running. Resets are found by the panel's reads, the re-read at a window boundary, an hourly read of idle credentials (`kickstart_sweep_minutes`; reads are free), and an immediate read of every idle credential when live traffic shows a reset arriving early. Kick-starts do not count as rotations; one that does not take is retried after 30 minutes, at most 3 times a day per credential
 - Credentials refused upstream (401/403) are disabled, and become candidates again once a fresh login replaces the token
 - Writes the credential file directly (`disabled`, `priority`) and lets CPA's file watcher apply it
 
@@ -66,7 +69,7 @@ Everything else has a default; see [config.go](config.go). Prices are refreshed 
 | `GET /v0/management/codex-weekly-usd/data` | management key | Full report |
 | `GET /v0/management/codex-weekly-usd/prices` | management key | Effective prices |
 | `POST /v0/management/codex-weekly-usd/rotate` | management key | Run one rotation decision now |
-| `POST /v0/management/codex-weekly-usd/refresh` | management key | Re-read every credential's quota (after an out-of-band reset) |
+| `POST /v0/management/codex-weekly-usd/refresh` | management key | Re-read every credential's quota (called by the panel when opened or refreshed) |
 
 Plugin resource routes bypass auth, so the dashboard is only a shell: it asks for the management key and calls the protected routes itself. The management key is accepted as a header only (`Authorization: Bearer` or `X-Management-Key`).
 
@@ -95,3 +98,5 @@ Tests load the `.so` through the real C ABI, so no running CLIProxyAPI is needed
 ## License
 
 MIT
+
+<sub></sub>Community: <a href="https://linux.do">LINUX DO</a>

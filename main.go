@@ -89,9 +89,9 @@ const (
 // Stamped at build time so a fork does not have to edit source to identify
 // itself:
 //
-//	go build -ldflags "-X main.pluginVersion=2.8.1 -X main.repository=github.com/owner/repo"
+//	go build -ldflags "-X main.pluginVersion=2.10.0 -X main.repository=github.com/owner/repo"
 var (
-	pluginVersion = "2.8.1"
+	pluginVersion = "2.10.0"
 	pluginAuthor  = "tang12306"
 	repository    = "github.com/tang12306/cpa-plugin-codex-weekly-usd"
 )

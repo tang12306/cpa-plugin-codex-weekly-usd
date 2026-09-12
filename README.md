@@ -19,10 +19,11 @@ Codex 每个响应都带额度头（`x-codex-*-used-percent`、`window-minutes`�
 - 窗口按长度识别，不按 primary / secondary 标签（上游调换过一次）
 - 同一窗口是一个额度池，所有模型共用同一块表；但**每美元吃掉的额度因模型而异**（实测 gpt-6-astra 约为 gpt-5.6-sol 的 1.4 倍），所以额度按模型分别估算。模型间比值在同一窗口内测量（取自事件日志，每小时重算），再推算到没用过该模型的凭据。没有足够数据就不估：实测要该模型自己推动额度 ≥10 个点，推算要 ≥5 个这样的窗口且结果一致；不够的显示「数据不足」
 - 校准只用当前周期的证据，不够时才回溯上个周期
+- 打开或刷新面板时，插件重读所有凭据的额度。用的是 Codex 客户端显示额度状态的 usage 接口，不调模型、不耗额度，同一凭据 30 秒内只读一次。所以在 CPA 管理页里用掉的重置、别的客户端的消耗，打开面板就能看到。面板每分钟的自动刷新只重画已有数据，不访问上游
 
 ## 安装
 
-插件商店搜 `codex-weekly-usd`，或从 [Releases](https://github.com/tang12306/cpa-plugin-codex-weekly-usd/releases) 下载，放到：
+从 [Releases](https://github.com/tang12306/cpa-plugin-codex-weekly-usd/releases) 下载，放到：
 
 ```
 <CLIProxyAPI 工作目录>/plugins/<goos>/<goarch>/codex-weekly-usd.so
@@ -45,6 +46,7 @@ plugins:
         keep_enabled: 2       # 同时启用的凭据数
         switch_at_percent: 10 # 最紧窗口余量低于此值即换
         probe_model: gpt-5.6-sol
+        kickstart_after_reset: false # true = 额度重置后发一句「你好」，让 7 天倒计时立即开始
 ```
 
 其余项都有默认值，见 [config.go](config.go)。价目每天从 `models.dev` 拉取（走 CPA 配好的代理），离线时用内置表；没有价目的模型会告警，不会按 0 计。
@@ -54,7 +56,8 @@ plugins:
 - 维持 `keep_enabled` 个凭据启用。一个被拒时，CPA 在同一个请求内换到下一个，所以换人对调用方无感
 - 替换进来的凭据会写一个低于所有在役凭据的 `priority`，排到队尾。CPA 的 fill-first 在同一优先级内按文件名排序，不这样做的话，名字靠后的备胎永远轮不到
 - 所有备用都低于阈值时，在役凭据用到 0，再依次换上剩余最多的备用，不留余量
-- 平时靠推算，不访问上游；只在换人前和窗口重置后各探测一次。探测走凭据自己的 `proxy_url`
+- 平时靠推算，不访问上游；只在换人前和窗口重置后各读一次额度（usage 接口，它答不了时才退回发一个最小请求）。都走凭据自己的 `proxy_url`
+- 额度被重置后，窗口要等到**第一次请求**才开始倒计时，闲置的凭据会一直停在「0%、剩整整 7 天」，每闲一小时下次刷新就晚一小时。开启 `kickstart_after_reset` 后，读到「已重置、未开始」的窗口就用该凭据发一句「你好」（约 20 token），再读回确认倒计时已开始。发现重置的途径：打开面板时的读取、窗口到点后的对账、每小时读一遍闲置凭据（`kickstart_sweep_minutes`，读取免费），以及在役凭据的流量里看到提前重置时立即全员读一遍。启动计时不计入轮换次数；没启动成功的 30 分钟后重试，每个凭据每天最多 3 次
 - 上游拒绝的凭据（401/403）会被停用；重新登录换了 token 后自动重新进入候选
 - 直接写凭据文件（`disabled`、`priority`），由 CPA 的文件监听生效
 
@@ -66,7 +69,7 @@ plugins:
 | `GET /v0/management/codex-weekly-usd/data` | 管理密钥 | 完整报表 |
 | `GET /v0/management/codex-weekly-usd/prices` | 管理密钥 | 生效价目 |
 | `POST /v0/management/codex-weekly-usd/rotate` | 管理密钥 | 立即执行一次轮换判断 |
-| `POST /v0/management/codex-weekly-usd/refresh` | 管理密钥 | 重读所有凭据额度（带外重置后用） |
+| `POST /v0/management/codex-weekly-usd/refresh` | 管理密钥 | 重读所有凭据额度（面板打开和刷新时自动调用） |
 
 插件资源路由不过鉴权，所以面板只是个壳，向你要管理密钥后再调受保护路由。管理密钥只认 header（`Authorization: Bearer` 或 `X-Management-Key`）。
 
@@ -95,3 +98,5 @@ make test    # 需要 Go(cgo)、Python 3、Node
 ## 许可
 
 MIT
+
+<sub></sub>社区：<a href="https://linux.do">LINUX DO</a>

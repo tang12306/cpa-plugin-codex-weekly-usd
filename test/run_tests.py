@@ -49,6 +49,11 @@ def config(price_url="", rotator=None):
             "price_source_url: \"%s\"\nevent_log: true\nflush_seconds: 1\n"
             % (DATA_DIR, price_url))
     if rotator:
+        rotator = dict(rotator)
+        # The usage endpoint is served by the same local stand-in as the probe,
+        # and a test must never reach the real one with a fixture token.
+        if "probe_url" in rotator and "usage_url" not in rotator:
+            rotator["usage_url"] = rotator["probe_url"].replace("/codex/responses", "/wham/usage")
         text += "rotator:\n"
         for key in sorted(rotator):
             value = rotator[key]
@@ -391,6 +396,12 @@ check("ships a language switcher", 'id="lang"' in html, True)
 # report - rotation reads the refusals out of it - but the page no longer
 # draws it.
 check("no per-model availability board", 'id="modeltable"' not in html, True)
+# Opening the panel is when someone is looking - and a reset spent on the
+# proxy's own management page is invisible here until something reads it - so
+# that load asks upstream. The once-a-minute poll only redraws what is known.
+check("opening the panel reads upstream", "if (keyBox.value) load(true);" in html, True)
+check("the minute poll does not", "load(false); }, 60000)" in html, True)
+check("the read goes through the refresh route", 'api("refresh", "POST")' in html, True)
 check("ships the rotation board", 'id="rottable"' in html, True)
 check("rotation strings in both languages",
       ("凭据轮换" in html) and ("Credential rotation" in html), True)
@@ -654,12 +665,42 @@ def rot_fixtures(creds):
             headers["X-Codex-%s-Used-Percent" % slot] = [str(percent)]
             headers["X-Codex-%s-Window-Minutes" % slot] = [str(minutes)]
             headers["X-Codex-%s-Reset-At" % slot] = [str(now + reset_in)]
+            if spec.get("unstarted"):
+                # What a model request's headers say about a waiting window:
+                # the moment before the request, the whole period to run.
+                headers["X-Codex-%s-Reset-After-Seconds" % slot] = [str(minutes * 60)]
         headers["X-Codex-Plan-Type"] = [spec.get("plan", "team")]
         resets[name] = absolute
         with open(os.path.join(probe_dir, token + ".json"), "w") as fh:
-            json.dump({"StatusCode": spec.get("status", 200), "Headers": headers, "Body": ""}, fh)
+            json.dump({"StatusCode": spec.get("status", 200), "Headers": headers, "Body": "",
+                       "NoUsage": spec.get("no_usage", False),
+                       "Unstarted": spec.get("unstarted", False),
+                       "KickIgnored": spec.get("kick_ignored", False)}, fh)
     return (auth_list, {"HARNESS_AUTH_DIR": auth_dir, "HARNESS_PROBE_DIR": probe_dir,
                         "HARNESS_SAVE_LOG": SAVE_LOG}, probe_dir, resets)
+
+
+def age_reads(seconds):
+    """Move every recorded upstream read back in time: the operator coming back
+    to the panel later, rather than seconds after the last visit."""
+    path = os.path.join(DATA_DIR, "state.json")
+    with open(path) as fh:
+        st = json.load(fh)
+    for memo in (st.get("rotator") or {}).get("probes", {}).values():
+        memo["at"] -= seconds
+    with open(path, "w") as fh:
+        json.dump(st, fh)
+
+
+def age_kicks(seconds):
+    """Move every recorded kick-start back in time."""
+    path = os.path.join(DATA_DIR, "state.json")
+    with open(path) as fh:
+        st = json.load(fh)
+    for memo in (st.get("rotator") or {}).get("kicks", {}).values():
+        memo["at"] -= seconds
+    with open(path, "w") as fh:
+        json.dump(st, fh)
 
 
 def saves():
@@ -1103,6 +1144,8 @@ rotate({
 check("a whole rotation costs at most two probes", len(PROBES) <= 2, True)
 check("and never asks one credential twice",
       len(PROBES) == len({h["token"] for h in PROBES}), True)
+# Each of them a read of the usage endpoint, not a model request.
+check("and calls no model to do it", {h["method"] for h in PROBES}, {"GET"})
 
 shutil.rmtree(DATA_DIR, ignore_errors=True)
 # The budget is per quota cycle and lives in state.json, so a second decision in
@@ -1592,6 +1635,7 @@ creds = {
     "cred-b.json": {"disabled": False, "status": 401, "windows": []},
 }
 rotate(creds, route="refresh")
+age_reads(60)
 rep = rotate(creds, route="refresh")
 check("a second refresh still re-reads", rep["read"] >= 1, True)
 skips = {c["file"]: c.get("skipped") for c in rep["credentials"]}
@@ -1967,6 +2011,286 @@ rotate({
 })
 disk = {n: json.load(open(os.path.join(live, n))) for n in sorted(os.listdir(live))}
 check("a queued newcomer lands below the lowest", disk["cred-b.json"].get("priority"), -5)
+
+print()
+print("=" * 74)
+print("AU. opening the panel reads upstream, and the read costs nothing")
+print("=" * 74)
+# A reset spent on the proxy's own management page moves no clock and empties no
+# pool, and this plugin cannot see that page. So until something happened to
+# read the credential, the panel kept the spent figure and the rotator kept
+# writing the credential off. Seen in production: a credential reset and
+# re-enabled by hand, still shown at 100% of a week that "ended" four days out.
+shutil.rmtree(DATA_DIR, ignore_errors=True)
+creds = {
+    # Spent by everything the plugin has seen, the refusal included. The reset
+    # put both windows back to zero, the week starting afresh.
+    "cred-a.json": {"disabled": False, "windows": [(FIVEH, 40, 9000), (WEEKF, 100, 300000)],
+                    "probe_windows": [(FIVEH, 0, 18000), (WEEKF, 0, 604800)]},
+    "cred-b.json": {"disabled": False, "windows": [(WEEKF, 20, 400000)]},
+    "cred-c.json": {"disabled": True, "windows": [(WEEKF, 30, 400000)]},
+}
+CREDS_AU = [authfile("cred-a.json"), authfile("cred-b.json"), authfile("cred-c.json", disabled=True)]
+refused = [("usage.handle", usage([(FIVEH, 40, ROT_NOW + 9000), (WEEKF, 100, ROT_NOW + 300000)],
+                                  auth="cred-a.json", index="idx-cred-a.json",
+                                  failed=True, status=429, extra_headers=LIMIT))]
+before = rotate(creds, steps=refused, route="data")
+row = [r for r in before["accounts"] if r["auth_id"] == "cred-a.json"][0]
+check("before: the plugin holds the spent figure", win(before, WEEKF, "cred-a.json")["used_percent"], 100.0)
+check("and the limit it hit", row.get("limit_reached_type"), "usage_limit_reached")
+
+rep = rotate(creds, seed=False, route="refresh")
+seen = {c["file"]: c for c in rep["credentials"]}
+check("a refresh reads it", seen["cred-a.json"].get("status_code"), 200)
+check("and sees the reset", seen["cred-a.json"].get("7d_used_percent"), 0.0)
+board = {c["file"]: c for c in rep["rotator"]["candidates"]}
+check("the rotator stops writing it off", board["cred-a.json"].get("skipped"), None)
+after = run([], auth_list=CREDS_AU)
+row = [r for r in after["accounts"] if r["auth_id"] == "cred-a.json"][0]
+check("the panel shows the reset", win(after, WEEKF, "cred-a.json")["used_percent"], 0.0)
+check("the five-hour window too", win(after, FIVEH, "cred-a.json")["used_percent"], 0.0)
+check("and no longer flags a limit that has lifted", "limit_reached_type" in row, False)
+
+# The read is the usage endpoint the Codex clients poll for their status line:
+# no model is called, no quota is spent. That is what makes it affordable on
+# every page load - and why it books nothing against the rotator's budget.
+check("every read went to the usage endpoint",
+      [(h["method"], h["path"].rsplit("/", 2)[-2:]) for h in PROBES],
+      [("GET", ["wham", "usage"])] * 3)
+state = json.load(open(os.path.join(DATA_DIR, "state.json")))
+ledger = state["rotator"]["probes"]
+check("none of it counts against the rotator's daily cap",
+      sum(m.get("day_count", 0) for m in ledger.values()), 0)
+check("nor claims the rotator's cycle", [m for m in ledger.values() if m.get("epoch")], [])
+
+# Two browsers open on the panel, or a few quick reloads, ask once.
+rep = rotate(creds, seed=False, route="refresh")
+check("a refresh seconds after the last asks nothing", len(PROBES), 0)
+check("and says why", {c.get("skipped") for c in rep["credentials"]}, {"read_just_now"})
+age_reads(60)
+rep = rotate(creds, seed=False, route="refresh")
+check("coming back later asks again", rep["read"], 3)
+
+shutil.rmtree(DATA_DIR, ignore_errors=True)
+# Leaving the cycle unclaimed matters: a page opened in the morning must not
+# cost a replacement the check it gets before taking traffic in the afternoon.
+creds = {
+    "cred-a.json": {"disabled": False, "windows": [(WEEKF, 96, 400000)]},
+    "cred-b.json": {"disabled": False, "windows": [(WEEKF, 8, 400000)]},
+    "cred-c.json": {"disabled": True, "windows": [(WEEKF, 10, 400000)]},
+}
+rotate(creds, route="refresh")
+rotate(creds, seed=False)
+check("a refresh does not use up a replacement's check",
+      "tok-cred-c.json" in [h["token"] for h in PROBES], True)
+check("and the rotation goes ahead", ("cred-c.json", False) in saves(), True)
+
+shutil.rmtree(DATA_DIR, ignore_errors=True)
+# And the other way round: a rotator that has spent its daily cap on a
+# credential does not stop the operator reading it.
+capped = {"max_probes_per_day_per_credential": 1}
+rotate(creds, rotator=capped)
+age_reads(60)
+rep = rotate(creds, seed=False, rotator=capped, route="refresh")
+seen = {c["file"]: c for c in rep["credentials"]}
+check("a credential at the rotator's cap is still read", seen["cred-c.json"].get("skipped"), None)
+check("successfully", seen["cred-c.json"].get("status_code"), 200)
+
+shutil.rmtree(DATA_DIR, ignore_errors=True)
+# The usage endpoint is not a published API. When it cannot answer, the
+# rotator falls back to a model request - it needs the reading - but a page
+# load must never turn into a model request per credential.
+creds = {
+    "cred-a.json": {"disabled": False, "windows": [(WEEKF, 96, 400000)]},
+    "cred-b.json": {"disabled": False, "windows": [(WEEKF, 8, 400000)]},
+    "cred-c.json": {"disabled": True, "windows": [(WEEKF, 10, 400000)], "no_usage": True},
+}
+rep = rotate(creds, route="refresh")
+seen = {c["file"]: c for c in rep["credentials"]}
+check("a refresh the usage endpoint cannot answer says so", "error" in seen["cred-c.json"], True)
+check("and counts it", rep["failed"], 1)
+check("without sending a model request instead", [h for h in PROBES if h["method"] == "POST"], [])
+shutil.rmtree(DATA_DIR, ignore_errors=True)
+rotate(creds)
+asked = [h["method"] for h in PROBES if h["token"] == "tok-cred-c.json"]
+check("the rotator tries the usage endpoint first, then a model request", asked, ["GET", "POST"])
+check("and the replacement still goes in", ("cred-c.json", False) in saves(), True)
+
+shutil.rmtree(DATA_DIR, ignore_errors=True)
+# A credential nothing has served had no accounting, so the panel could only
+# call it unused - with a reading of it in hand.
+creds = {
+    "cred-a.json": {"disabled": False, "windows": [(WEEKF, 20, 400000)]},
+    "cred-n.json": {"disabled": True, "seed": False,
+                    "windows": [(FIVEH, 0, 18000), (WEEKF, 0, 604800)]},
+}
+CREDS_N = [authfile("cred-a.json"), authfile("cred-n.json", disabled=True)]
+before = rotate(creds, route="data")
+rows = {r["auth_id"]: r for r in before["accounts"]}
+check("a credential nothing has served starts blank", rows["cred-n.json"].get("never_used"), True)
+rotate(creds, seed=False, route="refresh")
+after = run([], auth_list=CREDS_N)
+rows = {r["auth_id"]: r for r in after["accounts"]}
+check("a refresh fills it in", rows["cred-n.json"].get("has_quota_data"), True)
+check("as one row, not a second", len([r for r in after["accounts"] if r["auth_id"] == "cred-n.json"]), 1)
+check("with what upstream said", win(after, WEEKF, "cred-n.json")["used_percent"], 0.0)
+first_reset = win(after, WEEKF, "cred-n.json")["reset_in_seconds"]
+
+# An untouched window has no fixed end: upstream reports it as resetting one
+# full period from whenever it is asked. Reading it again later is not a new
+# cycle, and counting it as one would add a cycle per page load.
+age_reads(60)
+creds["cred-n.json"]["windows"] = [(FIVEH, 0, 18000 + 600), (WEEKF, 0, 604800 + 600)]
+rotate(creds, seed=False, route="refresh")
+after = run([], auth_list=CREDS_N)
+check("an idle window read twice is still one cycle", win(after, WEEKF, "cred-n.json")["cycles"], 1)
+check("its boundary follows upstream",
+      win(after, WEEKF, "cred-n.json")["reset_in_seconds"] > first_reset + 300, True)
+
+print()
+print("=" * 74)
+print("AV. a reset window is started with one short message")
+print("=" * 74)
+# A window does not start counting down when it is reset: it starts at the
+# first request after that. Measured in production on 2026-09-12, after upstream
+# reset every account: nine idle credentials all read 0% with the whole 168
+# hours to run, and kept reading that - each hour idle pushed that credential's
+# next refill an hour later. A single "你好" started every one of them.
+KICK = {"kickstart_after_reset": True}
+
+
+def kicks(token=None):
+    return [h for h in PROBES if h["method"] == "POST" and h["said"] == "你好"
+            and (token is None or h["token"] == token)]
+
+
+def kick_log(rep):
+    return [row for row in rep.get("log", []) if row["action"] == "kickstart"]
+
+
+WAITING = {"disabled": True, "seed": False, "unstarted": True,
+           "windows": [(FIVEH, 0, 18000), (WEEKF, 0, 604800)]}
+creds = {
+    "cred-a.json": {"disabled": False, "windows": [(WEEKF, 20, 400000)]},
+    "cred-b.json": {"disabled": False, "windows": [(WEEKF, 30, 400000)]},
+    "cred-w.json": dict(WAITING),
+}
+CREDS_W = [authfile("cred-a.json"), authfile("cred-b.json"), authfile("cred-w.json", disabled=True)]
+
+shutil.rmtree(DATA_DIR, ignore_errors=True)
+# It is a request made with the credential, so it is off unless asked for.
+rotate(creds, route="refresh")
+rep = rotate(creds, seed=False)
+check("off unless asked for: nothing is sent", kicks(), [])
+check("and nothing is listed as waiting", "waiting_to_start" in rep, False)
+
+shutil.rmtree(DATA_DIR, ignore_errors=True)
+# Opening the panel reads every credential; a waiting window is queued, and the
+# next check starts it.
+rep = rotate(creds, route="refresh", rotator=KICK)
+seen = {c["file"]: c for c in rep["credentials"]}
+check("a refresh sees the window waiting", seen["cred-w.json"].get("waiting_to_start"), True)
+check("and the board lists it", rep["rotator"].get("waiting_to_start"), ["cred-w.json"])
+rep = rotate(creds, seed=False, rotator=KICK)
+check("the next check sends one message", len(kicks("tok-cred-w.json")), 1)
+check("a greeting", kicks("tok-cred-w.json")[0]["said"], "你好")
+check("to nobody else", {h["token"] for h in kicks()}, {"tok-cred-w.json"})
+check("looking first and reading it back after",
+      [h["method"] for h in PROBES if h["token"] == "tok-cred-w.json"], ["GET", "POST", "GET"])
+logged = kick_log(rep)
+check("the log records it", len(logged), 1)
+check("as started, with when it refills", "started" in logged[0]["reason"] and "refills" in logged[0]["reason"], True)
+check("counted for today", rep.get("kicks_today"), 1)
+check("and nothing is waiting any more", "waiting_to_start" in rep, False)
+# A kick changes no credential's state. Letting a reset of every account spend
+# the day's rotation budget would leave the pool unable to rotate afterwards.
+check("it is not a rotation", rep["changes_today"], 0)
+after = run([], auth_list=CREDS_W)
+check("the week is running", win(after, WEEKF, "cred-w.json")["reset_in_seconds"] < 604800, True)
+rep = rotate(creds, seed=False, rotator=KICK)
+check("the check after that sends nothing", kicks(), [])
+
+shutil.rmtree(DATA_DIR, ignore_errors=True)
+# Without the panel: the first check reads the idle credentials - only those,
+# since a serving one carries a reading on every response - and starts the one
+# found waiting. Inside the hour, the next check reads nothing.
+rep = rotate(creds, rotator=KICK)
+check("the sweep finds it on its own", len(kicks("tok-cred-w.json")), 1)
+check("reading only the idle credential", {h["token"] for h in PROBES if h["method"] == "GET"},
+      {"tok-cred-w.json"})
+age_reads(60)
+rotate(creds, seed=False, rotator=KICK)
+check("inside the hour nothing is read", PROBES, [])
+# Until live traffic shows a reset arriving early - the old week still had days
+# to run, and the usage fell to nothing. That is what upstream resetting every
+# account looks like from the one credential serving, and it sends the sweep
+# out at once.
+early = [("usage.handle", usage([(WEEKF, 60, ROT_NOW + 400000)], auth="cred-a.json", index="idx-cred-a.json")),
+         ("usage.handle", usage([(WEEKF, 0, ROT_NOW + 604800)], auth="cred-a.json", index="idx-cred-a.json"))]
+rotate(creds, seed=False, rotator=KICK, steps=early)
+check("an early reset in live traffic reads the idle ones at once",
+      {"tok-cred-w.json", "tok-cred-b.json"} <= {h["token"] for h in PROBES if h["method"] == "GET"}, True)
+check("but not the one it was seen on", "tok-cred-a.json" in {h["token"] for h in PROBES}, False)
+
+shutil.rmtree(DATA_DIR, ignore_errors=True)
+# Only a window that is actually waiting: one already running is left alone,
+# however idle; one the operator excluded is not even read; one upstream
+# refuses is read once and never greeted.
+creds = {
+    "cred-a.json": {"disabled": False, "windows": [(WEEKF, 20, 400000)]},
+    "cred-b.json": {"disabled": False, "windows": [(WEEKF, 30, 400000)]},
+    "cred-r.json": {"disabled": True, "seed": False, "windows": [(WEEKF, 0, 300000)]},
+    "cred-x.json": dict(WAITING),
+    "cred-d.json": {"disabled": True, "seed": False, "status": 401, "windows": []},
+}
+rotate(creds, rotator=dict(KICK, never_enable=["cred-x.json"]))
+check("a running window is not greeted, nor a refused one", kicks(), [])
+check("an excluded credential is not even read", [h for h in PROBES if h["token"] == "tok-cred-x.json"], [])
+
+shutil.rmtree(DATA_DIR, ignore_errors=True)
+creds = {
+    "cred-a.json": {"disabled": False, "windows": [(WEEKF, 20, 400000)]},
+    "cred-b.json": {"disabled": False, "windows": [(WEEKF, 30, 400000)]},
+    "cred-w.json": dict(WAITING),
+}
+rep = rotate(creds, rotator=dict(KICK, dry_run=True))
+check("a dry run sends nothing", kicks(), [])
+check("but records what it would have done", [row["dry_run"] for row in kick_log(rep)], [True])
+
+shutil.rmtree(DATA_DIR, ignore_errors=True)
+# A greeting that does not take is said so, and is not repeated every check:
+# once more after half an hour, and no more than three times a day.
+creds["cred-w.json"] = dict(WAITING, kick_ignored=True)
+rep = rotate(creds, rotator=KICK)
+check("one that does not take is reported", "not started" in kick_log(rep)[0]["reason"], True)
+check("and stays on the waiting list", rep.get("waiting_to_start"), ["cred-w.json"])
+age_reads(60)
+rotate(creds, seed=False, rotator=KICK)
+check("it is not retried at the next check", kicks(), [])
+age_reads(60)
+age_kicks(31 * 60)
+rotate(creds, seed=False, rotator=KICK)
+check("but is after half an hour", len(kicks()), 1)
+for _ in range(3):
+    age_reads(60)
+    age_kicks(31 * 60)
+    rotate(creds, seed=False, rotator=KICK)
+check("and no more than three times a day", len(kicks()), 0)
+check("three in all", json.load(open(os.path.join(DATA_DIR, "state.json")))["rotator"]["kicks"]
+      ["cred-w.json"]["day_count"], 3)
+
+shutil.rmtree(DATA_DIR, ignore_errors=True)
+# A model request starts any window it finds waiting. When the usage endpoint
+# cannot answer, the rotator's probe is one - and its headers still describe the
+# moment before it - so that reading must not queue a greeting of its own.
+creds = {
+    "cred-a.json": {"disabled": False, "windows": [(WEEKF, 96, 400000)]},
+    "cred-b.json": {"disabled": False, "windows": [(WEEKF, 8, 400000)]},
+    "cred-w.json": dict(WAITING, no_usage=True),
+}
+rotate(creds, rotator=KICK)
+check("the probe went out", [h["said"] for h in PROBES if h["method"] == "POST"], ["hi"])
+check("and no greeting followed it", kicks(), [])
 
 print()
 print("=" * 74)

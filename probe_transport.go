@@ -219,14 +219,16 @@ func tokenFingerprint(token string) string {
 // interval would stack ticks on top of each other.
 const probeTimeout = 30 * time.Second
 
-// probeDo performs one probe request through the egress the credential's real
-// traffic uses. Only the status and headers are returned: the quota reading
-// lives entirely in the headers, and the body is a model response nobody asked
-// for. It is drained and discarded so the connection can be reused.
-func probeDo(proxyURL, method, url string, headers map[string][]string, body []byte) (int, map[string][]string, error) {
+// probeDo performs one request through the egress the credential's real traffic
+// uses. keep is how much of the body the caller wants back: the usage endpoint
+// answers in its body, while a model probe's reading lives entirely in the
+// headers and its body is a response nobody asked for. Either way the read is
+// bounded - upstream streams a model response, and reading it to the end would
+// keep a connection open for as long as the model wants to talk.
+func probeDo(proxyURL, method, url string, headers map[string][]string, body []byte, keep int64) (int, map[string][]string, []byte, error) {
 	client, errClient := probeClient(proxyURL, probeTimeout)
 	if errClient != nil {
-		return 0, nil, errClient
+		return 0, nil, nil, errClient
 	}
 	defer client.CloseIdleConnections()
 
@@ -235,7 +237,7 @@ func probeDo(proxyURL, method, url string, headers map[string][]string, body []b
 
 	req, errReq := http.NewRequestWithContext(ctx, method, url, strings.NewReader(string(body)))
 	if errReq != nil {
-		return 0, nil, errReq
+		return 0, nil, nil, errReq
 	}
 	for k, vs := range headers {
 		for _, v := range vs {
@@ -245,12 +247,15 @@ func probeDo(proxyURL, method, url string, headers map[string][]string, body []b
 
 	resp, errDo := client.Do(req)
 	if errDo != nil {
-		return 0, nil, errDo
+		return 0, nil, nil, errDo
 	}
 	defer func() { _ = resp.Body.Close() }()
-	// Bounded: upstream streams a response, and reading it to the end would
-	// keep a connection open for as long as the model wants to talk.
-	_, _ = io.CopyN(io.Discard, resp.Body, 8<<10)
 
-	return resp.StatusCode, resp.Header, nil
+	var kept []byte
+	if keep > 0 {
+		kept, _ = io.ReadAll(io.LimitReader(resp.Body, keep))
+	} else {
+		_, _ = io.CopyN(io.Discard, resp.Body, 8<<10)
+	}
+	return resp.StatusCode, resp.Header, kept, nil
 }

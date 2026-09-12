@@ -62,11 +62,12 @@ func (a *App) HandleManagement(payload []byte) json.RawMessage {
 		return marshalResponse(a.rot.Report(cfg, board(cfg)))
 
 	case strings.HasSuffix(path, "/refresh"):
-		// Re-read every credential now. Nothing automatic does this, and
-		// nothing should: the rotator asks only when it has a reason to, and a
-		// quota reset granted out of band gives it none. This is the operator
-		// saying the stored numbers are wrong. POST, because it makes upstream
-		// requests and rewrites what the plugin believes.
+		// Re-read every credential now. The panel calls this when it is opened
+		// and when the operator refreshes it - never on its once-a-minute poll -
+		// because that is when a person is looking, and a reset spent on the
+		// proxy's own management page is something only a read can discover.
+		// POST, because it makes upstream requests and rewrites what the plugin
+		// believes.
 		if !strings.EqualFold(req.Method, "POST") {
 			return jsonResponse(405, "application/json; charset=utf-8",
 				[]byte(`{"error":"POST required"}`))
@@ -298,7 +299,7 @@ const panelHTML = `<!doctype html>
     zh: {
       title: "Codex 额度美元估算",
       sub: "按 OpenAI 官方 API 价目，推算每个凭据的每个额度窗口值多少美元",
-      keyPlaceholder: "管理密钥", load: "加载", forget: "忘记密钥", exportJson: "导出 JSON",
+      keyPlaceholder: "管理密钥", load: "刷新", forget: "忘记密钥", exportJson: "导出 JSON",
       sortQuota: "按最长窗口额度排序", sortRemain: "按剩余排序", sortUsed: "按已用比例排序",
       sortPace: "按消耗节奏排序", sortName: "按名称排序",
       chartTitle: "全部凭据 · 用量走势", legendBars: "每小时消耗（左轴）", legendLine: "近 7 天消耗（右轴）",
@@ -314,6 +315,7 @@ const panelHTML = `<!doctype html>
       rotOff: "未启用", rotDry: "空跑（只决策不写入）", rotOn: "运行中",
       rotPool: "池 {0} 个", rotFloor: "阈值 {0}%", rotSwept: "{0}前评估",
       rotChanges: "今日 {0}/{1} 次改动", rotProbes: "今日探测 {0} 次",
+      rotKicks: "今日启动计时 {0} 次", rotWaiting: "{0} 个重置后待启动",
       rotRefused: "{0} 个凭据已被上游拒绝",
       rtCred: "凭据", rtRole: "角色", rtHead: "余量", rtWindow: "绑定窗口",
       rtReset: "重置", rtServe: "可撑", rtVerdict: "判定",
@@ -322,7 +324,7 @@ const panelHTML = `<!doctype html>
       skDead: "token 失效", skExhausted: "已耗尽", skFloor: "低于阈值",
       skProbe: "探测失败", skExcluded: "配置排除", skRecent: "刚轮换过",
       rotLogTitle: "轮换记录", rlAt: "时间", rlAction: "动作", rlCred: "凭据", rlWhy: "原因",
-      rlEnable: "启用", rlDisable: "停用", rlDry: "空跑",
+      rlEnable: "启用", rlDisable: "停用", rlKick: "启动计时", rlDry: "空跑",
       warnRotStuck: "轮换器判定**池子里已经没有任何凭据能服务**，且没有备用凭据合格，" +
         "因此没有动任何东西——现有凭据保持启用。请补充可用账号，或重新登录已失效的号。",
       warnRotStuckEta: "轮换器判定**池子里已经没有任何凭据能服务**，且暂时没有合格备用。" +
@@ -338,6 +340,11 @@ const panelHTML = `<!doctype html>
       warnRotDry: "轮换器处于空跑模式：它会照常判断并记录，但不会真的改写凭据。确认记录无误后把 dry_run 关掉。",
       rtNone: "还没有候选凭据。",
       updatedAt: "更新于 {0}",
+      refreshing: "正在从上游读取最新额度…",
+      readFromUpstream: "已从上游读取 {0} 个凭据",
+      readFromUpstreamAt: "{1} 从上游读取了 {0} 个凭据",
+      readFailed: "{0} 个读取失败",
+      refreshError: "从上游刷新失败（{0}），显示的是插件已有的数据",
       needKey: "请先填入管理密钥。", keyRejected: "管理密钥被拒绝。", reqFailed: "请求失败：HTTP {0}",
       loadFirst: "请先加载数据。",
       warnStale: "{0} 个凭据的额度读数已经过期（长时间没有流量经过），下面显示的是最后一次观测值，不代表现在。",
@@ -408,7 +415,7 @@ const panelHTML = `<!doctype html>
     en: {
       title: "Codex Quota USD",
       sub: "What each credential's quota window is worth at public OpenAI API pricing",
-      keyPlaceholder: "Management key", load: "Load", forget: "Forget key", exportJson: "Export JSON",
+      keyPlaceholder: "Management key", load: "Refresh", forget: "Forget key", exportJson: "Export JSON",
       sortQuota: "Sort by longest-window quota", sortRemain: "Sort by remaining", sortUsed: "Sort by used %",
       sortPace: "Sort by burn pace", sortName: "Sort by name",
       chartTitle: "All credentials · usage", legendBars: "Hourly spend (left axis)", legendLine: "Trailing 7 days (right axis)",
@@ -428,6 +435,7 @@ const panelHTML = `<!doctype html>
       rotOff: "off", rotDry: "dry run (decides, writes nothing)", rotOn: "running",
       rotPool: "pool of {0}", rotFloor: "floor {0}%", rotSwept: "evaluated {0} ago",
       rotChanges: "{0}/{1} changes today", rotProbes: "{0} probes today",
+      rotKicks: "{0} reset window(s) started today", rotWaiting: "{0} reset, waiting to start",
       rotRefused: "{0} credential(s) refused upstream",
       rtCred: "Credential", rtRole: "Role", rtHead: "Headroom", rtWindow: "Binding window",
       rtReset: "Resets", rtServe: "Covers", rtVerdict: "Verdict",
@@ -436,7 +444,7 @@ const panelHTML = `<!doctype html>
       skDead: "token rejected", skExhausted: "exhausted", skFloor: "below floor",
       skProbe: "probe failed", skExcluded: "excluded", skRecent: "just rotated",
       rotLogTitle: "Rotation log", rlAt: "When", rlAction: "Action", rlCred: "Credential", rlWhy: "Why",
-      rlEnable: "enable", rlDisable: "disable", rlDry: "dry run",
+      rlEnable: "enable", rlDisable: "disable", rlKick: "start clock", rlDry: "dry run",
       warnRotStuck: "**Nothing in the pool can serve** and no standby qualified, so the rotator " +
         "changed nothing - whatever is enabled stays enabled. Add a usable account, or log back " +
         "in to the rejected ones.",
@@ -456,6 +464,11 @@ const panelHTML = `<!doctype html>
         "credential. Turn dry_run off once the log looks right.",
       rtNone: "No candidate credentials yet.",
       updatedAt: "updated {0}",
+      refreshing: "reading the latest quota from upstream…",
+      readFromUpstream: "{0} credential(s) read from upstream",
+      readFromUpstreamAt: "{0} credential(s) read from upstream at {1}",
+      readFailed: "{0} failed",
+      refreshError: "could not refresh from upstream ({0}); showing what the plugin already has",
       needKey: "Enter the management key first.", keyRejected: "Management key rejected.",
       reqFailed: "Request failed: HTTP {0}", loadFirst: "Load the data first.",
       warnStale: "{0} credential(s) have stale quota readings (no traffic for a while). The figures below are the last observation, not the present.",
@@ -546,6 +559,16 @@ const panelHTML = `<!doctype html>
   var chartbox = el("chartbox"), chart = el("chart"), pricebox = el("pricebox"), wtotals = el("wtotals");
   var rotbox = el("rotbox"), rottable = el("rottable");
   var last = null, timer = null;
+  // What the last read from upstream found, shown beside the update time.
+  var upstream = {};
+  function upstreamText(updated) {
+    if (upstream.busy) return t("refreshing");
+    if (upstream.error) return t("refreshError", upstream.error);
+    if (!upstream.at) return "";
+    var s = upstream.at === updated ? t("readFromUpstream", upstream.read)
+                                    : t("readFromUpstreamAt", upstream.read, upstream.at);
+    return upstream.failed ? s + " · " + t("readFailed", upstream.failed) : s;
+  }
 
   keyBox.value = localStorage.getItem(STORE) || "";
 
@@ -995,6 +1018,15 @@ const panelHTML = `<!doctype html>
     if (r.probes_refused_credentials) {
       state += " <span class='tag bad'>" + t("rotRefused", r.probes_refused_credentials) + "</span>";
     }
+    // A reset window does not count down until something is sent through it.
+    // Waiting ones are started within a check or two; one that stays here did
+    // not take.
+    if (r.kickstart) {
+      state += " <span class='tag'>" + t("rotKicks", r.kicks_today || 0) + "</span>";
+      if (r.waiting_to_start && r.waiting_to_start.length) {
+        state += " <span class='tag warn'>" + t("rotWaiting", r.waiting_to_start.length) + "</span>";
+      }
+    }
     el("rot-status").innerHTML = state;
 
     var rows = r.candidates || [];
@@ -1026,10 +1058,10 @@ const panelHTML = `<!doctype html>
     if (log.length) {
       var lh = "<thead><tr><th>" + t("rlAt") + "</th><th>" + t("rlAction") + "</th><th>" +
                t("rlCred") + "</th><th>" + t("rlWhy") + "</th></tr></thead><tbody>";
+      var acts = { enable: ["ok", "rlEnable"], disable: ["warn", "rlDisable"], kickstart: ["", "rlKick"] };
       log.forEach(function (e) {
-        lh += "<tr><td>" + esc(e.at) + "</td><td><span class='tag " +
-              (e.action === "enable" ? "ok" : "warn") + "'>" +
-              t(e.action === "enable" ? "rlEnable" : "rlDisable") + "</span>" +
+        var act = acts[e.action] || acts.disable;
+        lh += "<tr><td>" + esc(e.at) + "</td><td><span class='tag " + act[0] + "'>" + t(act[1]) + "</span>" +
               (e.dry_run ? " <span class='tag'>" + t("rlDry") + "</span>" : "") + "</td>" +
               "<td>" + esc(e.file) + "</td><td>" + esc(e.reason) + "</td></tr>";
       });
@@ -1171,7 +1203,8 @@ const panelHTML = `<!doctype html>
     });
     wrap.hidden = false;
 
-    stamp.textContent = t("updatedAt", new Date().toLocaleTimeString(t("locale")));
+    var updated = new Date().toLocaleTimeString(t("locale")), up = upstreamText(updated);
+    stamp.textContent = t("updatedAt", updated) + (up ? " · " + up : "");
     var via = data.price_transport === "host" ? t("viaHost")
             : (data.price_transport === "direct" ? t("viaDirect") : "");
     foot.innerHTML =
@@ -1182,8 +1215,9 @@ const panelHTML = `<!doctype html>
     loadPrices();
   }
 
-  function api(path) {
+  function api(path, method) {
     return fetch(base() + "/v0/management/codex-weekly-usd/" + path, {
+      method: method || "GET",
       headers: { "X-Management-Key": keyBox.value.trim() }, cache: "no-store"
     }).then(function (r) {
       if (r.status === 401 || r.status === 403) throw new Error(t("keyRejected"));
@@ -1226,18 +1260,45 @@ const panelHTML = `<!doctype html>
     return true;
   }
 
-  function load() {
-    if (!keyBox.value.trim()) { alerts.innerHTML = ""; note("warn", t("needKey")); return; }
-    localStorage.setItem(STORE, keyBox.value.trim());
-    api("data").then(function (data) { if (!outdated(data)) render(data); }).catch(function (err) {
-      alerts.innerHTML = ""; note("bad", err.message);
-      cards.hidden = wrap.hidden = chartbox.hidden = pricebox.hidden = true;
-      rotbox.hidden = true;
-      wtotals.innerHTML = "";
+  // Only the newest answer is drawn: a poll that fires while a refresh is out
+  // must not paint over the refreshed figures with the ones it replaced.
+  var seq = 0;
+  function fetchData() {
+    var mine = ++seq;
+    return api("data").then(function (data) {
+      if (mine === seq && !outdated(data)) render(data);
     });
   }
 
-  el("load").addEventListener("click", load);
+  function failed(err) {
+    if (upstream.busy) upstream = {};
+    alerts.innerHTML = ""; note("bad", err.message);
+    cards.hidden = wrap.hidden = chartbox.hidden = pricebox.hidden = true;
+    rotbox.hidden = true;
+    wtotals.innerHTML = "";
+  }
+
+  // fresh also asks upstream. The panel does that when it is opened and when
+  // the operator refreshes it: that is when someone is looking, and a quota
+  // reset spent on the proxy's own management page is invisible to this plugin
+  // until something reads it. What the plugin already has is drawn at once and
+  // replaced when the read comes back. The once-a-minute poll never asks.
+  function load(fresh) {
+    if (!keyBox.value.trim()) { alerts.innerHTML = ""; note("warn", t("needKey")); return; }
+    localStorage.setItem(STORE, keyBox.value.trim());
+    if (fresh) upstream = { busy: true };
+    fetchData().then(function () {
+      if (!fresh) return;
+      return api("refresh", "POST").then(function (res) {
+        upstream = { read: res.read || 0, failed: res.failed || 0,
+                     at: new Date().toLocaleTimeString(t("locale")) };
+      }, function (err) {
+        upstream = { error: err.message };
+      }).then(fetchData);
+    }).catch(failed);
+  }
+
+  el("load").addEventListener("click", function () { load(true); });
   el("sort").addEventListener("change", function () { if (last) render(last); });
   el("lang").addEventListener("change", function (ev) {
     LANG = ev.target.value;
@@ -1245,9 +1306,9 @@ const panelHTML = `<!doctype html>
     applyStatic();
     if (last) render(last);
   });
-  keyBox.addEventListener("keydown", function (e) { if (e.key === "Enter") load(); });
+  keyBox.addEventListener("keydown", function (e) { if (e.key === "Enter") load(true); });
   el("forget").addEventListener("click", function () {
-    localStorage.removeItem(STORE); keyBox.value = ""; last = null;
+    localStorage.removeItem(STORE); keyBox.value = ""; last = null; upstream = {};
     cards.hidden = wrap.hidden = chartbox.hidden = pricebox.hidden = true;
     rotbox.hidden = true;
     alerts.innerHTML = ""; stamp.textContent = ""; wtotals.innerHTML = "";
@@ -1262,8 +1323,8 @@ const panelHTML = `<!doctype html>
   });
 
   applyStatic();
-  if (keyBox.value) load();
-  timer = setInterval(function () { if (keyBox.value.trim()) load(); }, 60000);
+  if (keyBox.value) load(true);
+  timer = setInterval(function () { if (keyBox.value.trim()) load(false); }, 60000);
 })();
 </script>
 </body>
