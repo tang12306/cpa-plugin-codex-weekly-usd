@@ -349,7 +349,6 @@ const panelHTML = `<!doctype html>
       loadFirst: "请先加载数据。",
       warnStale: "{0} 个凭据的额度读数已经过期（长时间没有流量经过），下面显示的是最后一次观测值，不代表现在。",
       warnWaiting: "{0} / {1} 个凭据还没有估算值。额度只有在「插件亲眼看到百分比至少走动 1 点」之后才能定价，正常使用中会自动补上。",
-      warnExternal: "{0} 的 {1} 窗口有 {2} 的额度被消耗但不在本插件账上，可能有其它客户端在共用该凭据",
       warnUnpriced: "{0} 暂无公开价目（凭据 {1}），这部分花费先不计入估算，价目表收录后自动补计",
       warnPrice: "价目刷新失败：{0}",
       warnModelDown: "模型 {0} 当前没有可用凭据：{1} 个全部在冷却中，最快 {2} 后恢复。" +
@@ -388,7 +387,7 @@ const panelHTML = `<!doctype html>
         "另一个模型都各自推动 ≥{1} 个点，且结果一致。现在有 {2} 个这样的窗口。",
       dCoverage: "整窗覆盖", dYes: "是", dNoMid: "否（中途接管）",
       dCycles: "已观察周期", dCyclesV: "{0} 次", dGranted: "，其中 {0} 次周期内重置",
-      dExternal: "外部消耗", dExternalV: "{0}（不在本插件账上）", dNone: "无",
+      dExternal: "未入账消耗", dExternalV: "本周期 {0}（不在本插件账上）", dNone: "无",
       dExhaust: "跑满预警", dWillExhaust: "会提前用完", dLasts: "够用到重置",
       dPerDay: "日均消耗",
       mtModel: "模型", mtReq: "请求", mtFail: "失败", mtIn: "输入", mtOut: "输出",
@@ -473,7 +472,6 @@ const panelHTML = `<!doctype html>
       reqFailed: "Request failed: HTTP {0}", loadFirst: "Load the data first.",
       warnStale: "{0} credential(s) have stale quota readings (no traffic for a while). The figures below are the last observation, not the present.",
       warnWaiting: "{0} of {1} credentials have no estimate yet. A quota can only be priced once its used-percentage has been watched moving at least one point, so these fill in during normal use.",
-      warnExternal: "{1} window of {0} shows {2} consumed that this plugin did not bill — another client may be sharing this credential",
       warnUnpriced: "No public price yet for {0} (credential {1}); its spend is held out of the estimate and billed automatically once the catalog lists it",
       warnPrice: "Price refresh is failing: {0}",
       warnModelDown: "Model {0} has no credential left: all {1} are cooling down, the first back in {2}. " +
@@ -513,7 +511,7 @@ const panelHTML = `<!doctype html>
         "and agreeing. There are {2} such windows so far.",
       dCoverage: "Full-cycle coverage", dYes: "yes", dNoMid: "no (joined mid-cycle)",
       dCycles: "Cycles observed", dCyclesV: "{0}", dGranted: ", {0} granted mid-cycle",
-      dExternal: "External usage", dExternalV: "{0} (not on this ledger)", dNone: "none",
+      dExternal: "Unbilled usage", dExternalV: "{0} this cycle (not on this ledger)", dNone: "none",
       dExhaust: "Exhaustion", dWillExhaust: "runs out early", dLasts: "lasts to reset",
       dPerDay: "Per day",
       mtModel: "Model", mtReq: "Req", mtFail: "Failed", mtIn: "Input", mtOut: "Output",
@@ -950,7 +948,6 @@ const panelHTML = `<!doctype html>
   // language is selected rather than whichever one the plugin was compiled with.
   function warnText(w) {
     switch (w.code) {
-      case "external_usage": return t("warnExternal", w.credential, w.window, pct(w.percent));
       case "unpriced_models": return t("warnUnpriced", (w.models || []).join(", "), w.credential);
       case "price_refresh_failed": return t("warnPrice", w.message);
       case "model_unavailable":

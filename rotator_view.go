@@ -46,9 +46,12 @@ func (a *App) observedWindows(e authEntry) ([]windowReading, int64) {
 	defer a.mu.Unlock()
 
 	out := make([]windowReading, 0, len(acct.Windows))
-	newest := int64(0)
+	newest := acct.lastRead()
 	for key, w := range acct.Windows {
-		if w == nil {
+		// A window upstream no longer reports is not part of what traffic last
+		// saw. Handed over anyway, its long-past boundary reads as a reset on
+		// every tick, and each one is answered with a probe (see retired).
+		if w == nil || w.retired(newest) {
 			continue
 		}
 		minutes := w.Minutes
@@ -58,12 +61,34 @@ func (a *App) observedWindows(e authEntry) ([]windowReading, int64) {
 			}
 		}
 		out = append(out, windowReading{Minutes: minutes, Percent: w.Percent, ResetAt: w.ResetAt})
-		if w.ObservedAt > newest {
-			newest = w.ObservedAt
-		}
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i].Minutes < out[j].Minutes })
 	return out, newest
+}
+
+// ownSpendGrace is how long after the plugin's own request a step in the
+// percentage is taken to be that request. The reading that shows it is usually
+// seconds behind, but an idle credential may not be read again until the next
+// sweep.
+const ownSpendGrace = 2 * time.Hour
+
+// expectOwnSpend notes that the plugin has just sent this credential a request
+// of its own - one that reaches upstream directly, so the host never reports it
+// and the ledger never bills it. The next step in its percentages is that
+// request, and must not be filed as somebody else's.
+func (a *App) expectOwnSpend(e authEntry, now time.Time) {
+	acct := a.accountFor(e)
+	if acct == nil {
+		return
+	}
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	until := now.Add(ownSpendGrace).Unix()
+	for _, w := range acct.Windows {
+		if w != nil {
+			w.ownUntil = until
+		}
+	}
 }
 
 // trafficRejection reports whether live traffic has seen upstream refuse this
@@ -103,9 +128,10 @@ func (a *App) trafficRejection(e authEntry) (bool, string, int64) {
 // said had rolled over stays marked inferred for good, because nothing ever
 // confirms it. That was the whole point of re-reading it.
 //
-// Movement with no spend of ours behind it is recorded as unexplained, which is
-// the truth: from this plugin's side the credential was idle, so anything that
-// moved was spent by something else.
+// Movement with no spend of ours behind it is recorded as unexplained for the
+// cycle it happened in: from this plugin's side the credential was idle, so
+// anything that moved was spent by something else - unless the plugin has just
+// sent a request of its own (see expectOwnSpend).
 func (a *App) observeReading(e authEntry, res probeResult, now time.Time) {
 	if len(res.Windows) == 0 {
 		return

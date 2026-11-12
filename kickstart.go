@@ -284,6 +284,9 @@ func (r *rotator) greet(e authEntry, cfg RotatorConfig, now time.Time) (greeted,
 	case status/100 != 2:
 		return fail(fmt.Sprintf("http_%d", status), fmt.Sprintf("upstream answered HTTP %d", status))
 	}
+	// The greeting is spend the ledger will never see: it did not go through
+	// the host. Say so before the reading that shows it arrives.
+	r.app.expectOwnSpend(e, now)
 	return g, true
 }
 
@@ -350,10 +353,7 @@ func (r *rotator) saveKick(file string, memo kickMemo) {
 // the pool unable to rotate afterwards.
 func (r *rotator) logKick(rec switchRecord) {
 	r.mu.Lock()
-	r.state.Log = append(r.state.Log, rec)
-	if len(r.state.Log) > switchLogLimit {
-		r.state.Log = r.state.Log[len(r.state.Log)-switchLogLimit:]
-	}
+	r.state.Log = trimLog(append(r.state.Log, rec))
 	r.mu.Unlock()
 	r.app.markDirty()
 }

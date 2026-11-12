@@ -303,24 +303,60 @@ check("all four cycles seen", w["cycles"], 4)
 
 print()
 print("=" * 74)
-print("I. quota consumed with no spend of ours is reported, not swallowed")
+print("I. quota consumed with no spend of ours is kept for its cycle, and no longer")
 print("=" * 74)
+
+
+def edit_state(change):
+    """Rewrite state.json between two runs, the way time or an older build would
+    have left it."""
+    path = os.path.join(DATA_DIR, "state.json")
+    with open(path) as fh:
+        st = json.load(fh)
+    change(st)
+    with open(path, "w") as fh:
+        json.dump(st, fh)
+
+
 shutil.rmtree(DATA_DIR, ignore_errors=True)
-rep = run([
+UNBILLED = [
     ("usage.handle", weekly(0)),
     ("usage.handle", weekly(1)),
     ("usage.handle", weekly(2, failed=True)),   # pairs, leaves pending at 0
     ("usage.handle", weekly(8, failed=True)),   # +6 points with nothing billed
-])
+]
+rep = run(UNBILLED)
 w = win(rep, WEEK)
 check("unexplained percent recorded", round(w["unexplained_percent"], 2), 6.00)
 check("failed requests counted", w["failed"], 2)
-# Warnings are structured, not prose, so the panel can render them in either
-# language rather than whichever one the plugin was compiled with.
-ext = [x for x in rep["warnings"] if x.get("code") == "external_usage"]
-check("warning is structured", len(ext), 1)
-check("warning carries the percent", round(ext[0]["percent"], 2), 6.00)
-check("warning carries the window", ext[0]["window"], "7d")
+# It is a line on the window's own row and nothing more. It used to raise a
+# warning as well, blaming another client - one per window, on a total that was
+# never reset, so in production the panel opened on a wall of them that could
+# not be acted on and never went away.
+check("it raises no warning", [x for x in rep["warnings"] if x.get("code") == "external_usage"], [])
+rep = run([])
+check("it survives a restart", round(win(rep, WEEK)["unexplained_percent"], 2), 6.00)
+# And it belongs to the cycle it happened in. Carried across the rollover it
+# described no cycle at all, and could only ever grow.
+rep = run([("usage.handle", usage([(WEEK, 0, RESET_W + 7 * 86400)]))])
+check("the next cycle starts from nothing", win(rep, WEEK)["unexplained_percent"], 0)
+
+shutil.rmtree(DATA_DIR, ignore_errors=True)
+# A file written by an older build holds the lifetime total. It is not this
+# cycle's figure and must not be shown as one.
+
+
+def lifetime_total(st):
+    for acct in st["accounts"].values():
+        for wnd in acct["windows"].values():
+            wnd.pop("unexplained_cycle_percent", None)
+            wnd["unexplained_percent"] = 55.0
+
+
+run(UNBILLED[:2])
+edit_state(lifetime_total)
+rep = run([])
+check("an older build's lifetime total is left behind", win(rep, WEEK)["unexplained_percent"], 0)
 
 print()
 print("=" * 74)
@@ -675,7 +711,8 @@ def rot_fixtures(creds):
             json.dump({"StatusCode": spec.get("status", 200), "Headers": headers, "Body": "",
                        "NoUsage": spec.get("no_usage", False),
                        "Unstarted": spec.get("unstarted", False),
-                       "KickIgnored": spec.get("kick_ignored", False)}, fh)
+                       "KickIgnored": spec.get("kick_ignored", False),
+                       "KickCosts": spec.get("kick_costs", 0)}, fh)
     return (auth_list, {"HARNESS_AUTH_DIR": auth_dir, "HARNESS_PROBE_DIR": probe_dir,
                         "HARNESS_SAVE_LOG": SAVE_LOG}, probe_dir, resets)
 
@@ -2367,7 +2404,6 @@ check("and every request counted as waiting", row(before, NEW)["unpriced"], 6)
 check("the warning names the model", unpriced_warnings(before), [[NEW]])
 # The points it moved were ours, not another client's.
 check("not blamed on another client", w["unexplained_percent"], 0)
-check("no external-usage warning", [x for x in before["warnings"] if x["code"] == "external_usage"], [])
 # Dividing what was priced (nothing) by the percentage would read as a quota
 # of zero; there is no estimate until the spend has a price.
 check("no estimate from spend it cannot price", w["estimate"]["method"], "none")
@@ -2492,6 +2528,292 @@ check("built in: gpt-6-luna", (book["gpt-6-luna"]["input"], book["gpt-6-luna"]["
 # the cache rate is what tells the two entries apart.
 check("built in: gpt-6.1-sol",
       (book["gpt-6.1-sol"]["input"], book["gpt-6.1-sol"]["output"], book["gpt-6.1-sol"]["cache_read"]), (2, 10, 0.1))
+
+print()
+print("=" * 74)
+print("AX. a greeting the plugin sent is not somebody else's spend")
+print("=" * 74)
+# A kick-start goes to upstream directly: the host never reports it and the
+# ledger never bills it, so the point it takes off a fresh window arrives with
+# nothing behind it. Filed as unexplained, the plugin was reporting itself as
+# the other client on every idle credential, after every reset.
+shutil.rmtree(DATA_DIR, ignore_errors=True)
+creds = {
+    "cred-a.json": {"disabled": False, "windows": [(WEEKF, 20, 400000)]},
+    "cred-b.json": {"disabled": False, "windows": [(WEEKF, 30, 400000)]},
+    "cred-w.json": dict(WAITING, kick_costs=1),
+}
+rotate(creds, route="refresh", rotator=KICK)
+rotate(creds, seed=False, rotator=KICK)
+check("the greeting went out", len(kicks("tok-cred-w.json")), 1)
+after = run([], auth_list=CREDS_W)
+for minutes, label in ((FIVEH, "5h"), (WEEKF, "7d")):
+    w = win(after, minutes, "cred-w.json")
+    check("%s: the greeting took its point" % label, w["used_percent"], 1.0)
+    check("%s: and it is not filed as unexplained" % label, w["unexplained_percent"], 0)
+# What moves later in the same cycle with nothing behind it is still recorded.
+# (The first reading after a restart only re-establishes where the window is.)
+with open(os.path.join(DATA_DIR, "state.json")) as fh:
+    running = json.load(fh)["accounts"]["cred-w.json"]["windows"]
+later = [("usage.handle", usage([(FIVEH, pct, running["300"]["reset_at"]),
+                                 (WEEKF, 1, running["10080"]["reset_at"])],
+                                auth="cred-w.json", index="idx-cred-w.json", failed=True))
+         for pct in (1, 4)]
+after = run(later, auth_list=CREDS_W)
+check("a later step with nothing behind it still is",
+      win(after, FIVEH, "cred-w.json")["unexplained_percent"], 3.0)
+
+print()
+print("=" * 74)
+print("AY. a window upstream has stopped reporting is let go")
+print("=" * 74)
+# Measured in production on 2026-11-12. One credential had reported a 24-hour
+# window for a single afternoon three days earlier, and nothing ever let go of
+# it. Once its boundary passed, every reading traffic produced was handed to
+# the rotator with that window in it, the clock said it had reset, and the
+# rotator went to re-read it - then again after the next response, because the
+# probe's own reading (which has no such window) is only preferred until
+# traffic is newer. Eleven of the day's twelve probes were gone in two hours,
+# on the one credential carrying the traffic, leaving nothing for the check a
+# switch is supposed to be made on.
+DAY = 1440
+POOL = {
+    "cred-a.json": {"disabled": False, "windows": [(WEEKF, 20, 400000)]},
+    "cred-b.json": {"disabled": False, "windows": [(WEEKF, 30, 400000)]},
+    "cred-c.json": {"disabled": True, "windows": [(WEEKF, 0, 400000)]},
+}
+POOL_LIST = [authfile("cred-a.json"), authfile("cred-b.json"), authfile("cred-c.json", disabled=True)]
+
+
+def both(day_percent, day_reset):
+    return [("usage.handle", usage([(DAY, day_percent, day_reset), (WEEKF, 20, ROT_NOW + 400000)],
+                                   auth="cred-a.json", index="idx-cred-a.json"))]
+
+
+def age_window(name, minutes, seen_ago, reset_ago):
+    def change(st):
+        wnd = st["accounts"][name]["windows"][str(minutes)]
+        wnd["observed_at"] = int(time.time()) - seen_ago
+        wnd["reset_at"] = wnd["key"] = int(time.time()) - reset_ago
+    edit_state(change)
+
+
+def stored_windows(name):
+    with open(os.path.join(DATA_DIR, "state.json")) as fh:
+        return sorted(json.load(fh)["accounts"][name]["windows"])
+
+
+shutil.rmtree(DATA_DIR, ignore_errors=True)
+rotate(POOL, steps=both(3, ROT_NOW + 86400))
+check("while upstream reports it, it is shown",
+      win(run([], auth_list=POOL_LIST), DAY, "cred-a.json")["used_percent"], 3.0)
+# Two days on: the window ran out a day ago, and traffic has gone on arriving
+# with only the week on it.
+age_window("cred-a.json", DAY, 2 * 86400, 86400)
+rotate(POOL)
+check("the rotator is not sent to re-read it", [h["token"] for h in PROBES], [])
+after = run([], auth_list=POOL_LIST)
+check("and the panel stops showing it", win(after, DAY, "cred-a.json"), None)
+check("the week beside it is untouched", win(after, WEEKF, "cred-a.json")["used_percent"], 20.0)
+# Nothing is thrown away yet: upstream has changed its mind about windows
+# before, and the calibration is worth keeping in case it does again.
+check("its accounting is kept for now", stored_windows("cred-a.json"), ["10080", "1440"])
+after = run(both(1, int(time.time()) + 86400), auth_list=POOL_LIST)
+check("and it is back the moment upstream reports it again",
+      win(after, DAY, "cred-a.json")["used_percent"], 1.0)
+# Past the age at which its calibration would have been discarded anyway, it
+# is forgotten.
+age_window("cred-a.json", DAY, 22 * 86400, 21 * 86400)
+run([], auth_list=POOL_LIST)
+check("after three weeks it is dropped", stored_windows("cred-a.json"), ["10080"])
+
+shutil.rmtree(DATA_DIR, ignore_errors=True)
+# Running out is not being retired. An idle credential's windows all pass their
+# boundary together and nothing newer says otherwise: they stay, rolled forward
+# and marked as inferred (section AH), and the rotator still re-reads them once
+# (section AI).
+rep = run([("usage.handle", usage([(FIVEH, 80, int(time.time()) - 600), (WEEKF, 20, ROT_NOW + 400000)],
+                                  auth="cred-a.json"))], auth_list=[authfile("cred-a.json")])
+check("a window that merely ran out is still shown", win(rep, FIVEH, "cred-a.json")["used_percent"], 80.0)
+
+print()
+print("=" * 74)
+print("AZ. kick-starts do not push rotations out of the audit trail")
+print("=" * 74)
+# One list, one limit of a hundred, and kick-starts arrive several at a time
+# after every reset: within days the trail held nothing else, and the panel's
+# last twenty entries had no rotation in them at all.
+shutil.rmtree(DATA_DIR, ignore_errors=True)
+rotate(POOL)
+
+
+def crowded(st):
+    old = int(time.time()) - 30 * 86400
+    log = [{"at": old + i, "action": "enable" if i % 2 else "disable",
+            "file": "cred-old-%d.json" % i, "reason": "seeded"} for i in range(3)]
+    log += [{"at": old + 100 + i, "action": "kickstart", "file": "cred-idle.json",
+             "reason": "reset window started"} for i in range(150)]
+    st.setdefault("rotator", {})["log"] = log
+
+
+edit_state(crowded)
+rep = rotate({
+    "cred-a.json": {"disabled": False, "windows": [(WEEKF, 95, 400000)]},
+    "cred-b.json": {"disabled": False, "windows": [(WEEKF, 8, 400000)]},
+    "cred-c.json": {"disabled": True, "windows": [(WEEKF, 10, 400000)]},
+})
+check("a rotation happened", len(saves()), 2)
+with open(os.path.join(DATA_DIR, "state.json")) as fh:
+    kept = json.load(fh)["rotator"]["log"]
+check("every rotation is still on record", len([r for r in kept if r["action"] != "kickstart"]), 5)
+check("kick-starts are bounded on their own", len(kick_log({"log": kept})), 40)
+oldest_kick = min(r["at"] for r in kept if r["action"] == "kickstart")
+check("and it is the oldest of them that went", oldest_kick, int(kept[0]["at"]) + 100 + 110)
+shown = rep["log"]
+check("the panel is sent the rotations", len([r for r in shown if r["action"] != "kickstart"]), 5)
+check("beside a share of the kick-starts", len(kick_log(rep)), 10)
+check("newest first", shown[0]["file"] in ("cred-a.json", "cred-c.json"), True)
+
+print()
+print("=" * 74)
+print("BA. a failed request's event says why it failed")
+print("=" * 74)
+# The log recorded that a request failed and nothing about how: a month of
+# failures in production could be counted and not one of them told apart.
+
+
+def read_events():
+    folder = os.path.join(DATA_DIR, "events")
+    out, raw = [], ""
+    for name in sorted(os.listdir(folder)):
+        with open(os.path.join(folder, name)) as fh:
+            text = fh.read()
+        raw += text
+        out += [json.loads(line) for line in text.splitlines() if line.strip()]
+    return out, raw
+
+
+shutil.rmtree(DATA_DIR, ignore_errors=True)
+run([
+    ("usage.handle", weekly(1)),
+    ("usage.handle", usage([], failed=True, status=401, body=REVOKED_BODY)),
+    ("usage.handle", weekly(2, failed=True, status=502, body="<html>upstream connect error</html>")),
+    ("usage.handle", weekly(2, failed=True)),
+])
+events, raw = read_events()
+check("four events", len(events), 4)
+check("a served request carries neither", ("status" in events[0], "error" in events[0]), (False, False))
+check("a refusal has its status", events[1].get("status"), 401)
+check("and upstream's own code for it", events[1].get("error"), "token_revoked")
+check("a body with no code leaves the status to speak",
+      (events[2].get("status"), "error" in events[2]), (502, False))
+check("no status reported, none invented", ("status" in events[3], "error" in events[3]), (False, False))
+# The body can quote the request back, so only the short code is kept.
+check("the response body stays out of the log",
+      "invalidated oauth token" in raw or "upstream connect" in raw, False)
+
+print()
+print("=" * 74)
+print("BB. a credential deleted long ago is forgotten")
+print("=" * 74)
+# Nothing let go of an account once its credential was deleted. Measured in
+# production on 2026-11-12: five of the fourteen accounts in the state file
+# belonged to credentials deleted weeks or months earlier, and the panel's note
+# that some had been removed named the same five every time it was opened.
+LIVE = [authfile("cred-a.json")]
+BOTH_GONE = ["cred-gone.json", "cred-old.json"]
+
+
+def stored_accounts():
+    with open(os.path.join(DATA_DIR, "state.json")) as fh:
+        return json.load(fh)["accounts"]
+
+
+def reported_removed(rep):
+    return sorted(r["auth_id"] for r in rep.get("removed", []))
+
+
+shutil.rmtree(DATA_DIR, ignore_errors=True)
+rep = run([
+    ("usage.handle", weekly(20, auth="cred-a.json")),
+    ("usage.handle", weekly(30, auth="cred-gone.json")),
+    ("usage.handle", weekly(40, auth="cred-old.json")),
+], auth_list=LIVE)
+check("deleted credentials are accounted for", reported_removed(rep), BOTH_GONE)
+check("and when they went missing is noted",
+      sorted(k for k, a in stored_accounts().items() if a.get("gone_at")), BOTH_GONE)
+
+
+# One of them was last read more than two weeks ago - past the hourly series,
+# so nothing the panel draws comes from it any more. It has only just been
+# noticed missing, though, and a list read mid-reload can be short.
+def long_unread(st):
+    for wnd in st["accounts"]["cred-old.json"]["windows"].values():
+        wnd["observed_at"] = int(time.time()) - 15 * 86400
+
+
+edit_state(long_unread)
+rep = run([], auth_list=LIVE)
+check("missing for less than a day is not believed yet", reported_removed(rep), BOTH_GONE)
+
+
+def missing_two_days(st):
+    for name in BOTH_GONE:
+        st["accounts"][name]["gone_at"] = int(time.time()) - 2 * 86400
+
+
+edit_state(missing_two_days)
+# An empty list is a failure to ask (section AF), and settles nothing here
+# either - or one bad reply would delete every account there is.
+run([], auth_list=[])
+check("a list that came back empty forgets nothing",
+      sorted(stored_accounts()), ["cred-a.json"] + BOTH_GONE)
+rep = run([], auth_list=LIVE)
+check("deleted and long unread: no longer reported", reported_removed(rep), ["cred-gone.json"])
+check("nor carried in the state file", sorted(stored_accounts()), ["cred-a.json", "cred-gone.json"])
+# The other was read last week. Its hours are still on the charts, so it stays
+# until they are not.
+check("one read recently is kept for now", "cred-gone.json" in stored_accounts(), True)
+rep = run([], auth_list=LIVE + [authfile("cred-gone.json")])
+check("and one that turns up again is simply back",
+      "cred-gone.json" in [a["auth_id"] for a in rep["accounts"]], True)
+check("with no mark left against it", stored_accounts()["cred-gone.json"].get("gone_at"), None)
+
+# The rotator keeps notes by file name, and none of those were ever cleared
+# either. A credential deleted while its window was waiting to start stayed on
+# the panel as waiting, and one deleted after being refused was counted among
+# the refused, for good.
+shutil.rmtree(DATA_DIR, ignore_errors=True)
+rotate(POOL, rotator=KICK)
+
+
+def leftovers(st):
+    now = int(time.time())
+    rot = st.setdefault("rotator", {})
+    rot.setdefault("kick_due", {})["cred-gone.json"] = now - 30 * 86400
+    probes = rot.setdefault("probes", {})
+    probes["cred-gone.json"] = {"at": now - 20 * 86400, "rejected": True, "status_code": 401}
+    probes["cred-recent.json"] = {"at": now - 86400, "rejected": True, "status_code": 401}
+    kicked = rot.setdefault("kicks", {})
+    kicked["cred-gone.json"] = {"at": now - 20 * 86400, "result": "started"}
+    kicked["cred-recent.json"] = {"at": now - 86400, "result": "started"}
+
+
+edit_state(leftovers)
+rep = rotate(POOL, rotator=KICK)
+with open(os.path.join(DATA_DIR, "state.json")) as fh:
+    notes = json.load(fh)["rotator"]
+check("a deleted credential is not left waiting to start",
+      "cred-gone.json" in rep.get("waiting_to_start", []), False)
+check("nor in the state behind that", "cred-gone.json" in notes.get("kick_due", {}), False)
+check("its probe record goes once it is too old to matter",
+      "cred-gone.json" in notes.get("probes", {}), False)
+check("and stops being counted among the refused", rep.get("probes_refused_credentials"), 1)
+check("so does its kick-start record", "cred-gone.json" in notes.get("kicks", {}), False)
+# These are budgets. A credential deleted and re-added the same day must not
+# come back with a fresh allowance, so a recent record outlives its file.
+check("a recent probe record is kept", "cred-recent.json" in notes.get("probes", {}), True)
+check("and a recent kick-start record", "cred-recent.json" in notes.get("kicks", {}), True)
 
 print()
 print("=" * 74)

@@ -42,8 +42,15 @@ import (
 const (
 	probeURL       = "https://chatgpt.com/backend-api/codex/responses"
 	probeUserAgent = "codex_cli_rs/0.144.1"
-	// switchLogLimit bounds the audit trail kept in state.json.
+	// switchLogLimit bounds the switches in the audit trail kept in state.json,
+	// and kickLogLimit the kick-starts. They are one list in time order, but
+	// counted apart: sharing a single limit, a fleet of idle credentials being
+	// greeted after every reset pushed the last real rotation out within days.
 	switchLogLimit = 100
+	kickLogLimit   = 40
+	// reportSwitches and reportKicks are how many of each the panel is sent.
+	reportSwitches = 20
+	reportKicks    = 10
 	// probeMinRelief treats a window that refills within this long as available:
 	// a five-hour window that resets in two minutes is not a reason to reject a
 	// candidate.
@@ -354,6 +361,7 @@ func (r *rotator) tick(force bool) {
 	}
 
 	now := time.Now()
+	r.forget(entries, now)
 	enabled, standby := splitPool(entries, cfg)
 	pool := append(append([]authEntry{}, enabled...), standby...)
 
@@ -1169,6 +1177,12 @@ func (r *rotator) settle(e authEntry, res, fresh probeResult, now time.Time, why
 	// The reading is worth as much to the accounting side as to this one: it is
 	// the same measurement a served request would have produced.
 	r.app.observeReading(e, fresh, now)
+	// A probe that had to go out as a model request spent a little itself, and
+	// its own headers were written before that spend was counted: it shows up
+	// in the next reading, which must not mistake it for another client.
+	if fresh.ViaModel && fresh.StatusCode/100 == 2 {
+		r.app.expectOwnSpend(e, now)
+	}
 	// And a served probe is proof the credential works, which is the only
 	// thing that can lift a refusal recorded against it. Nothing else can:
 	// a refused credential is disabled, so the successful request that would
@@ -1423,6 +1437,83 @@ func (r *rotator) pickReason(c candidate) string {
 	return fmt.Sprintf("headroom %.0f%%, best available (covers %.1fh)", c.Headroom, c.ServiceH)
 }
 
+// forget drops what the rotator remembers about credentials the host no longer
+// lists. An empty list settles nothing: it is a failure to ask.
+//
+// A credential deleted while its window was waiting to start stayed on the
+// panel as waiting, permanently - nothing visits a credential that is not in
+// the pool, so nothing ever cleared the mark. That goes at once; if the list
+// was merely short, the next sweep finds the window waiting again. The probe
+// and kick-start ledgers are budgets, and are kept until they are too old to
+// bind anything.
+func (r *rotator) forget(entries []authEntry, now time.Time) {
+	if len(entries) == 0 {
+		return
+	}
+	listed := make(map[string]bool, len(entries))
+	for _, e := range entries {
+		listed[e.Name] = true
+	}
+	cutoff := now.Add(-goneKeep).Unix()
+	changed := false
+	r.mu.Lock()
+	for name := range r.state.KickDue {
+		if !listed[name] {
+			delete(r.state.KickDue, name)
+			changed = true
+		}
+	}
+	for name, memo := range r.state.Probes {
+		if !listed[name] && memo.At < cutoff {
+			delete(r.state.Probes, name)
+			delete(r.probes, name)
+			changed = true
+		}
+	}
+	for name, memo := range r.state.Kicks {
+		if !listed[name] && memo.At < cutoff {
+			delete(r.state.Kicks, name)
+			changed = true
+		}
+	}
+	r.mu.Unlock()
+	if changed {
+		r.app.markDirty()
+	}
+}
+
+// trimLog bounds the audit trail, dropping the oldest switches and the oldest
+// kick-starts each against their own limit. The order of what is kept does not
+// change.
+func trimLog(log []switchRecord) []switchRecord {
+	switches, kicks := 0, 0
+	for _, rec := range log {
+		if rec.Action == "kickstart" {
+			kicks++
+		} else {
+			switches++
+		}
+	}
+	dropSwitches, dropKicks := switches-switchLogLimit, kicks-kickLogLimit
+	if dropSwitches <= 0 && dropKicks <= 0 {
+		return log
+	}
+	kept := make([]switchRecord, 0, len(log))
+	for _, rec := range log {
+		if rec.Action == "kickstart" {
+			if dropKicks > 0 {
+				dropKicks--
+				continue
+			}
+		} else if dropSwitches > 0 {
+			dropSwitches--
+			continue
+		}
+		kept = append(kept, rec)
+	}
+	return kept
+}
+
 // rotatedRecently keeps the rotator from handing work back to a credential it
 // just took it away from, unless that credential's window has since reset.
 func (r *rotator) rotatedRecently(file string, windows []windowReading, now time.Time, cfg RotatorConfig) bool {
@@ -1663,10 +1754,7 @@ func (r *rotator) record(rec switchRecord) {
 		r.state.DayKey, r.state.DayCount = day, 0
 	}
 	r.state.DayCount++
-	r.state.Log = append(r.state.Log, rec)
-	if len(r.state.Log) > switchLogLimit {
-		r.state.Log = r.state.Log[len(r.state.Log)-switchLogLimit:]
-	}
+	r.state.Log = trimLog(append(r.state.Log, rec))
 	r.mu.Unlock()
 
 	r.app.markDirty()
@@ -1836,12 +1924,29 @@ func (r *rotator) Report(cfg RotatorConfig, board []candidate) map[string]any {
 	}
 
 	if len(r.state.Log) > 0 {
-		log := r.state.Log
-		if len(log) > 20 {
-			log = log[len(log)-20:]
+		// Newest first, switches and kick-starts each with a share of their
+		// own. Taken as one list, the last twenty entries were whatever
+		// happened most often - and that is kick-starts, several per reset,
+		// which left the panel with no record of the last rotation.
+		log := make([]switchRecord, 0, reportSwitches+reportKicks)
+		switches, kicks := 0, 0
+		for i := len(r.state.Log) - 1; i >= 0 && (switches < reportSwitches || kicks < reportKicks); i-- {
+			rec := r.state.Log[i]
+			if rec.Action == "kickstart" {
+				if kicks >= reportKicks {
+					continue
+				}
+				kicks++
+			} else {
+				if switches >= reportSwitches {
+					continue
+				}
+				switches++
+			}
+			log = append(log, rec)
 		}
 		rows := make([]map[string]any, 0, len(log))
-		for i := len(log) - 1; i >= 0; i-- {
+		for i := 0; i < len(log); i++ {
 			rows = append(rows, map[string]any{
 				"at":      time.Unix(log[i].At, 0).UTC().Format(time.RFC3339),
 				"action":  log[i].Action,

@@ -235,13 +235,23 @@ type Window struct {
 	Held []Sample `json:"held_samples,omitempty"`
 
 	// Diagnostics.
-	Cycles         int64   `json:"cycles"`
-	GrantedResets  int64   `json:"granted_resets"`
-	UnexplainedPct float64 `json:"unexplained_percent"`
+	Cycles        int64 `json:"cycles"`
+	GrantedResets int64 `json:"granted_resets"`
+	// UnexplainedPct is how far this cycle's percentage moved with no spend of
+	// ours behind it. It used to be a lifetime total under the key
+	// "unexplained_percent", which only ever grew: a point here and a point
+	// there over months added up to a standing accusation that never cleared.
+	// The old key is deliberately not read, so those totals are left behind.
+	UnexplainedPct float64 `json:"unexplained_cycle_percent,omitempty"`
 
 	// resumed marks a window restored from disk whose first fresh reading has
 	// not been seen yet. Deliberately not persisted.
 	resumed bool
+	// ownUntil is set when this plugin itself has just spent on the credential
+	// outside the usage path - a kick-start greeting, a probe sent as a model
+	// request. The next step before it passes is ours, not another client's.
+	// Deliberately not persisted.
+	ownUntil int64
 }
 
 // Account is the per-credential accumulator.
@@ -272,6 +282,9 @@ type Account struct {
 	FirstSeen int64   `json:"first_seen"`
 	TotalUSD  float64 `json:"total_usd"`
 	TotalReqs int64   `json:"total_requests"`
+	// GoneAt is when the host was first seen to no longer list this
+	// credential, and zero while it does. See settleGone.
+	GoneAt int64 `json:"gone_at,omitempty"`
 
 	// Legacy flat fields, read once for migration and then left empty.
 	LegacyWindowMin int     `json:"window_minutes,omitempty"`
@@ -430,6 +443,8 @@ func (a *App) loop() {
 			if a.syncPrices(true) {
 				a.pruneEventLogs()
 			}
+			a.dropRetired(time.Now())
+			a.forgetGone(time.Now())
 			// The ratios were read once at startup and never again, so a
 			// plugin left running for a week kept pricing models on whatever
 			// the log said the day it loaded.
@@ -499,6 +514,127 @@ func (a *App) Shutdown() {
 		close(a.stop)
 	})
 	a.Flush()
+}
+
+// lastRead is when this credential's quota was last read, through any window.
+func (acct *Account) lastRead() int64 {
+	var newest int64
+	for _, w := range acct.Windows {
+		if w != nil && w.ObservedAt > newest {
+			newest = w.ObservedAt
+		}
+	}
+	return newest
+}
+
+// retired reports a window upstream has stopped counting: its cycle ran out,
+// and a later reading of the same credential came back without it.
+//
+// A reading carries every window upstream is counting and advances them all
+// under one timestamp, so a window a newer reading left behind was not in it.
+// One whose cycle is still running gets the benefit of the doubt, and so does
+// one missed only moments ago: responses are filed when they finish, not when
+// their headers were written, so two readings seconds apart say nothing about
+// which is the newer picture.
+//
+// It matters because nothing else ever lets go of a window. A credential that
+// reported a 24-hour window for one afternoon kept it for good, and once its
+// boundary passed the clock said it had "reset" on every reading traffic
+// produced - which the rotator answered with a probe each time, until the
+// credential's daily probe budget was gone by breakfast.
+func (w *Window) retired(lastRead int64) bool {
+	return w.ResetAt > 0 && w.ResetAt <= lastRead &&
+		lastRead-w.ObservedAt >= int64(retireAfter/time.Second)
+}
+
+// retireAfter is how much newer a reading without a window has to be than the
+// last one with it before the window counts as gone.
+const retireAfter = 10 * time.Minute
+
+// retiredKeep is how long a retired window's accounting is kept in case
+// upstream starts reporting it again. Nothing in it outlives the calibration
+// samples, so neither does it.
+const retiredKeep = sampleMaxAgeDays * 24 * time.Hour
+
+// dropRetired forgets windows that have been retired for longer than their
+// calibration is worth keeping. The lifetime totals are untouched: they are
+// carried by the hourly series, not by the windows.
+func (a *App) dropRetired(now time.Time) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	for _, acct := range a.accounts {
+		if acct == nil {
+			continue
+		}
+		lastRead := acct.lastRead()
+		for key, w := range acct.Windows {
+			if w == nil || !w.retired(lastRead) {
+				continue
+			}
+			if now.Sub(time.Unix(w.ObservedAt, 0)) > retiredKeep {
+				delete(acct.Windows, key)
+				a.dirty = true
+			}
+		}
+	}
+}
+
+const (
+	// goneConfirm is how long a credential has to stay off the host's list
+	// before that is believed. A list read mid-reload can be short.
+	goneConfirm = 24 * time.Hour
+	// goneKeep is how long after its last reading a deleted credential's
+	// account is kept: as long as the hourly series, after which nothing the
+	// panel draws comes from it.
+	goneKeep = hourRetention * time.Hour
+)
+
+// settleGone notes which accounts belong to credentials the host no longer
+// lists, and forgets the ones deleted long enough ago. Caller holds a.mu.
+//
+// Nothing used to. An account outlived its credential for good, so the panel's
+// note that some credentials had been deleted named the same ones months
+// later, and the state file carried them along.
+//
+// An empty list is a failure to ask, not evidence that every credential was
+// deleted, so it settles nothing; and a credential that turns up again is
+// simply present again.
+func (a *App) settleGone(entries []authEntry, now time.Time) {
+	if len(entries) == 0 {
+		return
+	}
+	for key, acct := range a.accounts {
+		if acct == nil {
+			continue
+		}
+		if _, known := lookupAuth(entries, acct); known {
+			if acct.GoneAt != 0 {
+				acct.GoneAt = 0
+				a.dirty = true
+			}
+			continue
+		}
+		if acct.GoneAt == 0 {
+			acct.GoneAt = now.Unix()
+			a.dirty = true
+			continue
+		}
+		if now.Sub(time.Unix(acct.GoneAt, 0)) >= goneConfirm &&
+			now.Sub(time.Unix(acct.lastRead(), 0)) >= goneKeep {
+			delete(a.accounts, key)
+			a.dirty = true
+		}
+	}
+}
+
+// forgetGone is settleGone on the hour, for a panel nobody has open, and the
+// same for what the rotator remembers.
+func (a *App) forgetGone(now time.Time) {
+	entries := a.authMetadata()
+	a.mu.Lock()
+	a.settleGone(entries, now)
+	a.mu.Unlock()
+	a.rot.forget(entries, now)
 }
 
 func (acct *Account) window(minutes int) *Window {
@@ -685,12 +821,19 @@ func (w *Window) advance(r windowReading, now time.Time) (early bool) {
 			w.Samples = append(w.Samples, Sample{DP: dp, USD: w.PendingUSD, TS: now.Unix(),
 				Cycle: w.Key, ByModel: copyUSD(w.PendingByModel)})
 			w.pruneSamples(now)
+		case now.Unix() <= w.ownUntil:
+			// Ours, though not on the ledger: the plugin's own greeting or
+			// probe, which reaches upstream without passing through the host's
+			// usage path. Counting it would have the plugin report itself as
+			// an intruder.
 		default:
-			// The percentage moved but we billed nothing for it: another client
-			// is spending this credential's quota. Worth surfacing rather than
-			// silently skipping, because it also means our ledger undercounts.
+			// The percentage moved but we billed nothing for it. That is spend
+			// this ledger does not hold - a request cut off before upstream
+			// reported its tokens, or another client on the same credential -
+			// so it is kept for the cycle it happened in (see startCycle).
 			w.UnexplainedPct += dp
 		}
+		w.ownUntil = 0
 		w.clearPending()
 	}
 
@@ -733,6 +876,9 @@ func (w *Window) startCycle(r windowReading, now time.Time, granted bool) {
 	w.clearPending()
 	w.HasLast = false
 	w.LastPercent = 0
+	// What moved without us moved in the cycle that just closed. Carried over,
+	// it described no cycle at all and could never go back down.
+	w.UnexplainedPct = 0
 	w.Cycles++
 	if granted {
 		w.GrantedResets++
@@ -1344,6 +1490,8 @@ func (a *App) loadState() {
 	if sf.Version < 4 {
 		a.recoverHeld()
 	}
+	// On load as well as on the hour, for the same reason the hourly series is.
+	a.dropRetired(time.Now())
 	a.rot.restore(sf.Rotator)
 }
 
@@ -1427,6 +1575,21 @@ func (a *App) appendEvent(rec usageRecord, model string, cost float64, priced bo
 	}
 	if rl.Credits.LimitReached != "" {
 		ev["limit_reached"] = rl.Credits.LimitReached
+	}
+	if rec.Failed {
+		// Why it failed, as far as a status and upstream's own short code say.
+		// The log had only "failed": a month of failures could be counted and
+		// not one of them explained. The response body itself stays out - it
+		// can quote the request back.
+		if rec.Failure.StatusCode > 0 {
+			ev["status"] = rec.Failure.StatusCode
+		}
+		if code := rec.Failure.reason(); code != fmt.Sprintf("http_%d", rec.Failure.StatusCode) {
+			if len(code) > 64 {
+				code = code[:64]
+			}
+			ev["error"] = code
+		}
 	}
 	if raw, err := json.Marshal(ev); err == nil {
 		a.events = append(a.events, raw)
@@ -1565,6 +1728,10 @@ func (a *App) Report() map[string]any {
 	// watched both, and every window's estimate then gets to use it.
 	weights := a.deriveModelWeights()
 
+	// Before anything is listed, so a credential deleted long ago is not
+	// reported as removed one last time.
+	a.settleGone(entries, now)
+
 	accounts := make([]*Account, 0, len(a.accounts))
 	for _, acct := range a.accounts {
 		accounts = append(accounts, acct)
@@ -1613,8 +1780,9 @@ func (a *App) Report() map[string]any {
 
 		windows := make([]map[string]any, 0, len(acct.Windows))
 		lengths := make([]int, 0, len(acct.Windows))
+		lastRead := acct.lastRead()
 		for _, w := range acct.Windows {
-			if w != nil {
+			if w != nil && !w.retired(lastRead) {
 				lengths = append(lengths, w.Minutes)
 			}
 		}
@@ -1704,14 +1872,11 @@ func (a *App) Report() map[string]any {
 			if w.Percent >= 90 {
 				t.AtRisk++
 			}
-			if w.UnexplainedPct > 1 {
-				warnings = append(warnings, map[string]any{
-					"code":       "external_usage",
-					"credential": displayName(entries, acct),
-					"window":     windowLabel(w.Minutes),
-					"percent":    round2(w.UnexplainedPct),
-				})
-			}
+			// Movement this ledger cannot account for stays on the window's
+			// own row and raises no warning. As a banner it could not be acted
+			// on and never went away, and its guess at the cause - someone
+			// else on the credential - was usually wrong: a request the client
+			// abandoned mid-stream is spent upstream and reported to nobody.
 
 			if w.Percent > bindingPct {
 				bindingPct, binding = w.Percent, entry

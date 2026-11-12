@@ -18,7 +18,8 @@ A fixture with "Unstarted" set describes a window that has been reset and not
 started, the way upstream does: the whole period still to run, however long
 ago the reset was, until a model request arrives - after which the window runs
 from that moment. "KickIgnored" keeps it unstarted regardless, which is how a
-test says a kick-start did not take.
+test says a kick-start did not take. "KickCosts" is how many points the request
+that started it took off every window, the way a real one does.
 """
 import http.server
 import json
@@ -28,11 +29,12 @@ import threading
 import time
 
 
-def usage_document(headers, unstarted=False, started_at=None):
+def usage_document(headers, unstarted=False, started_at=None, spent=0):
     """The usage endpoint's answer for a credential whose quota headers are these.
 
     unstarted describes a reset window still waiting for its first request;
-    started_at is when one arrived, if it has.
+    started_at is when one arrived, if it has; spent is what that request cost,
+    in points of every window.
     """
     h = {k.lower(): v[0] for k, v in (headers or {}).items() if v}
     now = int(time.time())
@@ -47,7 +49,7 @@ def usage_document(headers, unstarted=False, started_at=None):
         if unstarted:
             reset_at = (started_at + full) if started_at else now + full
         slots[slot] = {
-            "used_percent": float(pct),
+            "used_percent": float(pct) + (spent if started_at else 0),
             "limit_window_seconds": full,
             "reset_after_seconds": max(0, reset_at - now),
             "reset_at": reset_at,
@@ -119,7 +121,8 @@ class _Handler(http.server.BaseHTTPRequestHandler):
         else:
             status = 200
             body = json.dumps(usage_document(spec.get("Headers"), spec.get("Unstarted"),
-                                             self.server.started.get(token))).encode()
+                                             self.server.started.get(token),
+                                             spec.get("KickCosts", 0))).encode()
         self.send_response(status)
         self.send_header("content-type", "application/json")
         self.send_header("content-length", str(len(body)))
