@@ -49,7 +49,7 @@ plugins:
         kickstart_after_reset: false # true = after a quota reset, send "你好" so the 7-day countdown starts at once
 ```
 
-Everything else has a default; see [config.go](config.go). Prices are refreshed daily from `models.dev` (through CPA's configured proxy), with a built-in table as the offline fallback. Models without a price are flagged, never counted as free.
+Everything else has a default; see [config.go](config.go). Prices are refreshed daily from `models.dev` (through CPA's configured proxy), with a built-in table as the offline fallback. A model the catalog does not list yet is looked up again early (after 30 minutes, doubling each time); until then its spend is held as tokens and flagged on the panel, and it is billed automatically once a price appears - never counted as free.
 
 ## Rotation
 

@@ -2294,6 +2294,207 @@ check("and no greeting followed it", kicks(), [])
 
 print()
 print("=" * 74)
+print("AW. a model the catalog has not listed yet is billed once it is")
+print("=" * 74)
+# A model is in traffic the day it launches and in the catalog some hours later.
+# What was served in between used to be billed at nothing for good: estimates
+# stayed short, the quota it moved was blamed on another client, and the "no
+# public price" warning outlived the price by the rest of the window.
+NEW = "gpt-7-nova"
+CATALOG = "https://harness.invalid/catalog.json"
+# harness-model is in the harness's catalog and nowhere else, at $3 / $9.
+HM_COST = IN_TOKENS / 1e6 * 3 + OUT_TOKENS / 1e6 * 9
+
+
+def cfg_text(price_url="", overrides=None):
+    text = config(price_url)
+    if overrides:
+        text += "price_overrides:\n"
+        for model, (pin, pout) in overrides.items():
+            text += "  %s: {input: %s, output: %s}\n" % (model, pin, pout)
+    return text
+
+
+def lifecycle(text):
+    return {"config_yaml": base64.b64encode(text.encode()).decode(), "schema_version": 1}
+
+
+DATA_REQ = {"Method": "GET", "Path": "/v0/management/codex-weekly-usd/data"}
+
+
+def run_cfg(steps, text):
+    """Every data answer the steps asked for, in order, and the host log."""
+    path = os.path.join(BUILD, "script.txt")
+    lines = ["plugin.register\t" + json.dumps(lifecycle(text))]
+    lines += [m + "\t" + json.dumps(p, separators=(",", ":")) for m, p in steps]
+    lines += ["management.handle\t" + json.dumps(DATA_REQ), "plugin.shutdown\t{}"]
+    with open(path, "w") as fh:
+        fh.write("\n".join(lines) + "\n")
+    res = subprocess.run([HARNESS, SO, path], capture_output=True, text=True,
+                         env=dict(os.environ, HARNESS_AUTH_LIST="[]"))
+    reps = [json.loads(base64.b64decode(json.loads(b.split("\n", 1)[1].strip())["result"]["Body"]))
+            for b in res.stdout.split("--- ") if b.startswith("management.handle")]
+    return reps, res.stderr
+
+
+def seed_prices(models, source="seeded-cache"):
+    """A price cache as a fetch earlier today would have left it."""
+    os.makedirs(DATA_DIR, exist_ok=True)
+    with open(os.path.join(DATA_DIR, "prices.json"), "w") as fh:
+        json.dump({"source": source, "fetched_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+                   "models": models}, fh)
+
+
+def row(rep, model, minutes=WEEK):
+    return [m for m in win(rep, minutes)["by_model"] if m["model"] == model][0]
+
+
+def unpriced_warnings(rep):
+    return [w["models"] for w in rep["warnings"] if w["code"] == "unpriced_models"]
+
+
+DATA = ("management.handle", DATA_REQ)
+shutil.rmtree(DATA_DIR, ignore_errors=True)
+# Section A's traffic exactly - six requests, a point each - on a model nothing
+# can price yet. It is then given the sol rate card, and everything has to come
+# out the way section A's did, billed at the time.
+steps = [("usage.handle", weekly(i, model=NEW)) for i in range(6)]
+before, after = run_cfg(steps + [DATA, ("plugin.reconfigure", lifecycle(
+    cfg_text(overrides={NEW: (SOL_IN, SOL_OUT)})))], cfg_text())[0]
+w = win(before, WEEK)
+check("unpriced: nothing billed", w["usd_observed"], 0.0)
+check("and every request counted as waiting", row(before, NEW)["unpriced"], 6)
+check("the warning names the model", unpriced_warnings(before), [[NEW]])
+# The points it moved were ours, not another client's.
+check("not blamed on another client", w["unexplained_percent"], 0)
+check("no external-usage warning", [x for x in before["warnings"] if x["code"] == "external_usage"], [])
+# Dividing what was priced (nothing) by the percentage would read as a quota
+# of zero; there is no estimate until the spend has a price.
+check("no estimate from spend it cannot price", w["estimate"]["method"], "none")
+
+w = win(after, WEEK)
+check("priced later: billed in full", round(w["usd_observed"], 4), COST * 6)
+check("the model's row too", round(row(after, NEW)["usd"], 4), COST * 6)
+check("nothing left waiting", row(after, NEW)["unpriced"], 0)
+check("and the warning is gone", unpriced_warnings(after), [])
+check("quota as if priced all along", round(w["estimate"]["quota_usd"], 2), 200.00)
+check("by the window method", round(w["estimate"]["quota_usd_by_window"], 2), 200.00)
+check("and by the steps", round(w["estimate"]["quota_usd_by_delta"], 2), 200.00)
+check("all five steps count", w["estimate"]["samples"], 5)
+check("lifetime total", after["accounts"][0]["total_usd"], COST * 6)
+check("hourly series", after["fleet_series"][-1]["rolling_usd"], COST * 6)
+
+shutil.rmtree(DATA_DIR, ignore_errors=True)
+# The catalog was fetched this morning, before the model was in it. The first
+# request on it asks again at once rather than at tomorrow's fetch.
+seed_prices({"gpt-5.6-sol": {"input": 4, "output": 20, "cache_read": 0.4}})
+first, second = run_cfg([
+    ("usage.handle", weekly(0, model="harness-model")), ("sleep", 800), DATA,
+    # A second unlisted model within the half hour: asking again already
+    # would be one fetch per request while the catalog does not list it.
+    ("sleep", 1100), ("usage.handle", weekly(0, model="gpt-7-unlisted")), ("sleep", 800),
+], cfg_text(CATALOG))[0]
+check("fetched early for a model it lacked", first["price_source"], CATALOG)
+check("through the host", first["price_transport"], "host")
+check("and billed what it found", round(row(first, "harness-model")["usd"], 4), round(HM_COST, 4))
+check("which is no longer waiting", row(first, "harness-model")["unpriced"], 0)
+check("no warning for it", unpriced_warnings(first), [])
+check("not fetched again within the half hour", second["price_fetched"], first["price_fetched"])
+check("so the other waits, and says so", unpriced_warnings(second), [["gpt-7-unlisted"]])
+
+shutil.rmtree(DATA_DIR, ignore_errors=True)
+# A state from before 2.13 has the counts and nothing to bill them from. This
+# makes one: this build's own state, stripped of what 2.12 did not keep.
+run_cfg([("usage.handle", weekly(i, model="harness-model")) for i in range(6)], cfg_text())
+
+
+def as_2_12(counts=None):
+    path = os.path.join(DATA_DIR, "state.json")
+    st = json.load(open(path))
+    st["version"] = 3
+    for acct in st["accounts"].values():
+        for wnd in acct["windows"].values():
+            for name, agg in wnd["by_model"].items():
+                agg.pop("held", None)
+                if counts is not None:
+                    agg["unpriced_requests"] = counts
+            wnd.pop("pending_held", None)
+            # 2.12 took steps with nothing priced behind them for another
+            # client's; this build holds them instead.
+            wnd["unexplained_percent"] = sum(s["dp"] for s in wnd.pop("held_samples", []))
+        for hour in acct["hours"].values():
+            hour.pop("h", None)
+        acct["unpriced_requests"] = 6
+        acct["unpriced_models"] = ["harness-model"]
+    json.dump(st, open(path, "w"))
+
+
+as_2_12()
+if os.path.exists(os.path.join(DATA_DIR, "held-through")):
+    os.remove(os.path.join(DATA_DIR, "held-through"))
+seed_prices({"harness-model": {"input": 3, "output": 9, "cache_read": 0.3}})
+rep = run_cfg([], cfg_text())[0][-1]
+check("2.12 state: recovered from the log", round(win(rep, WEEK)["usd_observed"], 4), round(HM_COST * 6, 4))
+check("its warning cleared", unpriced_warnings(rep), [])
+check("lifetime total recovered", round(rep["accounts"][0]["total_usd"], 4), round(HM_COST * 6, 4))
+check("hourly series recovered", round(rep["fleet_series"][-1]["rolling_usd"], 4), round(HM_COST * 6, 4))
+# The sixth request is still in flight - the meter has not moved since the
+# reading it came with - so it is spent but not yet divided by the percentage.
+check("in-flight spend is not divided", round(win(rep, WEEK)["estimate"]["quota_usd_by_window"], 2), 120.00)
+rep = run_cfg([], cfg_text())[0][-1]
+check("loading it again bills nothing twice", round(rep["accounts"][0]["total_usd"], 4), round(HM_COST * 6, 4))
+# Down to 2.12 and back up. The log still says "unpriced" about all six, and a
+# build that kept the counts would ask for them again; they were billed before
+# the downgrade, and the last held-aware save says so.
+as_2_12(counts=6)
+rep = run_cfg([], cfg_text())[0][-1]
+check("after a downgrade and back, still once", round(rep["accounts"][0]["total_usd"], 4),
+      round(HM_COST * 6, 4))
+check("the window too", round(win(rep, WEEK)["usd_observed"], 4), round(HM_COST * 6, 4))
+
+shutil.rmtree(DATA_DIR, ignore_errors=True)
+# Without an event log, a model whose every request went unpriced still has its
+# tokens in the window's own row.
+run_cfg([("usage.handle", weekly(i, model="harness-model")) for i in range(6)], cfg_text())
+as_2_12()
+shutil.rmtree(os.path.join(DATA_DIR, "events"), ignore_errors=True)
+if os.path.exists(os.path.join(DATA_DIR, "held-through")):
+    os.remove(os.path.join(DATA_DIR, "held-through"))
+seed_prices({"harness-model": {"input": 3, "output": 9, "cache_read": 0.3}})
+rep = run_cfg([], cfg_text())[0][-1]
+check("no log: recovered from the row", round(win(rep, WEEK)["usd_observed"], 4), round(HM_COST * 6, 4))
+check("and cleared", unpriced_warnings(rep), [])
+
+shutil.rmtree(DATA_DIR, ignore_errors=True)
+# The model ratios replay the event log. A request logged before its model had
+# a price used to drop out of the replay entirely.
+run_cfg([("usage.handle", weekly(i, model="harness-model")) for i in range(12)], cfg_text())
+seed_prices({"harness-model": {"input": 3, "output": 9, "cache_read": 0.3}})
+log = run_cfg([], cfg_text())[1]
+check("ratios count it once it has a price", "harness-model=1.00 (1 windows)" in log, True)
+
+shutil.rmtree(DATA_DIR, ignore_errors=True)
+# And one that still has no price must not have its share of the meter handed
+# to the priced spend beside it. Here the unlisted requests move the meter two
+# points each and sol moves nothing; skipping them credited sol with all twelve.
+steps = []
+for k in range(7):
+    steps += [("usage.handle", weekly(2 * k)), ("usage.handle", weekly(2 * k, model="gpt-7-unlisted"))]
+run_cfg(steps, cfg_text())
+log = run_cfg([], cfg_text())[1]
+check("steps it moved are not sol's", "gpt-5.6-sol=not enough data (0 windows)" in log, True)
+
+prices = run([], route="prices")
+book = {m["model"]: m for m in prices["models"]}
+check("built in: gpt-6-sol", (book["gpt-6-sol"]["input"], book["gpt-6-sol"]["output"]), (2, 10))
+check("built in: gpt-6-luna", (book["gpt-6-luna"]["input"], book["gpt-6-luna"]["output"]), (0.1, 0.5))
+# 6.1-sol keeps 6-sol's input and output rates but halves the cached read, so
+# the cache rate is what tells the two entries apart.
+check("built in: gpt-6.1-sol",
+      (book["gpt-6.1-sol"]["input"], book["gpt-6.1-sol"]["output"], book["gpt-6.1-sol"]["cache_read"]), (2, 10, 0.1))
+
+print()
+print("=" * 74)
 if failures:
     print("FAILED: " + ", ".join(failures))
     sys.exit(1)

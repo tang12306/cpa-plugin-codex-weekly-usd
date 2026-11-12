@@ -47,6 +47,9 @@ var builtinPrices = map[string]Price{
 	"gpt-5.6-terra":       {Input: 2, Output: 12, CacheRead: 0.2, CacheWrite: 2.5},
 	"gpt-5.6-luna":        {Input: 0.2, Output: 1.2, CacheRead: 0.02, CacheWrite: 0.25},
 	"gpt-6-astra":         {Input: 10, Output: 50, CacheRead: 1, CacheWrite: 12.5},
+	"gpt-6-sol":           {Input: 2, Output: 10, CacheRead: 0.2, CacheWrite: 2.5},
+	"gpt-6-luna":          {Input: 0.1, Output: 0.5, CacheRead: 0.01, CacheWrite: 0.125},
+	"gpt-6.1-sol":         {Input: 2, Output: 10, CacheRead: 0.1, CacheWrite: 2.5},
 }
 
 // effortSuffixes are reasoning-effort decorations that gateways append to a
@@ -60,6 +63,10 @@ type priceBook struct {
 	source    string
 	transport string
 	fetchedAt time.Time
+	// triedAt is the last attempt, successful or not. fetchedAt alone cannot
+	// pace the early looks for a model the catalog did not list: it does not
+	// move when a fetch fails, so every request on that model would try again.
+	triedAt   time.Time
 	lastError string
 	path      string
 }
@@ -118,6 +125,13 @@ func (pb *priceBook) stale(every time.Duration) bool {
 	return time.Since(pb.fetchedAt) >= every
 }
 
+// triedWithin reports whether this process has asked the catalog within d.
+func (pb *priceBook) triedWithin(d time.Duration) bool {
+	pb.mu.RLock()
+	defer pb.mu.RUnlock()
+	return !pb.triedAt.IsZero() && time.Since(pb.triedAt) < d
+}
+
 // refresh pulls a models.dev-shaped catalog. The document is
 // {provider: {models: {name: {cost: {input, output, cache_read, cache_write}}}}}
 // and only the openai provider is read.
@@ -125,6 +139,9 @@ func (pb *priceBook) refresh(url string) {
 	if strings.TrimSpace(url) == "" {
 		return
 	}
+	pb.mu.Lock()
+	pb.triedAt = time.Now()
+	pb.mu.Unlock()
 	raw, via, err := fetchCatalog(url)
 	if err != nil {
 		pb.recordError(err.Error())

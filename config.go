@@ -139,6 +139,12 @@ type RotatorConfig struct {
 	// should already hold probing to a handful a day; this bounds the damage if
 	// some reading never settles and the per-cycle rule keeps renewing.
 	MaxProbesPerDayPerCredential int `yaml:"max_probes_per_day_per_credential"`
+	// PreferTurnState biases the pool towards credentials the codex-turn-state
+	// plugin can cover: a request served by an account with no live turn-state
+	// goes upstream without one. It reads that plugin's coverage.json (a
+	// sibling data directory) and, among credentials that are otherwise equal,
+	// takes the covered one first. It never overrides the floor or a skip.
+	PreferTurnState bool `yaml:"prefer_turn_state"`
 	// NeverEnable and NeverDisable are the manual override, by file name.
 	NeverEnable  []string `yaml:"never_enable"`
 	NeverDisable []string `yaml:"never_disable"`

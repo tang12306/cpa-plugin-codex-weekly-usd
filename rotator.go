@@ -132,6 +132,9 @@ type candidate struct {
 	Skip      string  `json:"skipped,omitempty"`
 	Status    int     `json:"status_code,omitempty"`
 	Plan      string  `json:"plan_type,omitempty"`
+	// Covered marks a credential the turn-state plugin holds a live state for.
+	// Set by rank from coverage.json; purely a preference among equals.
+	Covered bool `json:"turn_state,omitempty"`
 	// Reserve marks a pick taken from below the floor because nothing above it
 	// was left. Set by choose, never by rank.
 	Reserve bool `json:"-"`
@@ -1273,11 +1276,50 @@ func (r *rotator) credential(e authEntry) (token, account, proxyURL string, err 
 	return doc.AccessToken, doc.AccountID, firstNonEmpty(doc.ProxyURL, doc.Proxy), nil
 }
 
+// turnStateCoverage reads the sibling codex-turn-state plugin's coverage.json:
+// the accounts it currently holds a live state for. A missing or stale file
+// reads as "nothing covered", which leaves the order exactly as it was.
+//
+// Stale is worse than absent here: a lapsed list would send traffic to an
+// account whose state has since expired, which is the outcome this is meant to
+// avoid. The two plugins publish on the same cadence, so a minute of slack is
+// generous.
+func turnStateCoverage(dataDir string) map[string]bool {
+	out := map[string]bool{}
+	if strings.TrimSpace(dataDir) == "" {
+		return out
+	}
+	path := filepath.Join(filepath.Dir(dataDir), "codex-turn-state", "coverage.json")
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		return out
+	}
+	var cov struct {
+		Generated int64    `json:"generated"`
+		Accounts  []string `json:"accounts"`
+	}
+	if json.Unmarshal(raw, &cov) != nil {
+		return out
+	}
+	if cov.Generated == 0 || time.Now().Unix()-cov.Generated > 300 {
+		return out
+	}
+	for _, f := range cov.Accounts {
+		out[strings.TrimSpace(f)] = true
+	}
+	return out
+}
+
 // rank scores every credential and explains every rejection.
 func (r *rotator) rank(results map[string]probeResult, entries []authEntry, cfg RotatorConfig) []candidate {
 	now := time.Now()
 	usdPerHour := r.app.fleetUSDPerHour()
 	out := make([]candidate, 0, len(entries))
+
+	var covered map[string]bool
+	if cfg.PreferTurnState {
+		covered = turnStateCoverage(r.app.cfg.DataDir)
+	}
 
 	for _, e := range entries {
 		res, probed := results[e.Name]
@@ -1288,6 +1330,7 @@ func (r *rotator) rank(results map[string]probeResult, entries []authEntry, cfg 
 			Enabled: !e.Disabled,
 			Plan:    res.PlanType,
 			Status:  res.StatusCode,
+			Covered: covered[e.Name],
 		}
 		switch {
 		case contains(cfg.NeverEnable, e.Name):
@@ -1333,13 +1376,25 @@ func (r *rotator) rank(results map[string]probeResult, entries []authEntry, cfg 
 		if (a.Skip == "") != (b.Skip == "") {
 			return a.Skip == ""
 		}
+		// Coverage ranks above everything except being usable at all.
+		//
+		// A request served by an account with no live state goes upstream
+		// without one, and the turn is then whatever upstream decides it is -
+		// the exact outcome this system exists to prevent. A covered account
+		// that is merely low on quota is not a failure: the pool has a second
+		// member, and the rotator replaces the covered one when it empties.
+		// So coverage is compared first, and safety only decides between
+		// accounts that agree on it.
+		if a.Covered != b.Covered {
+			return a.Covered
+		}
 		if a.Safe != b.Safe {
 			return a.Safe
 		}
 		if a.Safe && b.Safe {
-			// Both will carry the horizon, so prefer the quota that would
-			// otherwise be thrown away first: an allowance resetting in nine
-			// hours is use-it-or-lose-it, one resetting in a week is not.
+			// Then prefer the quota that would otherwise be thrown away: an
+			// allowance resetting in nine hours is use-it-or-lose-it, one
+			// resetting in a week is not.
 			if a.ExpiresIn != b.ExpiresIn {
 				return a.ExpiresIn < b.ExpiresIn
 			}

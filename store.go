@@ -128,6 +128,10 @@ type ModelAgg struct {
 	USD      float64 `json:"usd"`
 	SavedUSD float64 `json:"saved_usd"`
 	Unpriced int64   `json:"unpriced_requests"`
+	// Held is what Unpriced is billed from once the model has a price. A
+	// state written before 2.13 counted Unpriced and kept nothing else, which
+	// is what recoverHeld is for.
+	Held *heldSpend `json:"held,omitempty"`
 }
 
 // HourAgg is one hour of the rolling time series. Keeping the series in memory
@@ -141,6 +145,9 @@ type HourAgg struct {
 	In        int64   `json:"i"`
 	Out       int64   `json:"o"`
 	CacheRead int64   `json:"c"`
+	// Held is this hour's spend on models that had no price yet. Billed into
+	// USD - and the credential's lifetime total - when one turns up.
+	Held map[string]*heldSpend `json:"h,omitempty"`
 }
 
 // rollingHours is both the span the fleet chart covers and the trailing window
@@ -173,6 +180,10 @@ type Sample struct {
 	// about 1.4x the quota a dollar of gpt-5.6-sol does. Without the split a
 	// sample cannot say which of those it was measuring.
 	ByModel map[string]float64 `json:"by_model,omitempty"`
+	// Held is spend inside this step that had no price when the step was
+	// measured. A sample carrying any waits in Window.Held, out of every
+	// estimate, until the price book can bill all of it.
+	Held map[string]*heldSpend `json:"held,omitempty"`
 }
 
 const (
@@ -215,7 +226,13 @@ type Window struct {
 	HasLast        bool               `json:"has_last"`
 	PendingUSD     float64            `json:"pending_usd"`
 	PendingByModel map[string]float64 `json:"pending_by_model,omitempty"`
-	Samples        []Sample           `json:"samples"`
+	// PendingHeld is pending spend on models with no price yet.
+	PendingHeld map[string]*heldSpend `json:"pending_held,omitempty"`
+	Samples     []Sample              `json:"samples"`
+	// Held are steps measured with unpriced spend inside them. Dividing the
+	// part that was priced by the whole step would understate the quota by
+	// the part that was not, so they wait here until it has a price.
+	Held []Sample `json:"held_samples,omitempty"`
 
 	// Diagnostics.
 	Cycles         int64   `json:"cycles"`
@@ -247,8 +264,10 @@ type Account struct {
 
 	Hours map[string]*HourAgg `json:"hours"`
 
-	UnpricedReqs int64    `json:"unpriced_requests"`
-	UnpricedList []string `json:"unpriced_models,omitempty"`
+	// What is still unpriced is read off the windows and the hourly series
+	// (see unpricedNow), not kept here. A list kept here only ever grew: a
+	// model served once before the catalog listed it stayed "unpriced" on the
+	// panel for good.
 
 	FirstSeen int64   `json:"first_seen"`
 	TotalUSD  float64 `json:"total_usd"`
@@ -269,8 +288,9 @@ type stateFile struct {
 // stateVersion 2 introduced per-length windows and bounded calibration;
 // 3 added the per-model health ledger, which is purely additive - a version 2
 // file loads unchanged and starts collecting model health from the next
-// request.
-const stateVersion = 3
+// request. 4 holds unpriced spend as tokens (heldSpend); an older file has
+// only the counts, and recoverHeld rebuilds the rest from the event log once.
+const stateVersion = 4
 
 // App owns all mutable plugin state.
 type App struct {
@@ -294,12 +314,24 @@ type App struct {
 	stop      chan struct{}
 	started   bool
 	startedAt time.Time
+	// flushMu makes a flush wait for one already writing. Shutdown and the
+	// loop both flush on stop; whichever took the snapshot second found
+	// nothing dirty and returned at once, and when that was Shutdown the
+	// process could exit before the other had written the file.
+	flushMu sync.Mutex
 
 	// earlyReset is when live traffic last showed a window reset before its
 	// time. Upstream resetting every account looks exactly like that from the
 	// credential that happens to be serving, and it is the rotator's cue to
 	// read the idle ones at once rather than at the next scheduled sweep.
 	earlyReset int64
+
+	// nudge tells the loop that a request just came in on a model with no
+	// price, so the catalog is asked now rather than at the next daily fetch.
+	nudge chan struct{}
+	// priceMisses counts the early looks in a row that came back without a
+	// price for what is held; each one doubles the wait before the next.
+	priceMisses uint
 }
 
 func (a *App) earlyResetAt() int64 {
@@ -329,12 +361,16 @@ func newApp(cfg Config) (*App, error) {
 		accounts:  make(map[string]*Account),
 		prices:    newPriceBook(cfg.DataDir),
 		stop:      make(chan struct{}),
+		nudge:     make(chan struct{}, 1),
 		startedAt: time.Now(),
 	}
 	app.rot = newRotator(app)
 	app.prices.setOverrides(cfg.PriceOverrides)
 	app.loadState()
 	app.loadModelWeights()
+	// Before the first report: whatever the cached catalog, the built-in table
+	// or an override can price is billed from the start.
+	app.repriceHeld()
 	app.start()
 	return app, nil
 }
@@ -352,6 +388,9 @@ func (a *App) Reconfigure(cfg Config) {
 		}
 	}
 	a.prices.setOverrides(cfg.PriceOverrides)
+	// An override is how an operator prices a model the catalog does not
+	// list, and it applies to what is already held, not just what comes next.
+	a.repriceHeld()
 }
 
 func (a *App) start() {
@@ -368,13 +407,9 @@ func (a *App) loop() {
 
 	a.mu.Lock()
 	flushEvery := time.Duration(a.cfg.FlushSeconds) * time.Second
-	url := a.cfg.PriceSourceURL
-	refresh := a.cfg.priceRefresh()
 	a.mu.Unlock()
 
-	if a.prices.stale(refresh) {
-		a.prices.refresh(url)
-	}
+	a.syncPrices(true)
 	a.pruneEventLogs()
 
 	flush := time.NewTicker(flushEvery)
@@ -389,12 +424,10 @@ func (a *App) loop() {
 			return
 		case <-flush.C:
 			a.Flush()
+		case <-a.nudge:
+			a.syncPrices(false)
 		case <-price.C:
-			a.mu.Lock()
-			url, refresh = a.cfg.PriceSourceURL, a.cfg.priceRefresh()
-			a.mu.Unlock()
-			if a.prices.stale(refresh) {
-				a.prices.refresh(url)
+			if a.syncPrices(true) {
 				a.pruneEventLogs()
 			}
 			// The ratios were read once at startup and never again, so a
@@ -403,6 +436,62 @@ func (a *App) loop() {
 			a.refreshModelWeights()
 		}
 	}
+}
+
+// unknownModelGap is how long after one look the catalog is asked again about a
+// model it did not list. It doubles with each look that comes back without the
+// price, up to the regular refresh interval: a model the catalog lists within
+// the hour is priced within the hour, and one it never lists costs a fetch a
+// day, the same as before.
+const unknownModelGap = 30 * time.Minute
+
+// syncPrices fetches the catalog when that is due and bills whatever held spend
+// the price book can then price. It is due on the schedule (onSchedule, and the
+// last fetch older than price_refresh_hours), or early while spend is held for
+// want of a price. The daily schedule alone used to leave a new model unpriced
+// for up to a day after the catalog listed it. It reports whether the scheduled
+// fetch ran.
+//
+// The early path is paced by the last attempt rather than the last success. A
+// catalog that cannot be reached would otherwise be tried again on every
+// request that came in on the unlisted model.
+func (a *App) syncPrices(onSchedule bool) (scheduled bool) {
+	// The price may already be here: in the cached catalog at startup, in the
+	// built-in table of a newer build, or in an override.
+	a.repriceHeld()
+
+	a.mu.Lock()
+	url, every := a.cfg.PriceSourceURL, a.cfg.priceRefresh()
+	gap := every
+	if a.priceMisses < 16 {
+		if g := unknownModelGap << a.priceMisses; g < every {
+			gap = g
+		}
+	}
+	a.mu.Unlock()
+
+	scheduled = onSchedule && a.prices.stale(every)
+	if strings.TrimSpace(url) == "" {
+		// Pricing is frozen at the built-in table: there is nothing to ask,
+		// though the schedule still turns over for the caller's upkeep.
+		return scheduled
+	}
+	early := !scheduled && a.holdsUnpriced() && !a.prices.triedWithin(gap)
+	if !scheduled && !early {
+		return false
+	}
+	a.prices.refresh(url)
+	a.repriceHeld()
+
+	short := a.holdsUnpriced()
+	a.mu.Lock()
+	if !short {
+		a.priceMisses = 0
+	} else if a.priceMisses < 16 {
+		a.priceMisses++
+	}
+	a.mu.Unlock()
+	return scheduled
 }
 
 func (a *App) Shutdown() {
@@ -471,6 +560,10 @@ func (a *App) HandleUsage(payload []byte) {
 	a.mu.Unlock()
 
 	price, priced := a.prices.Lookup(model)
+	// hold is a request whose spend is real but has no price yet: it is kept as
+	// tokens and billed when one turns up (see repriceHeld).
+	hold := !priced && !rec.Failed
+	long := cfg.LongContextThreshold > 0 && rec.Detail.Input > cfg.LongContextThreshold
 	cost, saved := 0.0, 0.0
 	if priced && !rec.Failed {
 		cost = price.Cost(rec.Detail, cfg.LongContextThreshold, cfg.LongContextMultiplier)
@@ -510,7 +603,7 @@ func (a *App) HandleUsage(payload []byte) {
 		if w.advance(wr, now) {
 			a.earlyReset = now.Unix()
 		}
-		w.bill(cost, saved, rec, model, priced)
+		w.bill(cost, saved, rec, model, hold, long)
 	}
 
 	// Availability is tracked per model because the proxy's cooldown is: the
@@ -520,15 +613,17 @@ func (a *App) HandleUsage(payload []byte) {
 
 	acct.TotalUSD += cost
 	acct.TotalReqs++
-	if !priced && !rec.Failed {
-		acct.UnpricedReqs++
-		acct.noteUnpriced(model)
-	}
-	acct.recordHour(now, cost, rec, rl)
+	acct.recordHour(now, cost, rec, rl, model, hold, long)
 
 	a.dirty = true
 	if cfg.EventLog {
 		a.appendEvent(rec, model, cost, priced, rl, now)
+	}
+	if hold {
+		select {
+		case a.nudge <- struct{}{}:
+		default:
+		}
 	}
 }
 
@@ -577,11 +672,20 @@ func (w *Window) advance(r windowReading, now time.Time) (early bool) {
 
 	if w.HasLast && r.Percent > w.LastPercent {
 		dp := r.Percent - w.LastPercent
-		if w.PendingUSD > 0 {
+		switch {
+		case len(w.PendingHeld) > 0:
+			// Some of this step went on a model with no price yet. It is our
+			// spend, so not another client's, but it cannot be divided until
+			// all of it has a price: it waits in Held (see releaseHeld).
+			w.Held = append(w.Held, Sample{DP: dp, USD: w.PendingUSD, TS: now.Unix(),
+				Cycle: w.Key, ByModel: copyUSD(w.PendingByModel), Held: w.PendingHeld})
+			w.PendingHeld = nil
+			w.pruneSamples(now)
+		case w.PendingUSD > 0:
 			w.Samples = append(w.Samples, Sample{DP: dp, USD: w.PendingUSD, TS: now.Unix(),
 				Cycle: w.Key, ByModel: copyUSD(w.PendingByModel)})
 			w.pruneSamples(now)
-		} else {
+		default:
 			// The percentage moved but we billed nothing for it: another client
 			// is spending this credential's quota. Worth surfacing rather than
 			// silently skipping, because it also means our ledger undercounts.
@@ -635,7 +739,7 @@ func (w *Window) startCycle(r windowReading, now time.Time, granted bool) {
 	}
 }
 
-func (w *Window) bill(cost, saved float64, rec usageRecord, model string, priced bool) {
+func (w *Window) bill(cost, saved float64, rec usageRecord, model string, hold, long bool) {
 	w.PendingUSD += cost
 	if cost != 0 {
 		if w.PendingByModel == nil {
@@ -663,30 +767,46 @@ func (w *Window) bill(cost, saved float64, rec usageRecord, model string, priced
 	if rec.Failed {
 		agg.Failed++
 	}
-	if !priced && !rec.Failed {
+	if hold {
 		agg.Unpriced++
+		if agg.Held == nil {
+			agg.Held = &heldSpend{}
+		}
+		agg.Held.add(rec.Detail, long)
+		w.PendingHeld = holdIn(w.PendingHeld, model, rec.Detail, long)
 	}
 }
 
 // pruneSamples keeps calibration bounded in both count and age so the estimate
-// follows the quota as it is now rather than as it was.
+// follows the quota as it is now rather than as it was. Held samples are
+// bounded the same way: one that waits past the age limit for a price would be
+// dropped on arrival anyway.
 func (w *Window) pruneSamples(now time.Time) {
 	cutoff := now.AddDate(0, 0, -sampleMaxAgeDays).Unix()
-	kept := w.Samples[:0]
-	for _, s := range w.Samples {
+	w.Samples = boundSamples(w.Samples, cutoff)
+	w.Held = boundSamples(w.Held, cutoff)
+	if len(w.Held) == 0 {
+		w.Held = nil
+	}
+}
+
+func boundSamples(in []Sample, cutoff int64) []Sample {
+	kept := in[:0]
+	for _, s := range in {
 		if s.TS >= cutoff {
 			kept = append(kept, s)
 		}
 	}
-	w.Samples = kept
-	if len(w.Samples) > maxSamples {
-		w.Samples = append([]Sample(nil), w.Samples[len(w.Samples)-maxSamples:]...)
+	if len(kept) > maxSamples {
+		kept = append([]Sample(nil), kept[len(kept)-maxSamples:]...)
 	}
+	return kept
 }
 
 // recordHour folds one request into the rolling hourly series and drops buckets
 // that have aged past the retention window.
-func (acct *Account) recordHour(now time.Time, cost float64, rec usageRecord, rl rateLimit) {
+func (acct *Account) recordHour(now time.Time, cost float64, rec usageRecord, rl rateLimit,
+	model string, hold, long bool) {
 	if acct.Hours == nil {
 		acct.Hours = map[string]*HourAgg{}
 	}
@@ -707,6 +827,9 @@ func (acct *Account) recordHour(now time.Time, cost float64, rec usageRecord, rl
 	bucket.CacheRead += rec.Detail.CacheRead
 	if rec.Failed {
 		bucket.Failed++
+	}
+	if hold {
+		bucket.Held = holdIn(bucket.Held, model, rec.Detail, long)
 	}
 	// The series tracks the longest window, which is the one whose curve spans
 	// enough hours to be worth drawing.
@@ -739,17 +862,6 @@ func longestReading(rl rateLimit) *windowReading {
 		}
 	}
 	return best
-}
-
-func (acct *Account) noteUnpriced(model string) {
-	for _, m := range acct.UnpricedList {
-		if m == model {
-			return
-		}
-	}
-	if len(acct.UnpricedList) < 20 {
-		acct.UnpricedList = append(acct.UnpricedList, model)
-	}
 }
 
 // Estimate is the derived view of one window.
@@ -959,7 +1071,9 @@ func (w *Window) EstimateWith(weights ModelWeights) Estimate {
 	if sumDP > 0 && sumUSD > 0 {
 		e.QuotaByDelta = sumUSD / (sumDP / 100)
 	}
-	if w.FullCoverage && w.Percent > 0 && e.AttributedUSD > 0 {
+	// A cycle holding spend it could not price is short by that much, and
+	// dividing the rest by the whole percentage would understate the quota.
+	if w.FullCoverage && w.Percent > 0 && e.AttributedUSD > 0 && !w.shortOfPrice() {
 		e.QuotaByWindow = e.AttributedUSD / (w.Percent / 100)
 	}
 
@@ -1227,6 +1341,9 @@ func (a *App) loadState() {
 	if migrated > 0 {
 		hostLog("info", fmt.Sprintf("migrated %d credential(s) to per-length windows; prior calibration discarded because it mixed window sizes", migrated))
 	}
+	if sf.Version < 4 {
+		a.recoverHeld()
+	}
 	a.rot.restore(sf.Rotator)
 }
 
@@ -1235,7 +1352,7 @@ func (a *App) loadState() {
 // unreadable state is exactly when the log is the only record there is, and it
 // used to be skipped in precisely that case.
 func (a *App) loadModelWeights() {
-	if a.logWeights = bootstrapModelWeights(a.cfg.DataDir); len(a.logWeights.Windows) > 0 {
+	if a.logWeights = bootstrapModelWeights(a.cfg.DataDir, a.eventPrice()); len(a.logWeights.Windows) > 0 {
 		hostLog("info", "model burn ratios recovered from the event log: "+describeWeights(a.logWeights))
 	}
 }
@@ -1250,6 +1367,8 @@ func (a *App) markDirty() {
 
 // Flush writes the state snapshot and drains the buffered event log.
 func (a *App) Flush() {
+	a.flushMu.Lock()
+	defer a.flushMu.Unlock()
 	a.mu.Lock()
 	if !a.dirty && len(a.events) == 0 {
 		a.mu.Unlock()
@@ -1276,6 +1395,9 @@ func (a *App) Flush() {
 	if errEncode == nil {
 		if err := writeFileAtomic(filepath.Join(dir, "state.json"), body); err != nil {
 			hostLog("warn", "state write failed: "+err.Error())
+		} else {
+			_ = writeFileAtomic(filepath.Join(dir, heldThroughFile),
+				[]byte(strconv.FormatInt(snapshot.SavedAt.Unix(), 10)))
 		}
 	}
 
@@ -1608,6 +1730,7 @@ func (a *App) Report() map[string]any {
 			totalFailed += toI(longest["failed"])
 		}
 
+		unpriced, unpricedReqs := acct.unpricedNow()
 		row := map[string]any{
 			"auth_id":           acct.AuthID,
 			"provider":          acct.Provider,
@@ -1620,14 +1743,14 @@ func (a *App) Report() map[string]any {
 			"longest":           longest,
 			"total_usd":         round4(acct.TotalUSD),
 			"total_requests":    acct.TotalReqs,
-			"unpriced_requests": acct.UnpricedReqs,
+			"unpriced_requests": unpricedReqs,
 		}
-		if len(acct.UnpricedList) > 0 {
-			row["unpriced_models"] = acct.UnpricedList
+		if len(unpriced) > 0 {
+			row["unpriced_models"] = unpriced
 			warnings = append(warnings, map[string]any{
 				"code":       "unpriced_models",
 				"credential": displayName(entries, acct),
-				"models":     acct.UnpricedList,
+				"models":     unpriced,
 			})
 		}
 		if acct.Credits.LimitReached != "" {
@@ -2031,9 +2154,20 @@ func (w *Window) freshEvidence() (sumDP, sumUSD float64, used int) {
 
 // clearPending drops the unattributed spend and its model split together. They
 // describe the same dollars, so anything that forgets one must forget the other.
+// shortOfPrice reports requests in this cycle that have no price yet.
+func (w *Window) shortOfPrice() bool {
+	for _, agg := range w.ByModel {
+		if agg != nil && agg.Unpriced > 0 {
+			return true
+		}
+	}
+	return false
+}
+
 func (w *Window) clearPending() {
 	w.PendingUSD = 0
 	w.PendingByModel = nil
+	w.PendingHeld = nil
 }
 
 func copyUSD(in map[string]float64) map[string]float64 {
@@ -2100,7 +2234,7 @@ func (a *App) refreshModelWeights() {
 	a.mu.Lock()
 	dir := a.cfg.DataDir
 	a.mu.Unlock()
-	weights := bootstrapModelWeights(dir)
+	weights := bootstrapModelWeights(dir, a.eventPrice())
 	a.mu.Lock()
 	a.logWeights = weights
 	a.mu.Unlock()
@@ -2147,7 +2281,13 @@ func median(in []float64) float64 {
 // the quota header describes the state before the request it arrives with, so
 // spend accumulates until the percentage moves and is then attributed to that
 // move. Run at startup and hourly after that.
-func bootstrapModelWeights(dataDir string) ModelWeights {
+//
+// A request logged before its model had a price is priced from its tokens
+// (price). Skipped instead, as it used to be, its share of the meter was
+// credited to whatever priced spend sat next to it - the model the fleet had
+// just moved off, exactly when the ratios mattered most. One that still has no
+// price voids the step it falls in rather than skewing it.
+func bootstrapModelWeights(dataDir string, price func(model string, d Tokens) (float64, bool)) ModelWeights {
 	paths, err := filepath.Glob(filepath.Join(dataDir, "events", "*.jsonl"))
 	if err != nil || len(paths) == 0 {
 		return ModelWeights{}
@@ -2160,6 +2300,10 @@ func bootstrapModelWeights(dataDir string) ModelWeights {
 		USD    float64            `json:"usd"`
 		Priced bool               `json:"priced"`
 		Failed bool               `json:"failed"`
+		In     int64              `json:"in"`
+		Out    int64              `json:"out"`
+		CacheR int64              `json:"cache_r"`
+		CacheW int64              `json:"cache_w"`
 		Pct    map[string]float64 `json:"-"`
 	}
 	// One pool is one credential's one window; nothing is ever compared across
@@ -2173,6 +2317,9 @@ func bootstrapModelWeights(dataDir string) ModelWeights {
 		last    float64
 		hasLast bool
 		pend    map[string]float64
+		// void marks spend in hand that has no price, so the step it ends
+		// up in cannot be attributed.
+		void bool
 	}
 	runs := map[poolKey]*run{}
 	// Every model the log has seen served, measured or not.
@@ -2191,10 +2338,15 @@ func bootstrapModelWeights(dataDir string) ModelWeights {
 				continue
 			}
 			var e ev
-			if json.Unmarshal(sc.Bytes(), &e) != nil || !e.Priced || e.Failed || e.Model == "" {
+			if json.Unmarshal(sc.Bytes(), &e) != nil || e.Failed || e.Model == "" {
 				continue
 			}
-			known[e.Model] = true
+			if !e.Priced && price != nil {
+				e.USD, e.Priced = price(e.Model, Tokens{Input: e.In, Output: e.Out, CacheRead: e.CacheR, CacheWrite: e.CacheW})
+			}
+			if e.Priced {
+				known[e.Model] = true
+			}
 			for key, val := range raw {
 				if !strings.HasPrefix(key, "pct_") {
 					continue
@@ -2212,13 +2364,13 @@ func bootstrapModelWeights(dataDir string) ModelWeights {
 				switch {
 				case r.hasLast && pct < r.last-0.001:
 					// Cycle rolled: the spend in hand can no longer be paired.
-					r.hasLast, r.pend = false, map[string]float64{}
+					r.hasLast, r.pend, r.void = false, map[string]float64{}, false
 				case r.hasLast && pct > r.last:
 					total := 0.0
 					for _, v := range r.pend {
 						total += v
 					}
-					if total > 0 {
+					if total > 0 && !r.void {
 						for m, v := range r.pend {
 							if v/total < dominantShare {
 								continue
@@ -2236,10 +2388,14 @@ func bootstrapModelWeights(dataDir string) ModelWeights {
 							break
 						}
 					}
-					r.pend = map[string]float64{}
+					r.pend, r.void = map[string]float64{}, false
 				}
 				r.last, r.hasLast = pct, true
-				r.pend[e.Model] += e.USD
+				if e.Priced {
+					r.pend[e.Model] += e.USD
+				} else {
+					r.void = true
+				}
 			}
 		}
 		fh.Close()
